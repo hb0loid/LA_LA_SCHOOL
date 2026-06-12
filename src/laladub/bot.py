@@ -70,6 +70,13 @@ ASR_METHOD_CONFIGS = {
 
 TELEGRAM_SAFE_VIDEO_BYTES = 45 * 1024 * 1024
 TELEGRAM_DIRECT_DOWNLOAD_SAFE_BYTES = 20 * 1024 * 1024
+RECOVERABLE_JOB_STATUSES = {"starting", "running", "queued", "ready"}
+
+
+class _ApplicationContext:
+    def __init__(self, application: Any) -> None:
+        self.application = application
+        self.bot = application.bot
 
 
 def main() -> None:
@@ -134,6 +141,7 @@ async def _setup_bot_commands(application: Any) -> None:
             ("cancel", "Сбросить текущую задачу"),
         ]
     )
+    application.create_task(_recover_interrupted_jobs(application))
 
 
 async def start(update: Any, context: Any) -> None:
@@ -481,6 +489,9 @@ async def _enqueue_job(update: Any, context: Any, job: dict[str, Any], status_me
     if chat is None:
         await _safe_edit_status(status_message, "Не удалось определить чат для задачи.")
         return
+    job["chat_id"] = chat.id
+    if user is not None:
+        job["user_id"] = user.id
 
     input_path = Path(str(job.get("input_path") or ""))
     if input_path.exists():
@@ -504,6 +515,108 @@ async def _enqueue_job(update: Any, context: Any, job: dict[str, Any], status_me
         job=job,
         status_message=status_message,
     )
+
+
+async def _recover_interrupted_jobs(application: Any) -> None:
+    settings: BotSettings = application.bot_data["settings"]
+    scheduler: _JobScheduler = application.bot_data["job_scheduler"]
+    context = _ApplicationContext(application)
+    jobs = await asyncio.to_thread(_find_recoverable_jobs, settings)
+    if not jobs:
+        print("Startup recovery: no interrupted jobs found", flush=True)
+        return
+
+    recovered = 0
+    skipped = 0
+    print(f"Startup recovery: found {len(jobs)} interrupted job(s)", flush=True)
+    for job in jobs:
+        job_dir = Path(str(job["job_dir"]))
+        chat_id = _job_chat_id(job)
+        user_id = _job_user_id(job)
+        if chat_id is None:
+            skipped += 1
+            _save_job_snapshot(job_dir, job, status="failed", error="startup_recovery_missing_chat_id")
+            print(f"Startup recovery skipped, chat_id missing: {job_dir}", flush=True)
+            continue
+
+        job["resume"] = "1"
+        job["recovered_at"] = time.time()
+        job["target_lang"] = "ru"
+        try:
+            status_message = await application.bot.send_message(
+                chat_id=chat_id,
+                text="Бот был перезапущен. Автоматически продолжаю задачу и ставлю её обратно в очередь.",
+                read_timeout=60,
+                write_timeout=60,
+                connect_timeout=30,
+                pool_timeout=30,
+            )
+        except Exception as exc:
+            skipped += 1
+            _save_job_snapshot(job_dir, job, status="failed", error=f"startup_recovery_send_failed: {exc}")
+            print(f"Startup recovery send failed for {job_dir}: {type(exc).__name__}: {exc}", flush=True)
+            continue
+
+        await scheduler.enqueue(
+            context,
+            chat_id=chat_id,
+            user_id=user_id,
+            job=job,
+            status_message=status_message,
+        )
+        recovered += 1
+
+    print(f"Startup recovery: recovered={recovered}, skipped={skipped}", flush=True)
+
+
+def _find_recoverable_jobs(settings: BotSettings) -> list[dict[str, Any]]:
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    if not settings.workdir.exists():
+        return []
+    for path in settings.workdir.rglob("job.json"):
+        job_dir = path.parent
+        job = _load_job_snapshot(job_dir)
+        if not job:
+            continue
+        status = str(job.get("status") or "")
+        if status not in RECOVERABLE_JOB_STATUSES:
+            continue
+        if not job.get("asr_method") and job.get("mode") != "raw_text":
+            continue
+        updated_at = float(job.get("queued_at") or job.get("updated_at") or path.stat().st_mtime)
+        candidates.append((updated_at, job))
+    candidates.sort(key=lambda item: item[0])
+    return [job for _updated_at, job in candidates]
+
+
+def _job_user_id(job: dict[str, Any]) -> int | None:
+    user_id = _coerce_int(job.get("user_id"))
+    if user_id is not None:
+        return user_id
+    try:
+        return int(Path(str(job["job_dir"])).parent.name)
+    except Exception:
+        return None
+
+
+def _job_chat_id(job: dict[str, Any]) -> int | str | None:
+    chat_id = job.get("chat_id")
+    if isinstance(chat_id, str) and chat_id.strip():
+        parsed = _coerce_int(chat_id)
+        return parsed if parsed is not None else chat_id
+    parsed = _coerce_int(chat_id)
+    if parsed is not None:
+        return parsed
+    return _job_user_id(job)
+
+
+def _coerce_int(value: object) -> int | None:
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class _QueuedJob:
