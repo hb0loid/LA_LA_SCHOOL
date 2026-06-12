@@ -113,6 +113,7 @@ def main() -> None:
     application.bot_data["job_scheduler"] = _JobScheduler(settings)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("me", me))
+    application.add_handler(CommandHandler("queue", queue_status))
     application.add_handler(CommandHandler("resume", resume))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_video))
@@ -127,6 +128,7 @@ async def _setup_bot_commands(application: Any) -> None:
     await application.bot.set_my_commands(
         [
             ("start", "Инструкция"),
+            ("queue", "Показать очередь задач"),
             ("resume", "Продолжить последнюю задачу"),
             ("me", "Показать Telegram ID"),
             ("cancel", "Сбросить текущую задачу"),
@@ -148,6 +150,35 @@ async def me(update: Any, context: Any) -> None:
     user = update.effective_user
     status = "оплачен" if settings.is_paid(user.id if user else None) else "бесплатный"
     await update.effective_message.reply_text(f"Твой Telegram ID: {user.id}\nСтатус: {status}")
+
+
+async def queue_status(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    scheduler: _JobScheduler = context.application.bot_data["job_scheduler"]
+    live = await scheduler.snapshot()
+    disk_counts = await asyncio.to_thread(_job_status_counts, settings.workdir)
+
+    live_total = live["active_total"] + live["pending_total"]
+    lines = [
+        "Очередь задач",
+        f"В работе сейчас: {live['active_total']}/{live['max_active_jobs']}",
+        f"Ждёт в живой очереди: {live['pending_total']}",
+        f"Всего в живом процессе: {live_total}",
+        f"Премиум в очереди: {live['pending_premium']}",
+        f"Обычных в очереди: {live['pending_normal']}",
+        f"Пользователей с активными задачами: {live['active_users']}",
+        "",
+        "По файлам:",
+        _format_status_counts(disk_counts),
+    ]
+    if disk_counts.get("running", 0) + disk_counts.get("queued", 0) > live_total:
+        lines.extend(
+            [
+                "",
+                "Примечание: файловые running/queued могут включать зависшие задачи после перезапуска. Их можно подхватить через /resume.",
+            ]
+        )
+    await update.effective_message.reply_text("\n".join(lines))
 
 
 async def cancel(update: Any, context: Any) -> None:
@@ -617,9 +648,47 @@ class _JobScheduler:
             ]
         )
 
+    async def snapshot(self) -> dict[str, int]:
+        async with self._lock:
+            pending_premium = sum(1 for _priority, _sequence, item in self._pending if item.premium)
+            pending_total = len(self._pending)
+            return {
+                "active_total": self._active_total,
+                "active_users": len(self._active_by_user),
+                "pending_total": pending_total,
+                "pending_premium": pending_premium,
+                "pending_normal": pending_total - pending_premium,
+                "max_active_jobs": self._settings.max_active_jobs,
+                "max_active_jobs_per_user": self._settings.max_active_jobs_per_user,
+            }
+
 
 def _job_queue_key(job: dict[str, Any]) -> str:
     return str(Path(str(job["job_dir"])).resolve())
+
+
+def _job_status_counts(workdir: Path) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if not workdir.exists():
+        return counts
+    for path in workdir.rglob("job.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            status = "bad_json"
+        else:
+            status = str(data.get("status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _format_status_counts(counts: dict[str, int]) -> str:
+    if not counts:
+        return "нет задач"
+    preferred = ["running", "starting", "queued", "select_source", "select_method", "ready", "failed", "rejected", "done"]
+    parts = [f"{status}={counts[status]}" for status in preferred if counts.get(status)]
+    parts.extend(f"{status}={count}" for status, count in sorted(counts.items()) if status not in preferred)
+    return ", ".join(parts)
 
 
 class _ProgressState:
