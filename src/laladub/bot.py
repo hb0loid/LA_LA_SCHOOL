@@ -69,6 +69,7 @@ ASR_METHOD_CONFIGS = {
 }
 
 TELEGRAM_SAFE_VIDEO_BYTES = 45 * 1024 * 1024
+TELEGRAM_DIRECT_DOWNLOAD_SAFE_BYTES = 20 * 1024 * 1024
 
 
 def main() -> None:
@@ -197,8 +198,10 @@ async def receive_video(update: Any, context: Any) -> None:
         return
 
     file_size = getattr(media, "file_size", 0) or 0
-    if file_size > settings.max_file_mb * 1024 * 1024:
-        await message.reply_text(f"Видео слишком большое. Лимит: {settings.max_file_mb} МБ.")
+    max_configured_bytes = settings.max_file_mb * 1024 * 1024
+    direct_limit_bytes = min(max_configured_bytes, TELEGRAM_DIRECT_DOWNLOAD_SAFE_BYTES)
+    if file_size > direct_limit_bytes:
+        await message.reply_text(_direct_video_too_large_text(direct_limit_bytes))
         return
 
     user_id = update.effective_user.id
@@ -210,8 +213,20 @@ async def receive_video(update: Any, context: Any) -> None:
     source_title = _source_title_from_media(media, message.message_id)
 
     status = await message.reply_text("Скачиваю видео...")
-    tg_file = await media.get_file()
-    await tg_file.download_to_drive(custom_path=str(input_path))
+    try:
+        tg_file = await media.get_file()
+        await tg_file.download_to_drive(custom_path=str(input_path))
+    except Exception as exc:
+        if _is_telegram_file_too_big(exc):
+            await status.edit_text(_direct_video_too_large_text(direct_limit_bytes))
+        else:
+            traceback_text = traceback.format_exc()
+            print(traceback_text, flush=True)
+            (job_dir / "error.log").write_text(traceback_text, encoding="utf-8")
+            details = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+            await status.edit_text(f"Не смог скачать видео из Telegram:\n{details}")
+        return
+
     input_path = await _prepare_input_video_duration(status, settings, user_id, input_path)
     if input_path is None:
         return
@@ -343,6 +358,23 @@ def _format_duration(seconds: float) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{seconds:02d}"
     return f"{minutes}:{seconds:02d}"
+
+
+def _format_mb(size_bytes: int) -> str:
+    return f"{size_bytes / (1024 * 1024):.0f} МБ"
+
+
+def _direct_video_too_large_text(limit_bytes: int) -> str:
+    return (
+        "Файл слишком большой для прямой загрузки через Telegram.\n"
+        f"Лимит для видеофайла: {_format_mb(limit_bytes)}.\n"
+        "Пришли ссылку на YouTube/TikTok/другой источник или сожми файл перед отправкой."
+    )
+
+
+def _is_telegram_file_too_big(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".casefold()
+    return "file is too big" in text or "too big" in text
 
 
 async def _remember_job_and_ask_source(
