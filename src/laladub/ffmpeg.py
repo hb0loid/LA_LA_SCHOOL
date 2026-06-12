@@ -105,6 +105,28 @@ def extract_audio_track(video_path: Path, wav_path: Path, sample_rate: int = 441
     )
 
 
+def trim_video(input_path: Path, output_path: Path, duration: float) -> None:
+    ffmpeg = require_tool("ffmpeg")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    run(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(input_path),
+            "-t",
+            f"{max(0.1, duration):.3f}",
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            "-avoid_negative_ts",
+            "make_zero",
+            str(output_path),
+        ]
+    )
+
+
 def make_silence(wav_path: Path, duration: float, sample_rate: int = 44100) -> None:
     ffmpeg = require_tool("ffmpeg")
     wav_path.parent.mkdir(parents=True, exist_ok=True)

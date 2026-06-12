@@ -13,7 +13,7 @@ from typing import Any
 
 from .bot_config import BotSettings, load_bot_settings
 from .download import download_video_url, extract_url
-from .ffmpeg import probe_duration
+from .ffmpeg import probe_duration, trim_video
 from .models import DubConfig
 from .pipeline import run_dub, run_transcript
 from .watermark import add_watermark
@@ -200,10 +200,6 @@ async def receive_video(update: Any, context: Any) -> None:
         return
 
     user_id = update.effective_user.id
-    media_duration = float(getattr(media, "duration", 0) or 0)
-    if _duration_limit_exceeded(settings, user_id, media_duration):
-        await message.reply_text(_duration_limit_text(settings, user_id, media_duration))
-        return
 
     job_dir = settings.workdir / str(user_id) / str(message.message_id)
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -214,7 +210,8 @@ async def receive_video(update: Any, context: Any) -> None:
     status = await message.reply_text("Скачиваю видео...")
     tg_file = await media.get_file()
     await tg_file.download_to_drive(custom_path=str(input_path))
-    if not await _validate_downloaded_video_duration(status, settings, user_id, input_path):
+    input_path = await _prepare_input_video_duration(status, settings, user_id, input_path)
+    if input_path is None:
         return
 
     await _remember_job_and_ask_source(context, status, job_dir, input_path, source_title)
@@ -245,33 +242,61 @@ async def receive_link(update: Any, context: Any) -> None:
         await status.edit_text(f"Не смог скачать видео по ссылке:\n{details}")
         return
 
-    if not await _validate_downloaded_video_duration(status, settings, user_id, input_path):
+    input_path = await _prepare_input_video_duration(status, settings, user_id, input_path)
+    if input_path is None:
         return
 
     await _remember_job_and_ask_source(context, status, job_dir, input_path, source_title)
 
 
-async def _validate_downloaded_video_duration(
+async def _prepare_input_video_duration(
     status: Any,
     settings: BotSettings,
     user_id: int | None,
     input_path: Path,
-) -> bool:
+) -> Path | None:
     limit = _duration_limit_seconds(settings, user_id)
     if limit is None:
-        return True
+        return input_path
 
     try:
         duration = await asyncio.to_thread(probe_duration, input_path)
     except Exception as exc:
         print(f"Video duration check skipped: {type(exc).__name__}: {exc}", flush=True)
-        return True
+        return input_path
 
     if not _duration_limit_exceeded(settings, user_id, duration):
-        return True
+        return input_path
 
-    await status.edit_text(_duration_limit_text(settings, user_id, duration))
-    return False
+    trimmed_path = input_path.with_name(f"{input_path.stem}_trimmed{input_path.suffix or '.mp4'}")
+    await status.edit_text(_duration_trim_text(settings, user_id, duration))
+    try:
+        await asyncio.to_thread(trim_video, input_path, trimmed_path, limit)
+    except Exception as exc:
+        print(f"Video trim failed: {type(exc).__name__}: {exc}", flush=True)
+        await status.edit_text(
+            "Видео длиннее лимита, и не удалось автоматически обрезать его.\n"
+            f"{type(exc).__name__}: {exc}"
+        )
+        return None
+
+    if not trimmed_path.exists() or trimmed_path.stat().st_size < 1024:
+        await status.edit_text("Не удалось обрезать видео: получился пустой файл.")
+        return None
+
+    try:
+        trimmed_duration = await asyncio.to_thread(probe_duration, trimmed_path)
+        print(
+            f"Video trimmed for duration limit: {duration:.2f}s -> {trimmed_duration:.2f}s ({trimmed_path})",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"Trimmed video duration check skipped: {type(exc).__name__}: {exc}", flush=True)
+
+    await status.edit_text(
+        f"Видео длиннее лимита. Взял первые {_format_duration(limit)} и продолжаю."
+    )
+    return trimmed_path
 
 
 def _duration_limit_seconds(settings: BotSettings, user_id: int | None) -> float | None:
@@ -294,6 +319,18 @@ def _duration_limit_text(settings: BotSettings, user_id: int | None, duration: f
     return (
         f"В {tier} версии лимит видео: {_format_duration(limit)}.\n"
         f"Это видео: {_format_duration(duration)}."
+    )
+
+
+def _duration_trim_text(settings: BotSettings, user_id: int | None, duration: float) -> str:
+    limit = _duration_limit_seconds(settings, user_id)
+    tier = "платной" if settings.is_paid(user_id) else "бесплатной"
+    if limit is None:
+        return "Видео принято."
+    return (
+        f"В {tier} версии лимит видео: {_format_duration(limit)}.\n"
+        f"Это видео: {_format_duration(duration)}.\n"
+        "Обрезаю и возьму начало видео."
     )
 
 
@@ -381,14 +418,19 @@ async def _enqueue_job(update: Any, context: Any, job: dict[str, Any], status_me
         return
 
     input_path = Path(str(job.get("input_path") or ""))
-    if input_path.exists() and not await _validate_downloaded_video_duration(
-        status_message,
-        settings,
-        user.id if user else None,
-        input_path,
-    ):
-        _save_job_snapshot(Path(job["job_dir"]), job, status="rejected", error="duration_limit")
-        return
+    if input_path.exists():
+        prepared_input_path = await _prepare_input_video_duration(
+            status_message,
+            settings,
+            user.id if user else None,
+            input_path,
+        )
+        if prepared_input_path is None:
+            _save_job_snapshot(Path(job["job_dir"]), job, status="rejected", error="duration_limit")
+            return
+        if prepared_input_path != input_path:
+            job["input_path"] = str(prepared_input_path)
+            _save_job_snapshot(Path(job["job_dir"]), job, status="queued", trimmed=True)
 
     await scheduler.enqueue(
         context,
