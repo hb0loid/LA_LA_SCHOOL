@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "la-la-local-dub"
+version = "0.1.0"
+description = "Local video translator and intentionally glitchy dubbing pipeline."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "HBoloid" }]
+dependencies = []
+
+[project.optional-dependencies]
+asr = ["faster-whisper>=1.0.0"]
+translate = ["argostranslate>=1.9.6"]
+bot = ["python-telegram-bot>=21.0", "yt-dlp>=2025.1.0"]
+clone = ["TTS>=0.22.0", "transformers==4.49.0"]
+f5 = ["f5-tts==1.1.20"]
+separation = ["demucs>=4.0.1"]
+dev = []
+
+[project.scripts]
+laladub = "laladub.cli:main"
+laladub-bot = "laladub.bot:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

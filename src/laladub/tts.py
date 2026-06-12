@@ -1,0 +1,630 @@
+from __future__ import annotations
+
+import base64
+import contextlib
+import re
+import subprocess
+import sys
+import unicodedata
+from pathlib import Path
+from typing import Iterator
+
+from .ffmpeg import concat_wavs, make_silence
+from .models import DubConfig, Segment
+
+
+class TTSError(RuntimeError):
+    pass
+
+
+_XTTS_CACHE: dict[tuple[str, str], object] = {}
+_F5_CACHE: dict[tuple[str, str, str, str], object] = {}
+
+
+def synthesize_segment(segment: Segment, output_path: Path, config: DubConfig) -> None:
+    provider = config.tts.lower()
+    text = segment.spoken_text
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if provider == "none" or not text:
+        make_silence(output_path, max(0.15, segment.duration))
+        return
+
+    if provider == "sapi":
+        _synthesize_sapi(text, output_path, config)
+        return
+
+    if provider == "piper":
+        _synthesize_piper(text, output_path, config)
+        return
+
+    if provider == "xtts":
+        try:
+            _synthesize_xtts(segment, text, output_path, config)
+        except Exception as exc:
+            print(f"      XTTS segment fallback to SAPI: {type(exc).__name__}: {exc}")
+            try:
+                _synthesize_sapi(text, output_path, config)
+            except Exception as sapi_exc:
+                print(f"      SAPI segment fallback to silence: {type(sapi_exc).__name__}: {sapi_exc}")
+                make_silence(output_path, max(0.15, segment.duration))
+        return
+
+    if provider in {"f5", "f5tts"}:
+        try:
+            _synthesize_f5tts(segment, text, output_path, config)
+        except Exception as exc:
+            print(f"      F5-TTS segment fallback to XTTS: {type(exc).__name__}: {exc}")
+            output_path.unlink(missing_ok=True)
+            try:
+                _synthesize_xtts(segment, text, output_path, config)
+            except Exception as xtts_exc:
+                print(f"      XTTS segment fallback to SAPI: {type(xtts_exc).__name__}: {xtts_exc}")
+                output_path.unlink(missing_ok=True)
+                try:
+                    _synthesize_sapi(text, output_path, config)
+                except Exception as sapi_exc:
+                    print(f"      SAPI segment fallback to silence: {type(sapi_exc).__name__}: {sapi_exc}")
+                    make_silence(output_path, max(0.15, segment.duration))
+        return
+
+    raise TTSError(f"Unknown TTS provider: {config.tts}")
+
+
+def list_sapi_voices() -> str:
+    script = """
+Add-Type -AssemblyName System.Speech
+$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+$synth.GetInstalledVoices() | ForEach-Object {
+  $info = $_.VoiceInfo
+  "$($info.Name)`t$($info.Culture)`t$($info.Gender)`t$($info.Age)"
+}
+$synth.Dispose()
+"""
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _synthesize_sapi(text: str, output_path: Path, config: DubConfig) -> None:
+    script_path = output_path.with_suffix(".ps1")
+    text_base64 = base64.b64encode(text.encode("utf-16-le")).decode("ascii")
+    script_path.write_text(
+        """
+param(
+  [Parameter(Mandatory=$true)][string]$TextBase64,
+  [Parameter(Mandatory=$true)][string]$OutputPath,
+  [string]$VoiceName = "",
+  [int]$Rate = 0,
+  [int]$Volume = 100
+)
+$ErrorActionPreference = "Stop"
+$voice = New-Object -ComObject SAPI.SpVoice
+if ($VoiceName -ne "") {
+  $selected = $null
+  foreach ($token in $voice.GetVoices()) {
+    if (($token.GetDescription() -eq $VoiceName) -or ($token.GetAttribute("Name") -eq $VoiceName)) {
+      $selected = $token
+      break
+    }
+  }
+  if ($null -eq $selected) { throw "SAPI voice not found: $VoiceName" }
+  $voice.Voice = $selected
+}
+$voice.Rate = $Rate
+$voice.Volume = $Volume
+$textBytes = [Convert]::FromBase64String($TextBase64)
+$text = [System.Text.Encoding]::Unicode.GetString($textBytes)
+$stream = New-Object -ComObject SAPI.SpFileStream
+$format = New-Object -ComObject SAPI.SpAudioFormat
+$format.Type = 34
+$stream.Format = $format
+try {
+  $stream.Open($OutputPath, 3, $false)
+  $voice.AudioOutputStream = $stream
+  [void]$voice.Speak($text, 0)
+}
+finally {
+  if ($stream -ne $null) { $stream.Close() }
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    try:
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script_path),
+                "-TextBase64",
+                text_base64,
+                "-OutputPath",
+                str(output_path.resolve()),
+                "-VoiceName",
+                config.voice or "",
+                "-Rate",
+                str(config.sapi_rate),
+                "-Volume",
+                str(config.sapi_volume),
+            ],
+            check=True,
+        )
+    finally:
+        script_path.unlink(missing_ok=True)
+
+    if not output_path.exists() or output_path.stat().st_size < 1024:
+        raise TTSError(f"SAPI produced an empty WAV file: {output_path}")
+
+
+def _synthesize_piper(text: str, output_path: Path, config: DubConfig) -> None:
+    if not config.piper_model:
+        raise TTSError("Piper needs --piper-model path/to/voice.onnx")
+    subprocess.run(
+        [
+            config.piper_cmd,
+            "--model",
+            str(config.piper_model),
+            "--output_file",
+            str(output_path),
+        ],
+        input=text,
+        text=True,
+        check=True,
+    )
+
+
+def _synthesize_f5tts(segment: Segment, text: str, output_path: Path, config: DubConfig) -> None:
+    text = _sanitize_text_for_xtts(text)
+    if not text:
+        make_silence(output_path, max(0.15, segment.duration))
+        return
+
+    speaker_wav = segment.speaker_wav or config.speaker_wav
+    if not speaker_wav:
+        raise TTSError("F5-TTS needs a speaker reference WAV.")
+    if not speaker_wav.exists():
+        raise TTSError(f"F5-TTS speaker reference does not exist: {speaker_wav}")
+
+    chunks = _split_text_for_xtts(text, max_chars=300, max_words=45)
+    if len(chunks) > 1:
+        print(f"      F5-TTS split long segment into {len(chunks)} chunks")
+        chunk_paths: list[Path] = []
+        chunk_dir = output_path.parent / f"{output_path.stem}_f5_chunks"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        for index, chunk in enumerate(chunks, start=1):
+            chunk_path = chunk_dir / f"{index:04d}.wav"
+            _f5_to_file(chunk, chunk_path, speaker_wav, config)
+            chunk_paths.append(chunk_path)
+        concat_wavs(chunk_paths, output_path)
+    else:
+        _f5_to_file(text, output_path, speaker_wav, config)
+
+    if not output_path.exists() or output_path.stat().st_size < 1024:
+        raise TTSError(f"F5-TTS produced an empty WAV file: {output_path}")
+
+
+def _f5_to_file(text: str, output_path: Path, speaker_wav: Path, config: DubConfig) -> None:
+    try:
+        model = _load_f5_model(config)
+        model.infer(
+            ref_file=str(speaker_wav),
+            ref_text="",
+            gen_text=text,
+            file_wave=str(output_path),
+            target_rms=config.f5_target_rms,
+            cross_fade_duration=config.f5_cross_fade_duration,
+            cfg_strength=config.f5_cfg_strength,
+            nfe_step=config.f5_nfe_step,
+            speed=config.f5_speed,
+            remove_silence=config.f5_remove_silence,
+        )
+    except Exception as exc:
+        output_path.unlink(missing_ok=True)
+        print(f"      F5-TTS in-process failed, trying isolated runner: {type(exc).__name__}: {exc}")
+        _f5_to_file_subprocess(text, output_path, speaker_wav, config)
+
+    if not output_path.exists() or output_path.stat().st_size < 1024:
+        raise TTSError(f"F5-TTS produced an empty WAV file: {output_path}")
+
+
+def _load_f5_model(config: DubConfig) -> object:
+    _add_f5_site_packages(config)
+    try:
+        from f5_tts.api import F5TTS
+    except ImportError as exc:
+        raise TTSError("F5-TTS is not installed in .venv-f5tts.") from exc
+
+    ckpt_file = _resolve_f5_model_file(config.f5_ckpt_file, config.f5_hf_repo, config.f5_hf_ckpt_path, config.f5_cache_dir)
+    vocab_file = _resolve_f5_model_file(config.f5_vocab_file, config.f5_hf_repo, config.f5_hf_vocab_path, config.f5_cache_dir)
+    device = _resolve_f5_device(config.f5_device)
+    key = (config.f5_model, str(ckpt_file), str(vocab_file), device)
+    model = _F5_CACHE.get(key)
+    if model is None:
+        model = F5TTS(
+            model=config.f5_model,
+            ckpt_file=str(ckpt_file),
+            vocab_file=str(vocab_file),
+            device=device,
+        )
+        _F5_CACHE[key] = model
+    return model
+
+
+def _f5_to_file_subprocess(text: str, output_path: Path, speaker_wav: Path, config: DubConfig) -> None:
+    python_path = _resolve_f5_python(config)
+    runner_path = _repo_root() / "tools" / "f5_tts_runner.py"
+    if not runner_path.exists():
+        raise TTSError(f"F5-TTS runner does not exist: {runner_path}")
+
+    command = [
+        str(python_path),
+        str(runner_path),
+        "--ref-audio",
+        str(speaker_wav),
+        "--text-base64",
+        base64.b64encode(text.encode("utf-8")).decode("ascii"),
+        "--output",
+        str(output_path),
+        "--model",
+        config.f5_model,
+        "--hf-repo",
+        config.f5_hf_repo,
+        "--hf-ckpt-path",
+        config.f5_hf_ckpt_path,
+        "--hf-vocab-path",
+        config.f5_hf_vocab_path,
+        "--cache-dir",
+        str(_resolve_repo_relative_path(config.f5_cache_dir)),
+        "--device",
+        config.f5_device,
+        "--speed",
+        str(config.f5_speed),
+        "--nfe-step",
+        str(config.f5_nfe_step),
+        "--cfg-strength",
+        str(config.f5_cfg_strength),
+        "--target-rms",
+        str(config.f5_target_rms),
+        "--cross-fade-duration",
+        str(config.f5_cross_fade_duration),
+    ]
+    if config.f5_ckpt_file is not None:
+        command.extend(["--ckpt-file", str(_resolve_repo_relative_path(config.f5_ckpt_file))])
+    if config.f5_vocab_file is not None:
+        command.extend(["--vocab-file", str(_resolve_repo_relative_path(config.f5_vocab_file))])
+    if config.f5_remove_silence:
+        command.append("--remove-silence")
+
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=config.f5_timeout_seconds,
+    )
+    message = _short_subprocess_output(result.stdout, result.stderr)
+    if message:
+        print(f"      F5-TTS runner: {message}")
+
+
+def _add_f5_site_packages(config: DubConfig) -> None:
+    python_path = _resolve_f5_python(config)
+    site_packages = python_path.parent.parent / "Lib" / "site-packages"
+    if not site_packages.exists():
+        raise TTSError(f"F5-TTS site-packages does not exist: {site_packages}")
+    site_packages_text = str(site_packages)
+    if site_packages_text not in sys.path:
+        sys.path.insert(0, site_packages_text)
+
+
+def _resolve_f5_python(config: DubConfig) -> Path:
+    python_path = config.f5_python or Path(".venv-f5tts") / "Scripts" / "python.exe"
+    python_path = _resolve_repo_relative_path(python_path)
+    if not python_path.exists():
+        raise TTSError(
+            "F5-TTS Python was not found. Expected .venv-f5tts\\Scripts\\python.exe. "
+            "Create it with: python -m venv --system-site-packages .venv-f5tts"
+        )
+    return python_path
+
+
+def _resolve_f5_model_file(local_path: Path | None, repo: str, repo_path: str, cache_dir: Path) -> Path:
+    if local_path is not None:
+        path = _resolve_repo_relative_path(local_path)
+        if not path.exists():
+            raise FileNotFoundError(path)
+        return path
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise TTSError("huggingface_hub is required for F5-TTS model downloads.") from exc
+
+    return Path(
+        hf_hub_download(
+            repo_id=repo,
+            filename=repo_path,
+            cache_dir=str(_resolve_repo_relative_path(cache_dir)),
+        )
+    )
+
+
+def _resolve_f5_device(device: str) -> str:
+    device = (device or "auto").strip().lower()
+    if device != "auto":
+        return device
+
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def _resolve_repo_relative_path(path: Path) -> Path:
+    return path if path.is_absolute() else _repo_root() / path
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _short_subprocess_output(stdout: str, stderr: str) -> str:
+    combined = " ".join(part.strip() for part in (stdout, stderr) if part.strip())
+    combined = re.sub(r"\s+", " ", combined)
+    if len(combined) > 500:
+        return combined[:497] + "..."
+    return combined
+
+
+def _synthesize_xtts(segment: Segment, text: str, output_path: Path, config: DubConfig) -> None:
+    text = _sanitize_text_for_xtts(text)
+    if not text:
+        make_silence(output_path, max(0.15, segment.duration))
+        return
+
+    speaker_wav = segment.speaker_wav or config.speaker_wav
+    if not speaker_wav:
+        raise TTSError("XTTS needs a speaker reference WAV. Set --speaker-wav or enable Demucs/source reference.")
+    if not speaker_wav.exists():
+        raise TTSError(f"XTTS speaker reference does not exist: {speaker_wav}")
+
+    try:
+        from TTS.api import TTS
+    except ImportError as exc:
+        raise TTSError("Coqui TTS is not installed. Run: python -m pip install -e .[clone]") from exc
+
+    key = (config.xtts_model, config.xtts_device)
+    model = _XTTS_CACHE.get(key)
+    if model is None:
+        use_gpu = config.xtts_device.lower() == "cuda"
+        try:
+            with _torch_load_legacy_checkpoint_mode():
+                model = TTS(config.xtts_model, gpu=use_gpu, progress_bar=False)
+        except Exception as exc:
+            message = str(exc)
+            if "terms of service" in message.lower() or "tos" in message.lower():
+                raise TTSError(
+                    "XTTS requires accepting Coqui CPML terms. "
+                    "If you accept them, set COQUI_TOS_AGREED=1 and restart the bot."
+                ) from exc
+            raise
+        _XTTS_CACHE[key] = model
+
+    language = _xtts_language(config.target_lang)
+    chunks = _split_text_for_xtts(text, max_chars=320, max_words=45)
+    if len(chunks) > 1:
+        print(f"      XTTS split long segment into {len(chunks)} chunks")
+        chunk_paths: list[Path] = []
+        chunk_dir = output_path.parent / f"{output_path.stem}_chunks"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        for index, chunk in enumerate(chunks, start=1):
+            chunk_path = chunk_dir / f"{index:04d}.wav"
+            _xtts_to_file(model, chunk, chunk_path, speaker_wav, language, config)
+            chunk_paths.append(chunk_path)
+        concat_wavs(chunk_paths, output_path)
+    else:
+        _xtts_to_file(model, text, output_path, speaker_wav, language, config)
+
+    if not output_path.exists() or output_path.stat().st_size < 1024:
+        raise TTSError(f"XTTS produced an empty WAV file: {output_path}")
+
+
+def _xtts_to_file(
+    model: object,
+    text: str,
+    output_path: Path,
+    speaker_wav: Path,
+    language: str,
+    config: DubConfig,
+) -> None:
+    try:
+        model.tts_to_file(
+            text=text,
+            speaker_wav=str(speaker_wav),
+            language=language,
+            speed=config.xtts_speed,
+            file_path=str(output_path),
+            split_sentences=True,
+        )
+    except (AssertionError, IndexError, RuntimeError) as exc:
+        if not _is_xtts_chunk_error(exc):
+            raise
+
+        subchunks = _split_text_for_xtts(text, max_chars=140, max_words=18)
+        if len(subchunks) <= 1 and len(text) > 1:
+            subchunks = _hard_split_text(text, max_chars=48)
+        if len(subchunks) <= 1 and len(text) > 1:
+            subchunks = _hard_split_text(text, max_chars=24)
+        if len(subchunks) <= 1:
+            raise TTSError(
+                "XTTS refused a text chunk even after conservative splitting."
+            ) from exc
+
+        print(f"      XTTS fallback split into {len(subchunks)} smaller chunks")
+        chunk_dir = output_path.parent / f"{output_path.stem}_retry_chunks"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        chunk_paths: list[Path] = []
+        for index, chunk in enumerate(subchunks, start=1):
+            chunk_path = chunk_dir / f"{index:04d}.wav"
+            _xtts_to_file(model, chunk, chunk_path, speaker_wav, language, config)
+            chunk_paths.append(chunk_path)
+        concat_wavs(chunk_paths, output_path)
+
+
+def _is_xtts_chunk_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "400 tokens" in message or "index out of range in self" in message
+
+
+def _sanitize_text_for_xtts(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+
+    cleaned: list[str] = []
+    for char in text:
+        category = unicodedata.category(char)
+        if category.startswith("C"):
+            continue
+        if ord(char) > 0xFFFF and not char.isalnum():
+            continue
+        cleaned.append(char)
+    return re.sub(r"\s+", " ", "".join(cleaned)).strip()
+
+
+def _split_text_for_xtts(text: str, max_chars: int = 520, max_words: int = 85) -> list[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return []
+
+    sentence_parts = [
+        part.strip()
+        for part in re.split(r"(?<=[.!?…。！？])\s+", text)
+        if part.strip()
+    ]
+    chunks: list[str] = []
+    current = ""
+    current_words = 0
+
+    for part in sentence_parts:
+        for piece in _split_oversized_piece(part, max_chars=max_chars, max_words=max_words):
+            piece_words = _word_count(piece)
+            candidate = f"{current} {piece}".strip() if current else piece
+            if current and (len(candidate) > max_chars or current_words + piece_words > max_words):
+                chunks.append(current)
+                current = piece
+                current_words = piece_words
+            else:
+                current = candidate
+                current_words += piece_words
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _split_oversized_piece(text: str, max_chars: int, max_words: int) -> list[str]:
+    if len(text) <= max_chars and _word_count(text) <= max_words:
+        return [text]
+
+    soft_parts = [
+        part.strip()
+        for part in re.split(r"(?<=[,;:،؛，、])\s+", text)
+        if part.strip()
+    ]
+    if len(soft_parts) > 1:
+        result: list[str] = []
+        for part in soft_parts:
+            result.extend(_split_oversized_piece(part, max_chars=max_chars, max_words=max_words))
+        return result
+
+    words = text.split()
+    if len(words) > 1:
+        result = []
+        current_words: list[str] = []
+        current_len = 0
+        for word in words:
+            next_len = current_len + len(word) + (1 if current_words else 0)
+            if current_words and (len(current_words) >= max_words or next_len > max_chars):
+                result.append(" ".join(current_words))
+                current_words = [word]
+                current_len = len(word)
+            else:
+                current_words.append(word)
+                current_len = next_len
+        if current_words:
+            result.append(" ".join(current_words))
+        return result
+
+    return [text[index : index + max_chars] for index in range(0, len(text), max_chars)]
+
+
+def _hard_split_text(text: str, max_chars: int) -> list[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return [text] if text else []
+
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + max_chars)
+        if end < len(text):
+            split_at = max(text.rfind(" ", start, end), text.rfind(",", start, end), text.rfind(".", start, end))
+            if split_at > start + max_chars // 3:
+                end = split_at
+        chunk = text[start:end].strip(" ,.;:")
+        if chunk:
+            chunks.append(chunk)
+        start = max(end, start + 1)
+    return chunks
+
+
+def _word_count(text: str) -> int:
+    return len(text.split()) if " " in text else max(1, len(text) // 6)
+
+
+def _xtts_language(target_lang: str) -> str:
+    code = target_lang.lower()
+    aliases = {
+        "zh-cn": "zh-cn",
+        "zh": "zh-cn",
+        "pt-br": "pt",
+    }
+    return aliases.get(code, code)
+
+
+@contextlib.contextmanager
+def _torch_load_legacy_checkpoint_mode() -> Iterator[None]:
+    """Let older Coqui XTTS checkpoints load under PyTorch 2.6+.
+
+    PyTorch 2.6 changed torch.load's default to weights_only=True. Coqui TTS
+    0.22 expects the old default for XTTS checkpoints, so we scope the legacy
+    behavior to model initialization instead of changing global process state
+    permanently.
+    """
+    try:
+        import torch
+    except ImportError:
+        yield
+        return
+
+    original_load = torch.load
+
+    def patched_load(*args: object, **kwargs: object) -> object:
+        kwargs.setdefault("weights_only", False)
+        return original_load(*args, **kwargs)
+
+    torch.load = patched_load  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        torch.load = original_load  # type: ignore[assignment]
