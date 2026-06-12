@@ -13,7 +13,7 @@ from typing import Any
 
 from .bot_config import BotSettings, load_bot_settings
 from .download import download_video_url, extract_url
-from .ffmpeg import probe_duration, trim_video
+from .ffmpeg import compress_video_for_telegram, probe_duration, trim_video
 from .models import DubConfig
 from .pipeline import run_dub, run_transcript
 from .watermark import add_watermark
@@ -67,6 +67,8 @@ ASR_METHOD_CONFIGS = {
     "fw-small-soft": ("faster-whisper", "small", False),
     "fw-small-forced": ("faster-whisper", "small", True),
 }
+
+TELEGRAM_SAFE_VIDEO_BYTES = 45 * 1024 * 1024
 
 
 def main() -> None:
@@ -992,7 +994,10 @@ async def _process_job(
             )
             send_path = watermarked_path
 
-        progress.update("Отправляю видео", 99, 100, None)
+        if _video_needs_telegram_compression(send_path):
+            progress.update("Сжимаю видео для Telegram", 99, 100, _format_file_size(send_path.stat().st_size))
+        else:
+            progress.update("Отправляю видео", 99, 100, None)
         output_filename = _lalaschool_filename(job.get("source_title") or Path(job["input_path"]).stem, send_path.suffix)
         transcript_text = _read_transcript_text(job_dir / "work" / "translated.srt")
         _save_job_snapshot(job_dir, job, status="ready")
@@ -1180,7 +1185,84 @@ def _write_transcript_text(job_dir: Path, source_title: str, transcript_text: st
     return path
 
 
+def _video_needs_telegram_compression(video_path: Path) -> bool:
+    try:
+        return video_path.stat().st_size > TELEGRAM_SAFE_VIDEO_BYTES
+    except OSError:
+        return False
+
+
+def _format_file_size(size_bytes: int) -> str:
+    return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def _telegram_video_output_path(video_path: Path, suffix: str) -> Path:
+    output_suffix = video_path.suffix if video_path.suffix.lower() == ".mp4" else ".mp4"
+    return video_path.with_name(f"{video_path.stem}{suffix}{output_suffix}")
+
+
+async def _telegram_sendable_video_path(
+    video_path: Path,
+    *,
+    target_size_mb: float = 45.0,
+    suffix: str = "_telegram",
+    force: bool = False,
+) -> Path:
+    if not force and not _video_needs_telegram_compression(video_path):
+        return video_path
+
+    output_path = _telegram_video_output_path(video_path, suffix)
+    source_mtime = video_path.stat().st_mtime
+    if output_path.exists() and output_path.stat().st_size > 1024 and output_path.stat().st_mtime >= source_mtime:
+        if force or output_path.stat().st_size <= TELEGRAM_SAFE_VIDEO_BYTES:
+            return output_path
+
+    await asyncio.to_thread(
+        compress_video_for_telegram,
+        video_path,
+        output_path,
+        target_size_mb=target_size_mb,
+    )
+    if output_path.stat().st_size > TELEGRAM_SAFE_VIDEO_BYTES and target_size_mb > 35.0:
+        return await _telegram_sendable_video_path(
+            video_path,
+            target_size_mb=35.0,
+            suffix="_telegram_small",
+            force=True,
+        )
+    return output_path
+
+
+def _is_request_entity_too_large(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".casefold()
+    return "request entity too large" in text or "entity too large" in text or "413" in text
+
+
 async def _send_video_file(
+    bot: Any,
+    chat_id: int | str,
+    video_path: Path,
+    filename: str,
+    *,
+    caption: str | None = None,
+    reply_markup: Any = None,
+) -> None:
+    send_path = await _telegram_sendable_video_path(video_path)
+    try:
+        await _send_video_file_once(bot, chat_id, send_path, filename, caption=caption, reply_markup=reply_markup)
+    except Exception as exc:
+        if not _is_request_entity_too_large(exc):
+            raise
+        retry_path = await _telegram_sendable_video_path(
+            video_path,
+            target_size_mb=35.0,
+            suffix="_telegram_small",
+            force=True,
+        )
+        await _send_video_file_once(bot, chat_id, retry_path, filename, caption=caption, reply_markup=reply_markup)
+
+
+async def _send_video_file_once(
     bot: Any,
     chat_id: int | str,
     video_path: Path,

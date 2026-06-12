@@ -127,6 +127,58 @@ def trim_video(input_path: Path, output_path: Path, duration: float) -> None:
     )
 
 
+def compress_video_for_telegram(
+    input_path: Path,
+    output_path: Path,
+    *,
+    target_size_mb: float = 45.0,
+    max_width: int = 1280,
+    audio_bitrate_k: int = 96,
+) -> None:
+    duration = max(1.0, probe_duration(input_path))
+    total_kbit_budget = target_size_mb * 8192 * 0.90
+    video_bitrate_k = max(320, int(total_kbit_budget / duration - audio_bitrate_k))
+    maxrate_k = max(video_bitrate_k, int(video_bitrate_k * 1.35))
+    bufsize_k = maxrate_k * 2
+    ffmpeg = require_tool("ffmpeg")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    run(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(input_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-vf",
+            f"scale=w='if(gt(iw,{max_width}),{max_width},iw)':h=-2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-b:v",
+            f"{video_bitrate_k}k",
+            "-maxrate",
+            f"{maxrate_k}k",
+            "-bufsize",
+            f"{bufsize_k}k",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            f"{audio_bitrate_k}k",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+    )
+
+
 def make_silence(wav_path: Path, duration: float, sample_rate: int = 44100) -> None:
     ffmpeg = require_tool("ffmpeg")
     wav_path.parent.mkdir(parents=True, exist_ok=True)
