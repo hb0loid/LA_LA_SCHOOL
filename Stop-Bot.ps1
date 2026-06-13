@@ -5,7 +5,7 @@ $OutLog = Join-Path $Root "bot.out.log"
 $PidFile = Join-Path $Root "bot.pid"
 
 Set-Location -LiteralPath $Root
-New-Item -ItemType File -Force -Path $OutLog | Out-Null
+if (-not (Test-Path -LiteralPath $OutLog)) { New-Item -ItemType File -Path $OutLog | Out-Null }
 
 $stopped = $false
 if (Test-Path -LiteralPath $PidFile) {
@@ -14,17 +14,29 @@ if (Test-Path -LiteralPath $PidFile) {
     $process = Get-Process -Id ([int]$pidText)
     if ($process) {
       Stop-Process -Id $process.Id -Force
-      Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Stopped pid=$pidText"
+      Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Stopped watchdog pid=$pidText"
       $stopped = $true
     }
   }
   Remove-Item -LiteralPath $PidFile -Force
 }
 
+$watchdogs = Get-CimInstance Win32_Process |
+  Where-Object {
+    $_.CommandLine -like "*Run-Bot-Watchdog.ps1*" -and
+    $_.CommandLine -like "*-Instance test*" -and
+    $_.CommandLine -like "*$Root*"
+  }
+
+foreach ($watchdog in $watchdogs) {
+  Stop-Process -Id $watchdog.ProcessId -Force
+  Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Stopped extra watchdog pid=$($watchdog.ProcessId)"
+  $stopped = $true
+}
+
 $matches = Get-CimInstance Win32_Process |
   Where-Object {
     $_.CommandLine -like "*laladub.bot*" -and
-    $_.CommandLine -like "*$Root*" -and
     $_.CommandLine -like "*--instance test*"
   }
 

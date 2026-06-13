@@ -4,21 +4,51 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $OutLog = Join-Path $Root "bot.out.log"
 $ErrLog = Join-Path $Root "bot.err.log"
 $PidFile = Join-Path $Root "bot.pid"
+$WatchdogScript = Join-Path $Root "Run-Bot-Watchdog.ps1"
 
 Set-Location -LiteralPath $Root
 New-Item -ItemType Directory -Force -Path (Join-Path $Root "runs\bot") | Out-Null
-New-Item -ItemType File -Force -Path $OutLog | Out-Null
-New-Item -ItemType File -Force -Path $ErrLog | Out-Null
+if (-not (Test-Path -LiteralPath $OutLog)) { New-Item -ItemType File -Path $OutLog | Out-Null }
+if (-not (Test-Path -LiteralPath $ErrLog)) { New-Item -ItemType File -Path $ErrLog | Out-Null }
 
 if (Test-Path -LiteralPath $PidFile) {
   $existingPid = Get-Content -LiteralPath $PidFile -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($existingPid) {
-    $existingProcess = Get-Process -Id ([int]$existingPid) -ErrorAction SilentlyContinue
+    $existingProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $existingPid" -ErrorAction SilentlyContinue
     if ($existingProcess) {
-      Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Bot is already running, pid=$existingPid"
-      exit 0
+      if (
+        $existingProcess.CommandLine -like "*Run-Bot-Watchdog.ps1*" -and
+        $existingProcess.CommandLine -like "*-Instance test*" -and
+        $existingProcess.CommandLine -like "*$Root*"
+      ) {
+        Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Bot watchdog is already running, pid=$existingPid" -ErrorAction SilentlyContinue
+        exit 0
+      }
+      if (
+        $existingProcess.CommandLine -like "*laladub.bot*" -and
+        $existingProcess.CommandLine -like "*--instance test*"
+      ) {
+        Stop-Process -Id ([int]$existingPid) -Force
+        Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Stopped legacy direct bot pid=$existingPid before starting watchdog" -ErrorAction SilentlyContinue
+      } else {
+        Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Ignoring stale pid=$existingPid before starting watchdog" -ErrorAction SilentlyContinue
+      }
     }
   }
+  Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
+}
+
+$existingWatchdog = Get-CimInstance Win32_Process |
+  Where-Object {
+    $_.CommandLine -like "*Run-Bot-Watchdog.ps1*" -and
+    $_.CommandLine -like "*-Instance test*" -and
+    $_.CommandLine -like "*$Root*"
+  } |
+  Select-Object -First 1
+if ($existingWatchdog) {
+  Set-Content -LiteralPath $PidFile -Value $existingWatchdog.ProcessId
+  Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Bot watchdog is already running, pid=$($existingWatchdog.ProcessId)" -ErrorAction SilentlyContinue
+  exit 0
 }
 
 $token = [Environment]::GetEnvironmentVariable("LALADUB_BOT_TOKEN", "User")
@@ -26,7 +56,7 @@ if (-not $token) {
   $token = [Environment]::GetEnvironmentVariable("LALADUB_BOT_TOKEN", "Process")
 }
 if (-not $token) {
-  Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) LALADUB_BOT_TOKEN is not set."
+  Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) LALADUB_BOT_TOKEN is not set." -ErrorAction SilentlyContinue
   exit 1
 }
 
@@ -84,16 +114,23 @@ if (-not $env:LALADUB_WATERMARK_IMAGE) { $env:LALADUB_WATERMARK_IMAGE = (Join-Pa
 if (-not $env:PYTHONPATH) { $env:PYTHONPATH = (Join-Path $Root "src") }
 if (-not $env:PYTHONIOENCODING) { $env:PYTHONIOENCODING = "utf-8" }
 
-$python = (Get-Command python -ErrorAction Stop).Source
-Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Starting La La Dub Bot..."
+Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Starting La La Dub Bot Watchdog..." -ErrorAction SilentlyContinue
+$watchdogArguments = (
+  "-NoProfile " +
+  "-ExecutionPolicy Bypass " +
+  "-File `"$WatchdogScript`" " +
+  "-Root `"$Root`" " +
+  "-Instance test " +
+  "-OutLog `"$OutLog`" " +
+  "-ErrLog `"$ErrLog`" " +
+  "-RestartDelaySeconds 8"
+)
 $process = Start-Process `
-  -FilePath $python `
-  -ArgumentList @("-m", "laladub.bot", "--instance", "test") `
+  -FilePath "powershell.exe" `
+  -ArgumentList $watchdogArguments `
   -WorkingDirectory $Root `
-  -RedirectStandardOutput $OutLog `
-  -RedirectStandardError $ErrLog `
   -WindowStyle Hidden `
   -PassThru
 
 Set-Content -LiteralPath $PidFile -Value $process.Id
-Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Started pid=$($process.Id)"
+Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Started watchdog pid=$($process.Id)" -ErrorAction SilentlyContinue

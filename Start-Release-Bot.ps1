@@ -4,33 +4,63 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $OutLog = Join-Path $Root "bot.release.out.log"
 $ErrLog = Join-Path $Root "bot.release.err.log"
 $PidFile = Join-Path $Root "bot.release.pid"
+$WatchdogScript = Join-Path $Root "Run-Bot-Watchdog.ps1"
 $TokenFile = Join-Path $Root ".secrets\Release-Bot-Token.ps1"
 $WorkDir = Join-Path $Root "runs\bot-release"
 
 Set-Location -LiteralPath $Root
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
-New-Item -ItemType File -Force -Path $OutLog | Out-Null
-New-Item -ItemType File -Force -Path $ErrLog | Out-Null
+if (-not (Test-Path -LiteralPath $OutLog)) { New-Item -ItemType File -Path $OutLog | Out-Null }
+if (-not (Test-Path -LiteralPath $ErrLog)) { New-Item -ItemType File -Path $ErrLog | Out-Null }
 
 if (Test-Path -LiteralPath $PidFile) {
   $existingPid = Get-Content -LiteralPath $PidFile -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($existingPid) {
-    $existingProcess = Get-Process -Id ([int]$existingPid) -ErrorAction SilentlyContinue
+    $existingProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $existingPid" -ErrorAction SilentlyContinue
     if ($existingProcess) {
-      Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Release bot is already running, pid=$existingPid"
-      exit 0
+      if (
+        $existingProcess.CommandLine -like "*Run-Bot-Watchdog.ps1*" -and
+        $existingProcess.CommandLine -like "*-Instance release*" -and
+        $existingProcess.CommandLine -like "*$Root*"
+      ) {
+        Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Release watchdog is already running, pid=$existingPid" -ErrorAction SilentlyContinue
+        exit 0
+      }
+      if (
+        $existingProcess.CommandLine -like "*laladub.bot*" -and
+        $existingProcess.CommandLine -like "*--instance release*"
+      ) {
+        Stop-Process -Id ([int]$existingPid) -Force
+        Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Stopped legacy direct release bot pid=$existingPid before starting watchdog" -ErrorAction SilentlyContinue
+      } else {
+        Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Ignoring stale release pid=$existingPid before starting watchdog" -ErrorAction SilentlyContinue
+      }
     }
   }
+  Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
+}
+
+$existingWatchdog = Get-CimInstance Win32_Process |
+  Where-Object {
+    $_.CommandLine -like "*Run-Bot-Watchdog.ps1*" -and
+    $_.CommandLine -like "*-Instance release*" -and
+    $_.CommandLine -like "*$Root*"
+  } |
+  Select-Object -First 1
+if ($existingWatchdog) {
+  Set-Content -LiteralPath $PidFile -Value $existingWatchdog.ProcessId
+  Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Release watchdog is already running, pid=$($existingWatchdog.ProcessId)" -ErrorAction SilentlyContinue
+  exit 0
 }
 
 if (-not (Test-Path -LiteralPath $TokenFile)) {
-  Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) Release token file is missing: $TokenFile"
+  Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) Release token file is missing: $TokenFile" -ErrorAction SilentlyContinue
   exit 1
 }
 
 . $TokenFile
 if (-not $ReleaseBotToken) {
-  Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) Release bot token is empty."
+  Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) Release bot token is empty." -ErrorAction SilentlyContinue
   exit 1
 }
 
@@ -74,16 +104,23 @@ $env:LALADUB_SUPPRESS_PLAIN_ASCII_TOKENS = "0"
 $env:PYTHONPATH = (Join-Path $Root "src")
 $env:PYTHONIOENCODING = "utf-8"
 
-$python = (Get-Command python -ErrorAction Stop).Source
-Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Starting La La Dub Release Bot..."
+Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Starting La La Dub Release Watchdog..." -ErrorAction SilentlyContinue
+$watchdogArguments = (
+  "-NoProfile " +
+  "-ExecutionPolicy Bypass " +
+  "-File `"$WatchdogScript`" " +
+  "-Root `"$Root`" " +
+  "-Instance release " +
+  "-OutLog `"$OutLog`" " +
+  "-ErrLog `"$ErrLog`" " +
+  "-RestartDelaySeconds 8"
+)
 $process = Start-Process `
-  -FilePath $python `
-  -ArgumentList @("-m", "laladub.bot", "--instance", "release") `
+  -FilePath "powershell.exe" `
+  -ArgumentList $watchdogArguments `
   -WorkingDirectory $Root `
-  -RedirectStandardOutput $OutLog `
-  -RedirectStandardError $ErrLog `
   -WindowStyle Hidden `
   -PassThru
 
 Set-Content -LiteralPath $PidFile -Value $process.Id
-Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Started release pid=$($process.Id)"
+Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Started release watchdog pid=$($process.Id)" -ErrorAction SilentlyContinue

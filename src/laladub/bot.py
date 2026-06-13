@@ -141,7 +141,7 @@ async def _setup_bot_commands(application: Any) -> None:
             ("cancel", "Сбросить текущую задачу"),
         ]
     )
-    application.create_task(_recover_interrupted_jobs(application))
+    asyncio.create_task(_recover_interrupted_jobs(application))
 
 
 async def start(update: Any, context: Any) -> None:
