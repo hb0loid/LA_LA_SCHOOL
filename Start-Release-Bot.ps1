@@ -118,7 +118,12 @@ $env:LALADUB_SUPPRESS_PLAIN_ASCII_TOKENS = "0"
 $env:PYTHONPATH = (Join-Path $Root "src")
 $env:PYTHONIOENCODING = "utf-8"
 
-$python = (Get-Command python -ErrorAction Stop).Source
+$python = Join-Path $Root ".venv-f5tts\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $python)) {
+  Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) F5/CUDA Python is missing: $python" -ErrorAction SilentlyContinue
+  exit 1
+}
+$python = (Resolve-Path -LiteralPath $python).Path
 Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Starting La La Dub Release Watchdog..." -ErrorAction SilentlyContinue
 Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Python: $python" -ErrorAction SilentlyContinue
 $watchdogArguments = (
