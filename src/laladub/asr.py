@@ -148,6 +148,17 @@ def _load_openai_whisper_model(model_name: str, device: str | None) -> object:
     return whisper.load_model(model_name, device=device)
 
 
+def clear_openai_whisper_cache() -> None:
+    _load_openai_whisper_model.cache_clear()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 @lru_cache(maxsize=32)
 def _ascii_text_suppress_tokens(is_multilingual: bool, language: str) -> list[int]:
     from whisper.tokenizer import get_tokenizer

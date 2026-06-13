@@ -10,7 +10,7 @@ import random
 import re
 import wave
 
-from .asr import transcribe
+from .asr import clear_openai_whisper_cache, transcribe
 from .ffmpeg import (
     combine_video_audio,
     concat_wavs,
@@ -220,6 +220,7 @@ def _clamp_segments_to_duration(segments: list[Segment], source_duration: float)
                 translated_text=segment.translated_text,
                 speaker_wav=segment.speaker_wav,
                 speaker_id=segment.speaker_id,
+                speaker_ref_text=segment.speaker_ref_text,
             )
         )
 
@@ -412,6 +413,7 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         print(f"      Resume: loaded artifact candidates={len(artifact_segments)}")
     else:
         artifact_segments = _build_artifact_segments(source_audio, config, segments)
+        clear_openai_whisper_cache()
         _save_resume_state(config, artifacts=bool(artifact_segments))
 
     translation_detail = _translation_progress_detail(config)
@@ -1120,6 +1122,7 @@ def _offset_segments(segments: list[Segment], offset: float, source_duration: fl
                 translated_text=segment.translated_text,
                 speaker_wav=segment.speaker_wav,
                 speaker_id=segment.speaker_id,
+                speaker_ref_text=segment.speaker_ref_text,
             )
         )
     return result
@@ -1799,6 +1802,7 @@ def _assign_segment_speaker_refs(segments: list[Segment], reference_audio: Path,
             print(f"      Speaker reference skipped for segment {index}: {type(exc).__name__}: {exc}")
             continue
         segment.speaker_wav = ref_path
+        segment.speaker_ref_text = _speaker_reference_text(segment)
         extracted += 1
 
         embedding, quality = _speaker_embedding(ref_path)
@@ -1860,6 +1864,13 @@ def _assign_segment_speaker_refs(segments: list[Segment], reference_audio: Path,
         "      XTTS speaker clustering: "
         f"{extracted} refs, {len(candidates)} usable, {len(bank_paths)} speaker banks from {reference_audio}"
     )
+
+
+def _speaker_reference_text(segment: Segment) -> str:
+    text = re.sub(r"\s+", " ", segment.spoken_text).strip()
+    if len(text) > 260:
+        text = text[:260].rsplit(" ", 1)[0].strip() or text[:260].strip()
+    return text
 
 
 def _speaker_embedding(path: Path) -> tuple[object | None, float]:

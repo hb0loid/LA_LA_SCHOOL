@@ -13,6 +13,7 @@ class Segment:
     translated_text: str | None = None
     speaker_wav: Path | None = None
     speaker_id: str | None = None
+    speaker_ref_text: str | None = None
 
     @property
     def duration(self) -> float:

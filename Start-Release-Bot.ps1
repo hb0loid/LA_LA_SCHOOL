@@ -68,18 +68,32 @@ $env:LALADUB_BOT_TOKEN = $ReleaseBotToken
 $paidUsers = [Environment]::GetEnvironmentVariable("LALADUB_PAID_USERS", "User")
 if ($paidUsers) { $env:LALADUB_PAID_USERS = $paidUsers }
 $env:LALADUB_BOT_WORKDIR = $WorkDir
-$env:LALADUB_TTS = "xtts"
+$env:LALADUB_TTS = "f5"
 $env:LALADUB_TRANSLATOR = "hybrid"
-$env:LALADUB_MAX_ACTIVE_JOBS = "2"
+$env:LALADUB_MAX_ACTIVE_JOBS = "1"
 $env:LALADUB_MAX_ACTIVE_JOBS_PER_USER = "1"
 $env:LALADUB_FREE_MAX_DURATION_SECONDS = "180"
 $env:LALADUB_PAID_MAX_DURATION_SECONDS = "0"
 $env:LALADUB_WATERMARK_IMAGE = (Join-Path $Root "assets\watermark.png")
 $env:LALADUB_VOICE = "Microsoft Irina Desktop"
 $env:LALADUB_XTTS_DEVICE = "cpu"
+$env:LALADUB_F5_PYTHON = (Join-Path $Root ".venv-f5tts\Scripts\python.exe")
+$env:LALADUB_F5_MODEL = "F5TTS_v1_Base"
+$env:LALADUB_F5_HF_REPO = "Misha24-10/F5-TTS_RUSSIAN"
+$env:LALADUB_F5_HF_CKPT_PATH = "F5TTS_v1_Base_v2/model_last_inference.safetensors"
+$env:LALADUB_F5_HF_VOCAB_PATH = "F5TTS_v1_Base/vocab.txt"
+$env:LALADUB_F5_CACHE_DIR = (Join-Path $Root "models\f5tts")
+$env:LALADUB_F5_DEVICE = "auto"
+$env:LALADUB_F5_SPEED = "1.0"
+$env:LALADUB_F5_NFE_STEP = "32"
+$env:LALADUB_F5_CFG_STRENGTH = "2.0"
+$env:LALADUB_F5_TARGET_RMS = "0.1"
+$env:LALADUB_F5_CROSS_FADE_DURATION = "0.15"
+$env:LALADUB_F5_REMOVE_SILENCE = "0"
+$env:LALADUB_F5_TIMEOUT_SECONDS = "1800"
 $env:LALADUB_MULTI_SPEAKER = "1"
 $env:LALADUB_SPEAKER_REFERENCE_SECONDS = "5.0"
-$env:LALADUB_SPEAKER_CLUSTERING = "1"
+$env:LALADUB_SPEAKER_CLUSTERING = "0"
 $env:LALADUB_MAX_SPEAKER_CLUSTERS = "6"
 $env:LALADUB_SPEAKER_CLUSTER_THRESHOLD = "0.08"
 $env:LALADUB_SEPARATION = "demucs"
@@ -104,7 +118,9 @@ $env:LALADUB_SUPPRESS_PLAIN_ASCII_TOKENS = "0"
 $env:PYTHONPATH = (Join-Path $Root "src")
 $env:PYTHONIOENCODING = "utf-8"
 
+$python = (Get-Command python -ErrorAction Stop).Source
 Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Starting La La Dub Release Watchdog..." -ErrorAction SilentlyContinue
+Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Python: $python" -ErrorAction SilentlyContinue
 $watchdogArguments = (
   "-NoProfile " +
   "-ExecutionPolicy Bypass " +
@@ -113,6 +129,7 @@ $watchdogArguments = (
   "-Instance release " +
   "-OutLog `"$OutLog`" " +
   "-ErrLog `"$ErrLog`" " +
+  "-Python `"$python`" " +
   "-RestartDelaySeconds 8"
 )
 $process = Start-Process `

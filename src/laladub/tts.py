@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import os
 import re
 import subprocess
 import sys
@@ -185,6 +186,7 @@ def _synthesize_f5tts(segment: Segment, text: str, output_path: Path, config: Du
     if not text:
         make_silence(output_path, max(0.15, segment.duration))
         return
+    ref_text = _sanitize_text_for_xtts(segment.speaker_ref_text or segment.spoken_text)
 
     speaker_wav = segment.speaker_wav or config.speaker_wav
     if not speaker_wav:
@@ -200,22 +202,28 @@ def _synthesize_f5tts(segment: Segment, text: str, output_path: Path, config: Du
         chunk_dir.mkdir(parents=True, exist_ok=True)
         for index, chunk in enumerate(chunks, start=1):
             chunk_path = chunk_dir / f"{index:04d}.wav"
-            _f5_to_file(chunk, chunk_path, speaker_wav, config)
+            _f5_to_file(chunk, chunk_path, speaker_wav, config, ref_text)
             chunk_paths.append(chunk_path)
         concat_wavs(chunk_paths, output_path)
     else:
-        _f5_to_file(text, output_path, speaker_wav, config)
+        _f5_to_file(text, output_path, speaker_wav, config, ref_text)
 
     if not output_path.exists() or output_path.stat().st_size < 1024:
         raise TTSError(f"F5-TTS produced an empty WAV file: {output_path}")
 
 
-def _f5_to_file(text: str, output_path: Path, speaker_wav: Path, config: DubConfig) -> None:
+def _f5_to_file(
+    text: str,
+    output_path: Path,
+    speaker_wav: Path,
+    config: DubConfig,
+    ref_text: str,
+) -> None:
     try:
         model = _load_f5_model(config)
         model.infer(
             ref_file=str(speaker_wav),
-            ref_text="",
+            ref_text=ref_text,
             gen_text=text,
             file_wave=str(output_path),
             target_rms=config.f5_target_rms,
@@ -228,7 +236,7 @@ def _f5_to_file(text: str, output_path: Path, speaker_wav: Path, config: DubConf
     except Exception as exc:
         output_path.unlink(missing_ok=True)
         print(f"      F5-TTS in-process failed, trying isolated runner: {type(exc).__name__}: {exc}")
-        _f5_to_file_subprocess(text, output_path, speaker_wav, config)
+        _f5_to_file_subprocess(text, output_path, speaker_wav, config, ref_text)
 
     if not output_path.exists() or output_path.stat().st_size < 1024:
         raise TTSError(f"F5-TTS produced an empty WAV file: {output_path}")
@@ -257,7 +265,13 @@ def _load_f5_model(config: DubConfig) -> object:
     return model
 
 
-def _f5_to_file_subprocess(text: str, output_path: Path, speaker_wav: Path, config: DubConfig) -> None:
+def _f5_to_file_subprocess(
+    text: str,
+    output_path: Path,
+    speaker_wav: Path,
+    config: DubConfig,
+    ref_text: str,
+) -> None:
     python_path = _resolve_f5_python(config)
     runner_path = _repo_root() / "tools" / "f5_tts_runner.py"
     if not runner_path.exists():
@@ -270,6 +284,8 @@ def _f5_to_file_subprocess(text: str, output_path: Path, speaker_wav: Path, conf
         str(speaker_wav),
         "--text-base64",
         base64.b64encode(text.encode("utf-8")).decode("ascii"),
+        "--ref-text-base64",
+        base64.b64encode(ref_text.encode("utf-8")).decode("ascii"),
         "--output",
         str(output_path),
         "--model",
@@ -302,11 +318,14 @@ def _f5_to_file_subprocess(text: str, output_path: Path, speaker_wav: Path, conf
     if config.f5_remove_silence:
         command.append("--remove-silence")
 
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     result = subprocess.run(
         command,
         check=True,
         capture_output=True,
         text=True,
+        env=env,
         timeout=config.f5_timeout_seconds,
     )
     message = _short_subprocess_output(result.stdout, result.stderr)
