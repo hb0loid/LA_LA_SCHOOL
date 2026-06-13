@@ -4,7 +4,9 @@ import asyncio
 import contextlib
 import heapq
 import json
+import multiprocessing
 import re
+import sys
 import threading
 import time
 import traceback
@@ -17,6 +19,15 @@ from .ffmpeg import compress_video_for_telegram, probe_duration, trim_video
 from .models import DubConfig
 from .pipeline import run_dub, run_transcript
 from .watermark import add_watermark
+
+
+def _force_current_python_for_child_processes() -> None:
+    multiprocessing.set_executable(sys.executable)
+    if hasattr(sys, "_base_executable"):
+        sys._base_executable = sys.executable
+
+
+_force_current_python_for_child_processes()
 
 
 SOURCE_LANGS = [
