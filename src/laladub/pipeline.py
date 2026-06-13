@@ -1030,16 +1030,16 @@ def _whisper_chaos_audio(source_audio: Path, config: DubConfig, *, purpose: str)
     if not (config.artifact_chaos_mode and config.force_source_language and config.source_lang):
         return source_audio
 
-    output_path = config.workdir / f"{purpose}_whisper_bassboost.wav"
+    output_path = config.workdir / f"{purpose}_whisper_loud.wav"
     if output_path.exists() and output_path.stat().st_size > 1024:
         return output_path
 
     try:
-        print(f"      Preparing bass-boosted Whisper audio: {purpose}")
-        make_whisper_chaos_audio(source_audio, output_path, bass_gain_db=50.0)
+        print(f"      Preparing loudness-boosted Whisper audio: {purpose}")
+        make_whisper_chaos_audio(source_audio, output_path, gain_db=50.0)
         return output_path
     except Exception as exc:
-        print(f"      Bass-boosted Whisper audio skipped: {type(exc).__name__}: {exc}")
+        print(f"      Loudness-boosted Whisper audio skipped: {type(exc).__name__}: {exc}")
         return source_audio
 
 

@@ -242,7 +242,7 @@ def prepare_voice_reference(input_path: Path, output_path: Path, sample_rate: in
     )
 
 
-def make_whisper_chaos_audio(input_path: Path, output_path: Path, bass_gain_db: float = 50.0) -> None:
+def make_whisper_chaos_audio(input_path: Path, output_path: Path, gain_db: float = 50.0) -> None:
     ffmpeg = require_tool("ffmpeg")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     run(
@@ -253,7 +253,7 @@ def make_whisper_chaos_audio(input_path: Path, output_path: Path, bass_gain_db: 
             str(input_path),
             "-vn",
             "-af",
-            f"bass=g={bass_gain_db:.1f}:f=120:w=1,volume=1.8,alimiter=limit=0.98",
+            f"volume={gain_db:.1f}dB,alimiter=limit=0.98",
             "-ac",
             "1",
             "-ar",
