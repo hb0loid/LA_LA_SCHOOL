@@ -9,6 +9,16 @@ from pathlib import Path
 class BotSettings:
     token: str
     workdir: Path
+    executor_mode: str
+    max_local_jobs: int
+    worker_api_host: str
+    worker_api_port: int
+    worker_api_token: str
+    worker_package_path: Path
+    worker_package_manifest_path: Path
+    worker_version: str
+    job_retention_seconds: float
+    cleanup_interval_seconds: float
     paid_users: frozenset[int]
     max_active_jobs: int
     max_active_jobs_per_user: int
@@ -72,21 +82,33 @@ class BotSettings:
         return user_id is not None and user_id in self.paid_users
 
 
-def load_bot_settings() -> BotSettings:
+def load_bot_settings(*, require_token: bool = True) -> BotSettings:
     token = os.environ.get("LALADUB_BOT_TOKEN", "").strip()
-    if not token:
+    if require_token and not token:
         raise RuntimeError("Set LALADUB_BOT_TOKEN to your Telegram bot token.")
 
     return BotSettings(
         token=token,
         workdir=Path(os.environ.get("LALADUB_BOT_WORKDIR", "runs/bot")),
+        executor_mode=os.environ.get("LALADUB_EXECUTOR_MODE", "local").strip().lower(),
+        max_local_jobs=max(0, int(os.environ.get("LALADUB_MAX_LOCAL_JOBS", "1"))),
+        worker_api_host=os.environ.get("LALADUB_WORKER_API_HOST", "127.0.0.1").strip() or "127.0.0.1",
+        worker_api_port=int(os.environ.get("LALADUB_WORKER_API_PORT", "8765")),
+        worker_api_token=os.environ.get("LALADUB_WORKER_API_TOKEN", "").strip(),
+        worker_package_path=Path(os.environ.get("LALADUB_WORKER_PACKAGE_PATH", "dist/LaLaDubWorker-update.zip")),
+        worker_package_manifest_path=Path(
+            os.environ.get("LALADUB_WORKER_PACKAGE_MANIFEST", "dist/LaLaDubWorker-update.manifest.json")
+        ),
+        worker_version=os.environ.get("LALADUB_WORKER_VERSION", "0.1.0").strip() or "0.1.0",
+        job_retention_seconds=max(0.0, float(os.environ.get("LALADUB_JOB_RETENTION_SECONDS", "86400"))),
+        cleanup_interval_seconds=max(60.0, float(os.environ.get("LALADUB_CLEANUP_INTERVAL_SECONDS", "3600"))),
         paid_users=frozenset(_parse_user_ids(os.environ.get("LALADUB_PAID_USERS", ""))),
         max_active_jobs=max(1, int(os.environ.get("LALADUB_MAX_ACTIVE_JOBS", "2"))),
         max_active_jobs_per_user=max(1, int(os.environ.get("LALADUB_MAX_ACTIVE_JOBS_PER_USER", "1"))),
         watermark_text=os.environ.get("LALADUB_WATERMARK_TEXT", "La La Local Dub"),
         watermark_image=_optional_path(os.environ.get("LALADUB_WATERMARK_IMAGE")),
         max_file_mb=int(os.environ.get("LALADUB_MAX_FILE_MB", "200")),
-        free_max_duration_seconds=float(os.environ.get("LALADUB_FREE_MAX_DURATION_SECONDS", "180")),
+        free_max_duration_seconds=float(os.environ.get("LALADUB_FREE_MAX_DURATION_SECONDS", "60")),
         paid_max_duration_seconds=float(os.environ.get("LALADUB_PAID_MAX_DURATION_SECONDS", "0")),
         translator=os.environ.get("LALADUB_TRANSLATOR", "hybrid"),
         tts=os.environ.get("LALADUB_TTS", "xtts"),

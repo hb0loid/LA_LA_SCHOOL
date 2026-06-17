@@ -155,6 +155,8 @@ laladub-bot
 - `LALADUB_FREE_MAX_DURATION_SECONDS` - лимит длительности для free-пользователей, по умолчанию `180` секунд.
 - `LALADUB_PAID_MAX_DURATION_SECONDS` - лимит длительности для paid-пользователей, по умолчанию `0` без ограничения.
 - `LALADUB_BOT_WORKDIR` - папка задач, по умолчанию `runs/bot`.
+- `LALADUB_JOB_RETENTION_SECONDS` - сколько хранить завершённые задачи (`done`, `failed`, `rejected`) перед автоочисткой, по умолчанию `86400` секунд. `0` отключает очистку.
+- `LALADUB_CLEANUP_INTERVAL_SECONDS` - как часто запускать автоочистку, по умолчанию `3600` секунд.
 - `LALADUB_TRANSLATOR` - `hybrid`, `googleweb`, `mymemory`, `argos`, `libretranslate` или `identity`.
 - `LALADUB_TTS` - `xtts`, `f5`, `sapi`, `piper` или `none`; `Start-Bot.ps1` по умолчанию ставит `f5`.
 - `LALADUB_VOICE` - имя SAPI-голоса.
@@ -195,3 +197,26 @@ laladub-bot
 Сейчас XTTS по умолчанию использует сегментные speaker reference: для каждой реплики нарезается короткий фрагмент оригинального вокала рядом с её таймингом. Это лучше одного общего голоса, но это ещё не полноценная diarization. Следующий этап для качества - определить, кто говорит в каждом сегменте, кластеризовать спикеров и собрать отдельные чистые референсы для каждого персонажа.
 
 XTTS v2 в Coqui TTS требует принятия CPML terms. Для локального прототипа можно выставить `COQUI_TOS_AGREED=1`, если ты принимаешь эти условия. Для платного публичного сервиса нужно отдельно проверить права на модель, голоса и исходное видео.
+## Release Worker Setup
+
+Release bot starts in `hybrid` mode from `Start-Release-Bot.cmd`: one local job slot stays on the main PC and remote workers can lease more jobs through the worker API on port `8765`.
+
+Build worker packages:
+
+```powershell
+.\Build-Worker-Package.cmd
+```
+
+Use `release.env.example.ps1` and `worker_config.example.json` as templates.
+Keep real tokens in `.secrets` or environment variables only.
+
+Outputs:
+
+- `dist\LaLaDubWorker\` - folder ready to zip or copy to a laptop.
+- `dist\LaLaDubWorker.zip` - full first-install package.
+- `dist\LaLaDubWorker-update.zip` - small code-only update package served to workers.
+- `dist\LaLaDubWorker-update.manifest.json` - update metadata served by the release bot.
+
+The portable package includes `worker_config.json` automatically when `.secrets\Worker-Api-Token.txt` exists. Workers do not need the Telegram bot token. They use only the worker token.
+
+For another PC on the same LAN, unzip `LaLaDubWorker.zip`, run `Start-Worker.cmd`, and leave it open. When the release bot package changes, idle workers download the update from the main PC and restart themselves.

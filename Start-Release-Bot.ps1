@@ -6,6 +6,7 @@ $ErrLog = Join-Path $Root "bot.release.err.log"
 $PidFile = Join-Path $Root "bot.release.pid"
 $WatchdogScript = Join-Path $Root "Run-Bot-Watchdog.ps1"
 $TokenFile = Join-Path $Root ".secrets\Release-Bot-Token.ps1"
+$WorkerTokenFile = Join-Path $Root ".secrets\Worker-Api-Token.txt"
 $WorkDir = Join-Path $Root "runs\bot-release"
 
 Set-Location -LiteralPath $Root
@@ -64,13 +65,96 @@ if (-not $ReleaseBotToken) {
   exit 1
 }
 
+if (-not (Test-Path -LiteralPath $WorkerTokenFile)) {
+  $bytes = [byte[]]::new(32)
+  $rng = [Security.Cryptography.RNGCryptoServiceProvider]::new()
+  try {
+    $rng.GetBytes($bytes)
+  } finally {
+    $rng.Dispose()
+  }
+  $workerToken = ([BitConverter]::ToString($bytes) -replace "-", "").ToLowerInvariant()
+  Set-Content -LiteralPath $WorkerTokenFile -Value $workerToken -Encoding UTF8
+} else {
+  $workerToken = (Get-Content -LiteralPath $WorkerTokenFile -Raw -Encoding UTF8).Trim()
+}
+if (-not $workerToken) {
+  Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) Worker API token is empty: $WorkerTokenFile" -ErrorAction SilentlyContinue
+  exit 1
+}
+
+function Set-LaLaDubModelCaches {
+  $portableCacheRoot = Join-Path $Root "models\cache"
+  $userCacheRoot = Join-Path $env:USERPROFILE ".cache"
+  $portableWhisperCache = Join-Path $portableCacheRoot "whisper"
+  $userWhisperCache = Join-Path $userCacheRoot "whisper"
+  $portableHfHome = Join-Path $portableCacheRoot "huggingface"
+  $userHfHome = Join-Path $userCacheRoot "huggingface"
+
+  if (-not $env:XDG_CACHE_HOME) {
+    if (Test-Path -LiteralPath $portableWhisperCache) {
+      $env:XDG_CACHE_HOME = $portableCacheRoot
+    } elseif (Test-Path -LiteralPath $userWhisperCache) {
+      $env:XDG_CACHE_HOME = $userCacheRoot
+    } else {
+      New-Item -ItemType Directory -Force -Path $portableCacheRoot | Out-Null
+      $env:XDG_CACHE_HOME = $portableCacheRoot
+    }
+  }
+
+  if (-not $env:HF_HOME) {
+    if (Test-Path -LiteralPath $portableHfHome) {
+      $env:HF_HOME = $portableHfHome
+    } elseif (Test-Path -LiteralPath $userHfHome) {
+      $env:HF_HOME = $userHfHome
+    } else {
+      New-Item -ItemType Directory -Force -Path $portableHfHome | Out-Null
+      $env:HF_HOME = $portableHfHome
+    }
+  }
+
+  if (-not $env:HF_HUB_DISABLE_SYMLINKS_WARNING) {
+    $env:HF_HUB_DISABLE_SYMLINKS_WARNING = "1"
+  }
+}
+
+Set-LaLaDubModelCaches
+
 $env:LALADUB_BOT_TOKEN = $ReleaseBotToken
 $paidUsers = [Environment]::GetEnvironmentVariable("LALADUB_PAID_USERS", "User")
 if ($paidUsers) { $env:LALADUB_PAID_USERS = $paidUsers }
 $env:LALADUB_BOT_WORKDIR = $WorkDir
+$env:LALADUB_EXECUTOR_MODE = "hybrid"
+$env:LALADUB_MAX_LOCAL_JOBS = "1"
+$env:LALADUB_WORKER_API_HOST = "0.0.0.0"
+$env:LALADUB_WORKER_API_PORT = "8765"
+$workerApiPort = $env:LALADUB_WORKER_API_PORT
+try {
+  $firewallRuleName = "LaLaDub Worker API 8765"
+  $existingFirewallRule = Get-NetFirewallRule -DisplayName $firewallRuleName -ErrorAction SilentlyContinue
+  if ($existingFirewallRule) {
+    Set-NetFirewallRule -DisplayName $firewallRuleName -Enabled True -Direction Inbound -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+  } else {
+    New-NetFirewallRule `
+      -DisplayName $firewallRuleName `
+      -Direction Inbound `
+      -Action Allow `
+      -Protocol TCP `
+      -LocalPort $workerApiPort `
+      -Profile Any `
+      -ErrorAction Stop | Out-Null
+  }
+} catch {
+  Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) Could not ensure worker API firewall rule: $($_.Exception.Message)" -ErrorAction SilentlyContinue
+}
+$env:LALADUB_WORKER_API_TOKEN = $workerToken
+$env:LALADUB_WORKER_PACKAGE_PATH = (Join-Path $Root "dist\LaLaDubWorker-update.zip")
+$env:LALADUB_WORKER_PACKAGE_MANIFEST = (Join-Path $Root "dist\LaLaDubWorker-update.manifest.json")
+$env:LALADUB_JOB_RETENTION_SECONDS = "86400"
+$env:LALADUB_CLEANUP_INTERVAL_SECONDS = "3600"
 $env:LALADUB_TTS = "f5"
 $env:LALADUB_TRANSLATOR = "hybrid"
-$env:LALADUB_MAX_ACTIVE_JOBS = "1"
+$env:LALADUB_MAX_ACTIVE_JOBS = "2"
 $env:LALADUB_MAX_ACTIVE_JOBS_PER_USER = "1"
 $env:LALADUB_FREE_MAX_DURATION_SECONDS = "180"
 $env:LALADUB_PAID_MAX_DURATION_SECONDS = "0"

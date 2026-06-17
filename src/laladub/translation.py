@@ -71,7 +71,7 @@ def translate_text_chain(text: str, languages: list[str], config: DubConfig) -> 
     current = text
     for source_lang, target_lang in zip(languages, languages[1:]):
         current = translate_text(current, source_lang, target_lang, config)
-    return current
+    return _postprocess_translated_text(current, languages[-1] if languages else config.target_lang)
 
 
 def _translate_hybrid(segments: list[Segment], config: DubConfig) -> list[Segment]:
@@ -80,7 +80,10 @@ def _translate_hybrid(segments: list[Segment], config: DubConfig) -> list[Segmen
 
     for segment in segments:
         text = segment.text.strip()
-        segment.translated_text = _translate_hybrid_text(text, config.source_lang, config.target_lang, config)
+        segment.translated_text = _postprocess_translated_text(
+            _translate_hybrid_text(text, config.source_lang, config.target_lang, config),
+            config.target_lang,
+        )
     return segments
 
 
@@ -93,19 +96,19 @@ def _translate_hybrid_text(text: str, source_lang: str, target_lang: str, config
     try:
         translated = _translate_googleweb_text(text, source_lang, target_lang)
         if not _looks_bad_machine_translation(translated):
-            return translated
+            return _postprocess_translated_text(translated, target_lang)
     except Exception as exc:
         online_errors.append(exc)
 
     try:
         translated = _translate_mymemory_text(text, source_lang, target_lang)
         if not _looks_bad_machine_translation(translated):
-            return translated
+            return _postprocess_translated_text(translated, target_lang)
     except Exception as exc:
         online_errors.append(exc)
 
     try:
-        return _translate_argos_provider_text(text, source_lang, target_lang)
+        return _postprocess_translated_text(_translate_argos_provider_text(text, source_lang, target_lang), target_lang)
     except Exception as exc:
         if online_errors:
             online_details = "; ".join(f"{type(item).__name__}: {item}" for item in online_errors)
@@ -124,9 +127,14 @@ def _translate_googleweb(segments: list[Segment], config: DubConfig) -> list[Seg
     for segment in segments:
         text = segment.text.strip()
         known = _translate_known_meta_text(text, config.source_lang, config.target_lang)
-        segment.translated_text = known if known is not None else _translate_googleweb_text(
-            text,
-            config.source_lang,
+        segment.translated_text = _postprocess_translated_text(
+            known
+            if known is not None
+            else _translate_googleweb_text(
+                text,
+                config.source_lang,
+                config.target_lang,
+            ),
             config.target_lang,
         )
     return segments
@@ -158,7 +166,7 @@ def _translate_googleweb_text(text: str, source_lang: str, target_lang: str) -> 
         raise TranslationError(f"Unexpected GoogleWeb response: {data!r}") from exc
     if not translated.strip():
         raise TranslationError("GoogleWeb returned an empty translation.")
-    return translated.strip()
+    return _postprocess_translated_text(translated.strip(), target_lang)
 
 
 def _translate_mymemory(segments: list[Segment], config: DubConfig) -> list[Segment]:
@@ -168,9 +176,14 @@ def _translate_mymemory(segments: list[Segment], config: DubConfig) -> list[Segm
     for segment in segments:
         text = segment.text.strip()
         known = _translate_known_meta_text(text, config.source_lang, config.target_lang)
-        segment.translated_text = known if known is not None else _translate_mymemory_text(
-            text,
-            config.source_lang,
+        segment.translated_text = _postprocess_translated_text(
+            known
+            if known is not None
+            else _translate_mymemory_text(
+                text,
+                config.source_lang,
+                config.target_lang,
+            ),
             config.target_lang,
         )
     return segments
@@ -196,7 +209,7 @@ def _translate_mymemory_text(text: str, source_lang: str, target_lang: str) -> s
     translated = str(data.get("responseData", {}).get("translatedText") or "").strip()
     if not translated:
         raise TranslationError(f"Unexpected MyMemory response: {data!r}")
-    return translated
+    return _postprocess_translated_text(translated, target_lang)
 
 
 def _translate_argos_provider_text(text: str, source_lang: str, target_lang: str) -> str:
@@ -208,7 +221,10 @@ def _translate_argos_provider_text(text: str, source_lang: str, target_lang: str
         ) from exc
 
     _ensure_argos_route(source_lang, target_lang, argostranslate.translate)
-    return _translate_argos_text(text, source_lang, target_lang, argostranslate.translate)
+    return _postprocess_translated_text(
+        _translate_argos_text(text, source_lang, target_lang, argostranslate.translate),
+        target_lang,
+    )
 
 
 def _translate_argos(segments: list[Segment], config: DubConfig) -> list[Segment]:
@@ -226,11 +242,16 @@ def _translate_argos(segments: list[Segment], config: DubConfig) -> list[Segment
     for segment in segments:
         text = segment.text.strip()
         known = _translate_known_meta_text(text, config.source_lang, config.target_lang)
-        segment.translated_text = known if known is not None else _translate_argos_text(
-            text,
-            config.source_lang,
+        segment.translated_text = _postprocess_translated_text(
+            known
+            if known is not None
+            else _translate_argos_text(
+                text,
+                config.source_lang,
+                config.target_lang,
+                argostranslate.translate,
+            ),
             config.target_lang,
-            argostranslate.translate,
         )
     return segments
 
@@ -241,14 +262,14 @@ def _translate_argos_text(text: str, source_lang: str, target_lang: str, transla
 
     direct = _get_argos_translation(translate_module, source_lang, target_lang)
     if direct is not None:
-        return direct.translate(text)
+        return _postprocess_translated_text(direct.translate(text), target_lang)
 
     pivot_lang = "en"
     if source_lang != pivot_lang and target_lang != pivot_lang:
         first = _get_argos_translation(translate_module, source_lang, pivot_lang)
         second = _get_argos_translation(translate_module, pivot_lang, target_lang)
         if first is not None and second is not None:
-            return second.translate(first.translate(text))
+            return _postprocess_translated_text(second.translate(first.translate(text)), target_lang)
 
     raise TranslationError(
         f"Argos package is missing for {source_lang}->{target_lang}. "
@@ -346,11 +367,14 @@ def _translate_libretranslate(segments: list[Segment], config: DubConfig) -> lis
             segment.translated_text = ""
             continue
 
-        segment.translated_text = _translate_libretranslate_text(
-            text,
-            config.source_lang,
+        segment.translated_text = _postprocess_translated_text(
+            _translate_libretranslate_text(
+                text,
+                config.source_lang,
+                config.target_lang,
+                config,
+            ),
             config.target_lang,
-            config,
         )
 
     return segments
@@ -384,7 +408,7 @@ def _translate_libretranslate_text(
         data = json.loads(response.read().decode("utf-8"))
 
     try:
-        return data["translatedText"]
+        return _postprocess_translated_text(data["translatedText"], target_lang)
     except KeyError as exc:
         raise TranslationError(f"Unexpected LibreTranslate response: {data}") from exc
 
@@ -397,8 +421,29 @@ _VI_SUBSCRIBE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_TURKISH_SUBTITLES_CREDIT_RE = re.compile(
+    r"^\s*altyaz[ıi]\s+m\.?\s*k\.?\s*$",
+    re.IGNORECASE,
+)
+
+_RU_BAD_SUBTITLE_CREDIT_RE = re.compile(
+    r"\b[Пп]одзаголов(?:ок|ки)\s+(?:M|М)\.?\s*(?:K|К)\.?",
+    re.IGNORECASE,
+)
+
+
+def _postprocess_translated_text(text: str, target_lang: str) -> str:
+    if target_lang != "ru" or not text:
+        return text
+    return _RU_BAD_SUBTITLE_CREDIT_RE.sub("Субтитры М.К.", text)
+
 
 def _translate_known_meta_text(text: str, source_lang: str, target_lang: str) -> str | None:
+    if source_lang == "tr" and target_lang == "ru":
+        compact = re.sub(r"\s+", " ", text).strip()
+        if _TURKISH_SUBTITLES_CREDIT_RE.match(compact):
+            return "Субтитры М.К."
+
     if source_lang != "vi" or target_lang != "ru":
         return None
 

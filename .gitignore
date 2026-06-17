@@ -1,6 +1,9 @@
 .venv/
 .venv-f5tts/
 .secrets/
+worker_config.json
+.worker_state.json
+updates/
 __pycache__/
 *.pyc
 .pytest_cache/

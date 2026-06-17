@@ -39,6 +39,7 @@ _META_HALLUCINATION_TERMS = [
     "caption",
     "captions",
     "amara.org",
+    "solanya",
     "subscribe",
     "subscribed",
     "thanks for watching",
@@ -1616,23 +1617,29 @@ def _shorten_text_to_duration(text: str, duration: float, *, chaos: bool = False
         return text
 
     if chaos:
-        max_words = max(1, int(duration * 4.2 + 0.5))
-        max_chars = max(14, int(duration * 27.0))
+        max_words = max(2, int(duration * 6.2 + 1.5))
+        max_chars = max(28, int(duration * 42.0))
     else:
-        max_words = max(1, int(duration * 3.0 + 0.5))
-        max_chars = max(10, int(duration * 18.0))
+        max_words = max(2, int(duration * 4.8 + 1.5))
+        max_chars = max(24, int(duration * 34.0))
     if duration < 0.65:
-        max_chars = min(max_chars, 18 if chaos else 14)
+        max_chars = min(max_chars, 32 if chaos else 26)
 
+    shortened = False
     words = text.split()
     if len(words) > max_words:
         text = " ".join(words[:max_words])
+        shortened = True
 
     if len(text) > max_chars:
         trimmed = text[:max_chars].rsplit(" ", 1)[0].strip()
         text = trimmed or text[:max_chars].strip()
+        shortened = True
 
-    return text.rstrip(" ,;:")
+    text = text.rstrip(" ,;:")
+    if shortened and text and not text.endswith(("...", "…")):
+        return f"{text}..."
+    return text
 
 
 def _artifact_slots(

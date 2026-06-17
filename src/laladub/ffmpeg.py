@@ -351,8 +351,6 @@ def fit_wav_to_duration(
 
     ffmpeg = require_tool("ffmpeg")
     filter_value = _atempo_chain(min(tempo, max_tempo))
-    if tempo > max_tempo:
-        filter_value = f"{filter_value},atrim=0:{target_duration:.3f},asetpts=N/SR/TB"
 
     run(
         [

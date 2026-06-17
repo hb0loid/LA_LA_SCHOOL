@@ -20,6 +20,22 @@ class TTSError(RuntimeError):
 
 _XTTS_CACHE: dict[tuple[str, str], object] = {}
 _F5_CACHE: dict[tuple[str, str, str, str], object] = {}
+_F5_PRONUNCIATION_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    ("Ghiền Mì Gõ", "гиен ми го"),
+    ("Ghien Mi Go", "гиен ми го"),
+    ("Amara.org", "амара орг"),
+    ("YouTube", "ютуб"),
+    ("TikTok", "тикток"),
+    ("ElevenLabs", "элевенлабс"),
+    ("DimaTorzok", "дима торзок"),
+    ("Ming Jing", "минь джинг"),
+    ("Mingjing", "минь джинг"),
+    ("Diandian", "дян дян"),
+    ("Dian Dian", "дян дян"),
+    ("Altyazı M.K.", "субтитры эм ка"),
+    ("Altyazi M.K.", "субтитры эм ка"),
+    ("Субтитры М.К.", "субтитры эм ка"),
+)
 
 
 def synthesize_segment(segment: Segment, output_path: Path, config: DubConfig) -> None:
@@ -182,11 +198,11 @@ def _synthesize_piper(text: str, output_path: Path, config: DubConfig) -> None:
 
 
 def _synthesize_f5tts(segment: Segment, text: str, output_path: Path, config: DubConfig) -> None:
-    text = _sanitize_text_for_xtts(text)
+    text = _sanitize_text_for_f5(text, config)
     if not text:
         make_silence(output_path, max(0.15, segment.duration))
         return
-    ref_text = _sanitize_text_for_xtts(segment.speaker_ref_text or segment.spoken_text)
+    ref_text = _sanitize_text_for_f5(segment.speaker_ref_text or segment.spoken_text, config)
 
     speaker_wav = segment.speaker_wav or config.speaker_wav
     if not speaker_wav:
@@ -518,6 +534,20 @@ def _sanitize_text_for_xtts(text: str) -> str:
             continue
         cleaned.append(char)
     return re.sub(r"\s+", " ", "".join(cleaned)).strip()
+
+
+def _sanitize_text_for_f5(text: str, config: DubConfig) -> str:
+    text = _sanitize_text_for_xtts(text)
+    if not text:
+        return ""
+    return _apply_f5_pronunciation_dictionary(text)
+
+
+def _apply_f5_pronunciation_dictionary(text: str) -> str:
+    for source, replacement in _F5_PRONUNCIATION_REPLACEMENTS:
+        pattern = re.compile(rf"(?<!\w){re.escape(source)}(?!\w)", re.IGNORECASE)
+        text = pattern.sub(replacement, text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _split_text_for_xtts(text: str, max_chars: int = 520, max_words: int = 85) -> list[str]:

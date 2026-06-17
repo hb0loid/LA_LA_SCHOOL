@@ -1,0 +1,5 @@
+{
+  "server": "http://MAIN_PC_IP:8765",
+  "token": "PASTE_WORKER_API_TOKEN_HERE",
+  "worker_id": "worker-1"
+}
