@@ -1,4 +1,6 @@
-# La La Local Dub
+# LA LA SCHOOL Local Dubber
+
+Увага! Этот бот на 100 процентов сгенерирован нейросетью, автор не то что за кодинг не шарит, а в принципе за гитхаб и всё из него вытекающее не судите строга :3
 
 Локальный конвейер для перевода и дубляжа видео с Telegram-ботом. Бот оставляет два рабочих режима: сырой текст Whisper и полноценный дубляж с переводом, вырезанием оригинального вокала и XTTS voice cloning.
 
@@ -187,36 +189,5 @@ laladub-bot
 - `LALADUB_COLLAPSE_REPETITIONS` - `1` по умолчанию: сжимает повторяющиеся слова/фразы перед XTTS.
 - `LALADUB_MAX_PHRASE_REPEATS` - сколько раз подряд можно оставить одинаковую фразу, по умолчанию `2`.
 - `LALADUB_MAX_WORD_REPEATS` - сколько раз подряд можно оставить одно слово, по умолчанию `3`.
-
-## Что Дальше
-
-Текущая оплата сделана как allowlist: paid-пользователи добавляются через `LALADUB_PAID_USERS`. Следующий естественный шаг - подключить реальную оплату: Telegram Payments, YooKassa, CryptoBot или ручную админ-команду, которая добавляет ID в локальную базу.
-
-## Ограничения Клонирования
-
-Сейчас XTTS по умолчанию использует сегментные speaker reference: для каждой реплики нарезается короткий фрагмент оригинального вокала рядом с её таймингом. Это лучше одного общего голоса, но это ещё не полноценная diarization. Следующий этап для качества - определить, кто говорит в каждом сегменте, кластеризовать спикеров и собрать отдельные чистые референсы для каждого персонажа.
-
-XTTS v2 в Coqui TTS требует принятия CPML terms. Для локального прототипа можно выставить `COQUI_TOS_AGREED=1`, если ты принимаешь эти условия. Для платного публичного сервиса нужно отдельно проверить права на модель, голоса и исходное видео.
-## Release Worker Setup
-
-Release bot starts in `hybrid` mode from `Start-Release-Bot.cmd`: one local job slot stays on the main PC and remote workers can lease more jobs through the worker API on port `8765`.
-
-Build worker packages:
-
-```powershell
-.\Build-Worker-Package.cmd
-```
-
-Use `release.env.example.ps1` and `worker_config.example.json` as templates.
-Keep real tokens in `.secrets` or environment variables only.
-
-Outputs:
-
-- `dist\LaLaDubWorker\` - folder ready to zip or copy to a laptop.
-- `dist\LaLaDubWorker.zip` - full first-install package.
-- `dist\LaLaDubWorker-update.zip` - small code-only update package served to workers.
-- `dist\LaLaDubWorker-update.manifest.json` - update metadata served by the release bot.
-
-The portable package includes `worker_config.json` automatically when `.secrets\Worker-Api-Token.txt` exists. Workers do not need the Telegram bot token. They use only the worker token.
 
 For another PC on the same LAN, unzip `LaLaDubWorker.zip`, run `Start-Worker.cmd`, and leave it open. When the release bot package changes, idle workers download the update from the main PC and restart themselves.
