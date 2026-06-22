@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
+
+from .ffmpeg import require_tool
 
 
 class DownloadError(RuntimeError):
@@ -36,7 +39,7 @@ def download_video_url(url: str, output_dir: Path, max_file_mb: int) -> Path:
     max_bytes = max_file_mb * 1024 * 1024
     output_template = str(output_dir / "input.%(ext)s")
     options: dict[str, object] = {
-        "format": "bv*+ba/b",
+        "format": "bv*[vcodec!=none][height<=720]+ba/b[vcodec!=none][height<=720]/bv*[vcodec!=none]+ba/b[vcodec!=none]",
         "merge_output_format": "mp4",
         "outtmpl": output_template,
         "noplaylist": True,
@@ -53,6 +56,7 @@ def download_video_url(url: str, output_dir: Path, max_file_mb: int) -> Path:
 
     errors: list[str] = []
     info = None
+    video_path: Path | None = None
     for profile_name, profile_options in _download_profiles(parsed.netloc):
         for candidate in output_dir.glob("input.*"):
             if candidate.is_file():
@@ -61,10 +65,13 @@ def download_video_url(url: str, output_dir: Path, max_file_mb: int) -> Path:
         try:
             with yt_dlp.YoutubeDL(merged_options) as downloader:
                 info = downloader.extract_info(url, download=True)
-            break
+            video_path = _find_downloaded_video(output_dir)
+            if video_path is not None:
+                break
+            errors.append(f"{profile_name}: скачивание завершилось, но итоговый файл не содержит видео и аудио")
         except Exception as exc:
             errors.append(f"{profile_name}: {exc}")
-    else:
+    if video_path is None:
         version = getattr(getattr(yt_dlp, "version", None), "__version__", "unknown")
         error_text = "; ".join(errors[-3:]) if errors else "unknown error"
         hint = ""
@@ -89,15 +96,6 @@ def download_video_url(url: str, output_dir: Path, max_file_mb: int) -> Path:
             encoding="utf-8",
         )
 
-    candidates = [
-        path
-        for path in output_dir.glob("input.*")
-        if path.suffix.lower() in _MEDIA_SUFFIXES and not path.name.endswith(".part")
-    ]
-    if not candidates:
-        raise DownloadError("Скачивание завершилось, но видеофайл не найден.")
-
-    video_path = max(candidates, key=lambda path: path.stat().st_mtime)
     if video_path.stat().st_size > max_bytes:
         size_mb = video_path.stat().st_size / 1024 / 1024
         video_path.unlink(missing_ok=True)
@@ -106,9 +104,67 @@ def download_video_url(url: str, output_dir: Path, max_file_mb: int) -> Path:
     return video_path
 
 
+def _find_downloaded_video(output_dir: Path) -> Path | None:
+    candidates = [
+        path
+        for path in output_dir.glob("input.*")
+        if path.suffix.lower() in _MEDIA_SUFFIXES and not path.name.endswith(".part")
+    ]
+    candidates = [path for path in candidates if has_video_and_audio(path)]
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def has_video_and_audio(path: Path) -> bool:
+    ffprobe = require_tool("ffprobe")
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return False
+    try:
+        streams = json.loads(result.stdout).get("streams", [])
+    except json.JSONDecodeError:
+        return False
+    stream_types = {str(stream.get("codec_type") or "") for stream in streams}
+    return "video" in stream_types and "audio" in stream_types
+
+
 def _download_profiles(netloc: str) -> list[tuple[str, dict[str, object]]]:
     if "tiktok.com" not in netloc.lower():
-        return [("standard", {})]
+        return [
+            ("standard-720", {}),
+            (
+                "fallback-480",
+                {
+                    "format": (
+                        "bv*[vcodec!=none][height<=480]+ba/"
+                        "b[vcodec!=none][height<=480]/"
+                        "bv*[vcodec!=none][height<=360]+ba/"
+                        "b[vcodec!=none][height<=360]"
+                    )
+                },
+            ),
+            (
+                "fallback-any-video",
+                {"format": "b[vcodec!=none]/bv*[vcodec!=none]+ba"},
+            ),
+        ]
 
     return [
         ("tiktok-standard", {}),
@@ -123,7 +179,7 @@ def _download_profiles(netloc: str) -> list[tuple[str, dict[str, object]]]:
         (
             "tiktok-mobile-format",
             {
-                "format": "b/bv*+ba",
+                "format": "b[vcodec!=none]/bv*[vcodec!=none]+ba",
                 "extractor_args": {"tiktok": {"api_hostname": ["api16-normal-c-useast1a.tiktokv.com"]}},
             },
         ),

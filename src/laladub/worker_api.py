@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
+import os
+import re
 import shutil
 import threading
 import urllib.parse
@@ -44,6 +47,7 @@ class _WorkerHTTPServer(ThreadingHTTPServer):
         self.context = context
         self.loop = loop
         self.token = token
+        self.trusted_worker_networks = _trusted_worker_networks()
 
 
 class _WorkerRequestHandler(BaseHTTPRequestHandler):
@@ -185,7 +189,15 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
 
     def _authorized(self) -> bool:
         header = self.headers.get("Authorization", "")
-        return header == f"Bearer {self.server.token}"
+        if header == f"Bearer {self.server.token}":
+            return True
+        if not header.startswith("Bearer ") or not header[7:].strip():
+            return False
+        try:
+            client_ip = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            return False
+        return any(client_ip in network for network in self.server.trusted_worker_networks)
 
     def _match_job_path(self, path: str) -> tuple[str | None, str]:
         prefix = "/api/v1/jobs/"
@@ -254,6 +266,22 @@ def _read_json_file(path: Path) -> dict[str, Any]:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _trusted_worker_networks() -> list[Any]:
+    value = os.environ.get("LALADUB_WORKER_API_TRUSTED_IPS", "").strip()
+    if not value:
+        return []
+    networks: list[Any] = []
+    for item in re.split(r"[,;\s]+", value):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            print(f"Worker API trusted IP ignored: {item}", flush=True)
+    return networks
 
 
 def _sha256_file(path: Path) -> str:

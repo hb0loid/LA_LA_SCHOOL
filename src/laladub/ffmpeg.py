@@ -315,6 +315,40 @@ def concat_wavs(input_paths: list[Path], output_path: Path) -> None:
     run(cmd)
 
 
+def _run_mux_with_video_fallback(cmd: list[str]) -> None:
+    try:
+        run(cmd)
+    except subprocess.CalledProcessError:
+        fallback = _video_reencode_fallback_cmd(cmd)
+        if fallback is None:
+            raise
+        run(fallback)
+
+
+def _video_reencode_fallback_cmd(cmd: list[str]) -> list[str] | None:
+    try:
+        codec_index = cmd.index("-c:v")
+    except ValueError:
+        return None
+    if codec_index + 1 >= len(cmd) or cmd[codec_index + 1] != "copy":
+        return None
+
+    fallback = list(cmd)
+    fallback[codec_index + 1 : codec_index + 2] = [
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "22",
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    if "-movflags" not in fallback:
+        output_path = fallback.pop()
+        fallback.extend(["-movflags", "+faststart", output_path])
+    return fallback
+
+
 def _atempo_chain(factor: float) -> str:
     factor = max(0.25, min(8.0, factor))
     parts: list[float] = []
@@ -499,4 +533,4 @@ def combine_video_audio(
             "-shortest",
             str(output_path),
         ]
-    run(cmd)
+    _run_mux_with_video_fallback(cmd)

@@ -40,6 +40,8 @@ _META_HALLUCINATION_TERMS = [
     "captions",
     "amara.org",
     "solanya",
+    "dimatorzok",
+    "dima torzok",
     "subscribe",
     "subscribed",
     "thanks for watching",
@@ -554,7 +556,9 @@ def _build_artifact_segments(
     artifact_lang = config.artifact_source_lang
     if not config.inject_artifacts or not artifact_lang or artifact_lang == "auto":
         return []
-    if config.source_lang and artifact_lang == config.source_lang:
+    same_language_hunt = bool(config.source_lang and artifact_lang == config.source_lang)
+    ru_same_language_hunt = same_language_hunt and artifact_lang == "ru"
+    if same_language_hunt and not ru_same_language_hunt:
         return []
 
     _report_progress(
@@ -578,12 +582,19 @@ def _build_artifact_segments(
     artifact_config.force_source_language = True
     artifact_config.suppress_plain_ascii_tokens = False
     artifact_config.condition_on_previous_text = True
-    artifact_config.initial_prompt = None
+    artifact_config.initial_prompt = _artifact_initial_prompt(artifact_lang, same_language=ru_same_language_hunt)
     artifact_config.hallucination_silence_threshold = None
     artifact_config.collapse_repetitions = True
 
     whole_artifacts = _load_resumable_artifact_source(config, artifact_lang) if config.resume else []
     if whole_artifacts:
+        if ru_same_language_hunt:
+            before = len(whole_artifacts)
+            whole_artifacts = _filter_same_language_ru_artifacts(whole_artifacts)
+            print(
+                "      Same-language RU artifact filter: "
+                f"kept={len(whole_artifacts)} dropped={before - len(whole_artifacts)}"
+            )
         _report_progress(
             config,
             "Перевожу Whisper-артефакты",
@@ -614,6 +625,13 @@ def _build_artifact_segments(
                     whole_artifacts = _clean_chaos_artifact_source_segments(whole_artifacts)
                 else:
                     whole_artifacts = _clean_artifact_source_segments(whole_artifacts)
+                if ru_same_language_hunt:
+                    before = len(whole_artifacts)
+                    whole_artifacts = _filter_same_language_ru_artifacts(whole_artifacts)
+                    print(
+                        "      Same-language RU artifact filter: "
+                        f"kept={len(whole_artifacts)} dropped={before - len(whole_artifacts)}"
+                    )
                 forced_source_path = config.workdir / f"forced_{_safe_label(artifact_lang)}_transcript.srt"
                 write_srt(forced_source_path, whole_artifacts, translated=False)
                 write_srt(_debug_path(config, "artifact_source.srt"), whole_artifacts, translated=False)
@@ -957,6 +975,21 @@ def _normalize_lang(language: str | None) -> str | None:
     return language
 
 
+def _artifact_initial_prompt(language: str | None, *, same_language: bool) -> str | None:
+    if language != "ru":
+        return None
+    if same_language:
+        return (
+            "Субтитры сделал DimaTorzok. "
+            "Перевод и субтитры DimaTorzok. "
+            "Subtitles by DimaTorzok. Captions created by DimaTorzok. amara.org."
+        )
+    return (
+        "Субтитры DimaTorzok. "
+        "Subtitles by DimaTorzok. amara.org."
+    )
+
+
 def _translate_artifact_segments(artifacts: list[Segment], artifact_config: DubConfig) -> list[Segment]:
     if not artifacts:
         return artifacts
@@ -1027,6 +1060,22 @@ def _clean_chaos_artifact_source_segments(segments: list[Segment]) -> list[Segme
     return cleaned
 
 
+def _filter_same_language_ru_artifacts(segments: list[Segment]) -> list[Segment]:
+    result: list[Segment] = []
+    seen_per_text: dict[str, int] = {}
+    for segment in sorted(segments, key=lambda item: (item.start, item.end)):
+        if not _looks_like_meta_hallucination(segment.text):
+            continue
+        key = " ".join(segment.text.casefold().split())
+        if seen_per_text.get(key, 0) >= 2:
+            continue
+        seen_per_text[key] = seen_per_text.get(key, 0) + 1
+        result.append(segment)
+        if len(result) >= 8:
+            break
+    return result
+
+
 def _whisper_chaos_audio(source_audio: Path, config: DubConfig, *, purpose: str) -> Path:
     if not (config.artifact_chaos_mode and config.force_source_language and config.source_lang):
         return source_audio
@@ -1062,7 +1111,7 @@ def _harvest_chunked_forced_artifacts(
     print(f"      Chaos artifact chunk harvest: windows={len(windows)}")
     chunk_config = copy(artifact_config)
     chunk_config.condition_on_previous_text = True
-    chunk_config.initial_prompt = None
+    chunk_config.initial_prompt = artifact_config.initial_prompt
     result: list[Segment] = []
     for index, (start, duration) in enumerate(windows, start=1):
         chunk_path = chunk_dir / f"{index:04d}_{start:.2f}_{duration:.2f}.wav"

@@ -128,6 +128,7 @@ $env:LALADUB_EXECUTOR_MODE = "hybrid"
 $env:LALADUB_MAX_LOCAL_JOBS = "1"
 $env:LALADUB_WORKER_API_HOST = "0.0.0.0"
 $env:LALADUB_WORKER_API_PORT = "8765"
+$env:LALADUB_WORKER_API_TRUSTED_IPS = "192.168.1.67"
 $workerApiPort = $env:LALADUB_WORKER_API_PORT
 try {
   $firewallRuleName = "LaLaDub Worker API 8765"
@@ -150,15 +151,15 @@ try {
 $env:LALADUB_WORKER_API_TOKEN = $workerToken
 $env:LALADUB_WORKER_PACKAGE_PATH = (Join-Path $Root "dist\LaLaDubWorker-update.zip")
 $env:LALADUB_WORKER_PACKAGE_MANIFEST = (Join-Path $Root "dist\LaLaDubWorker-update.manifest.json")
-$env:LALADUB_JOB_RETENTION_SECONDS = "86400"
+$env:LALADUB_JOB_RETENTION_SECONDS = "604800"
 $env:LALADUB_CLEANUP_INTERVAL_SECONDS = "3600"
 $env:LALADUB_TTS = "f5"
 $env:LALADUB_TRANSLATOR = "hybrid"
 $env:LALADUB_MAX_ACTIVE_JOBS = "2"
 $env:LALADUB_MAX_ACTIVE_JOBS_PER_USER = "1"
-$env:LALADUB_FREE_MAX_DURATION_SECONDS = "180"
+$env:LALADUB_FREE_MAX_DURATION_SECONDS = "60"
 $env:LALADUB_PAID_MAX_DURATION_SECONDS = "0"
-$env:LALADUB_WATERMARK_IMAGE = (Join-Path $Root "assets\watermark.png")
+$env:LALADUB_WATERMARK_IMAGE = (Join-Path $Root "assets")
 $env:LALADUB_VOICE = "Microsoft Irina Desktop"
 $env:LALADUB_XTTS_DEVICE = "cpu"
 $env:LALADUB_F5_PYTHON = (Join-Path $Root ".venv-f5tts\Scripts\python.exe")

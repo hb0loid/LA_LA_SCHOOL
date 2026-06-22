@@ -76,19 +76,16 @@ def execute_job(
     result = run_dub(input_path, config)
     send_path = result
 
-    user_id = _coerce_int(job.get("user_id"))
-    is_paid = bool(job.get("is_paid")) or settings.is_paid(user_id)
-    if not is_paid:
-        watermarked_path = job_dir / "dubbed_watermarked.mp4"
-        if progress_callback:
-            progress_callback("Adding watermark", 98, 100, None)
-        add_watermark(
-            result,
-            watermarked_path,
-            text=settings.watermark_text,
-            image_path=settings.watermark_image,
-        )
-        send_path = watermarked_path
+    watermarked_path = job_dir / "dubbed_watermarked.mp4"
+    if progress_callback:
+        progress_callback("Adding watermark", 98, 100, None)
+    add_watermark(
+        result,
+        watermarked_path,
+        text=settings.watermark_text,
+        image_path=settings.watermark_image,
+    )
+    send_path = watermarked_path
 
     transcript_text = _read_transcript_text(job_dir / "work" / "translated.srt")
     transcript_path: Path | None = None
@@ -277,7 +274,9 @@ def speaker_count_value(value: Any) -> int | None:
 
 def target_lang_value(value: Any) -> str:
     text = str(value or "").strip().lower()
-    return "uk" if text == "uk" else "ru"
+    if text == "ua":
+        text = "uk"
+    return text if text in {"ru", "uk", "en"} else "ru"
 
 
 def apply_speaker_count(config: DubConfig, job: dict[str, Any]) -> None:

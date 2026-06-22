@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .bot_config import BotSettings, load_bot_settings
-from .download import download_video_url, extract_url
+from .download import download_video_url, extract_url, has_video_and_audio
 from .ffmpeg import compress_video_for_telegram, probe_duration, trim_video
 from .models import DubConfig
 from .pipeline import run_dub, run_transcript
@@ -85,6 +85,7 @@ SPEAKER_COUNT_OPTIONS = [("auto", "Авто"), *[(str(index), str(index)) for in
 TARGET_LANGS = [
     ("ru", "Русский"),
     ("uk", "Украинский"),
+    ("en", "Английский"),
 ]
 
 TELEGRAM_SAFE_VIDEO_BYTES = 45 * 1024 * 1024
@@ -378,7 +379,15 @@ async def receive_link(update: Any, context: Any) -> None:
     if input_path is None:
         return
 
-    await _remember_job_and_ask_source(context, status, job_dir, input_path, source_title, input_source="coordinator_download")
+    await _remember_job_and_ask_source(
+        context,
+        status,
+        job_dir,
+        input_path,
+        source_title,
+        input_source="coordinator_download",
+        source_url=url,
+    )
 
 
 async def _prepare_input_video_duration(
@@ -429,6 +438,56 @@ async def _prepare_input_video_duration(
         f"Видео длиннее лимита. Взял первые {_format_duration(limit)} и продолжаю."
     )
     return trimmed_path
+
+
+async def _ensure_job_input_video(
+    status: Any,
+    job: dict[str, Any],
+    settings: BotSettings,
+    input_path: Path,
+) -> Path | None:
+    if await asyncio.to_thread(has_video_and_audio, input_path):
+        return input_path
+
+    job_dir = Path(str(job["job_dir"]))
+    source_url = str(job.get("source_url") or _download_meta_url(job_dir) or "").strip()
+    if not source_url:
+        await _safe_edit_status(
+            status,
+            "Файл не содержит полноценное видео с аудио. Пришли видеофайл или ссылку заново.",
+        )
+        return None
+
+    await _safe_edit_status(
+        status,
+        "Скачанный файл оказался не видео, а отдельной дорожкой. Перекачиваю ссылку заново...",
+    )
+    try:
+        redownloaded_path = await asyncio.to_thread(download_video_url, source_url, job_dir, settings.max_file_mb)
+    except Exception as exc:
+        details = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+        await _safe_edit_status(status, f"Не смог перекачать видео по ссылке:\n{details}")
+        return None
+
+    if not await asyncio.to_thread(has_video_and_audio, redownloaded_path):
+        await _safe_edit_status(status, "Перекачанный файл всё ещё не содержит полноценное видео с аудио.")
+        return None
+
+    job["input_path"] = str(redownloaded_path)
+    _save_job_snapshot(job_dir, job, status="queued", redownloaded=True)
+    return redownloaded_path
+
+
+def _download_meta_url(job_dir: Path) -> str | None:
+    meta_path = job_dir / "download_meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    value = data.get("webpage_url")
+    return str(value) if value else None
 
 
 def _duration_limit_seconds(settings: BotSettings, user_id: int | None) -> float | None:
@@ -500,6 +559,7 @@ async def _remember_job_and_ask_source(
     source_title: str,
     *,
     input_source: str,
+    source_url: str | None = None,
 ) -> None:
     context.user_data["job"] = {
         "job_dir": str(job_dir),
@@ -507,6 +567,8 @@ async def _remember_job_and_ask_source(
         "source_title": source_title,
         "input_source": input_source,
     }
+    if source_url:
+        context.user_data["job"]["source_url"] = source_url
     _save_job_snapshot(job_dir, context.user_data["job"], status="select_source")
     text = (
         "Выбери input-язык. Для soft-методов это будет промежуточный язык перевода; "
@@ -596,7 +658,7 @@ async def select_target_lang(update: Any, context: Any) -> None:
         return
 
     target_lang = _target_lang_value(query.data.split(":", 1)[1])
-    if target_lang not in {"ru", "uk"}:
+    if target_lang not in {"ru", "uk", "en"}:
         await query.edit_message_text("Неизвестный язык озвучки. Пришли видео ещё раз.")
         return
 
@@ -626,6 +688,10 @@ async def _enqueue_job(update: Any, context: Any, job: dict[str, Any], status_me
 
     input_path = Path(str(job.get("input_path") or ""))
     if input_path.exists():
+        input_path = await _ensure_job_input_video(status_message, job, settings, input_path)
+        if input_path is None:
+            _save_job_snapshot(Path(job["job_dir"]), job, status="rejected", error="invalid_input_media")
+            return
         prepared_input_path = await _prepare_input_video_duration(
             status_message,
             settings,
@@ -1328,7 +1394,9 @@ def _asr_method_label(method: str) -> str:
 
 def _target_lang_value(value: Any) -> str:
     text = str(value or "").strip().lower()
-    return "uk" if text == "uk" else "ru"
+    if text == "ua":
+        text = "uk"
+    return text if text in {"ru", "uk", "en"} else "ru"
 
 
 def _target_lang_label(value: Any) -> str:
@@ -1678,17 +1746,16 @@ async def _process_job(
         result = await asyncio.to_thread(run_dub, Path(job["input_path"]), config)
         send_path = result
 
-        if not settings.is_paid(user_id):
-            watermarked_path = job_dir / "dubbed_watermarked.mp4"
-            progress.update("Добавляю водяной знак", 98, 100, None)
-            await asyncio.to_thread(
-                add_watermark,
-                result,
-                watermarked_path,
-                text=settings.watermark_text,
-                image_path=settings.watermark_image,
-            )
-            send_path = watermarked_path
+        watermarked_path = job_dir / "dubbed_watermarked.mp4"
+        progress.update("Добавляю водяной знак", 98, 100, None)
+        await asyncio.to_thread(
+            add_watermark,
+            result,
+            watermarked_path,
+            text=settings.watermark_text,
+            image_path=settings.watermark_image,
+        )
+        send_path = watermarked_path
 
         if _video_needs_telegram_compression(send_path):
             progress.update("Сжимаю видео для Telegram", 99, 100, _format_file_size(send_path.stat().st_size))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
 from .ffmpeg import require_tool, run
@@ -12,10 +13,29 @@ def add_watermark(
     text: str,
     image_path: Path | None = None,
 ) -> None:
-    if image_path and image_path.exists():
-        add_image_watermark(input_path, output_path, image_path)
+    selected_image = _select_watermark_image(image_path)
+    if selected_image is not None:
+        print(f"      Watermark image: {selected_image}", flush=True)
+        add_image_watermark(input_path, output_path, selected_image)
         return
+    print("      Watermark image: none, using text fallback", flush=True)
     add_text_watermark(input_path, output_path, text)
+
+
+def _select_watermark_image(image_path: Path | None) -> Path | None:
+    if image_path is None or not image_path.exists():
+        return None
+    if image_path.is_file():
+        return image_path if image_path.suffix.casefold() == ".png" else None
+
+    candidates = sorted(
+        path
+        for path in image_path.iterdir()
+        if path.is_file() and path.suffix.casefold() == ".png"
+    )
+    if not candidates:
+        return None
+    return random.choice(candidates)
 
 
 def add_image_watermark(
