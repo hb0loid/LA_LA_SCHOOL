@@ -17,7 +17,7 @@ from typing import Any
 
 from .bot_config import BotSettings, load_bot_settings
 from .download import download_video_url, extract_url, has_video_and_audio
-from .ffmpeg import compress_video_for_telegram, probe_duration, trim_video
+from .ffmpeg import compress_video_for_telegram, make_audio_visual_video, probe_duration, trim_video
 from .models import DubConfig
 from .pipeline import run_dub, run_transcript
 from .watermark import add_watermark
@@ -48,27 +48,29 @@ SOURCE_LANGS = [
     ("it", "Итальянский"),
     ("pt", "Португальский"),
     ("ar", "Арабский"),
+    ("he", "Иврит"),
     ("hi", "Хинди"),
     ("id", "Индонезийский"),
+    ("ms", "Малайзийский"),
+    ("az", "Азербайджанский"),
     ("pl", "Польский"),
     ("uk", "Украинский"),
 ]
 
 ASR_METHODS = [
     ("ow-large-v3-chaos-backbone", "Поломанный дубляж"),
-    ("ow-large-v3-raw-dub", "Сырой forced дубляж"),
 ]
 
 ASR_METHOD_CONFIGS = {
-    "ow-large-v3-hunt": ("openai-whisper", "large-v3", False),
-    "ow-large-v3-chaos-backbone": ("openai-whisper", "large-v3", False),
-    "ow-large-v3-raw-dub": ("openai-whisper", "large-v3", True),
-    "ow-large-v3-chaos": ("openai-whisper", "large-v3", True),
-    "ow-large-v3-soft": ("openai-whisper", "large-v3", False),
-    "ow-large-v3-forced": ("openai-whisper", "large-v3", True),
+    "ow-large-v3-hunt": ("openai-whisper", "turbo", False),
+    "ow-large-v3-chaos-backbone": ("openai-whisper", "turbo", False),
+    "ow-large-v3-raw-dub": ("openai-whisper", "turbo", True),
+    "ow-large-v3-chaos": ("openai-whisper", "turbo", True),
+    "ow-large-v3-soft": ("openai-whisper", "turbo", False),
+    "ow-large-v3-forced": ("openai-whisper", "turbo", True),
     "fw-large-v3-soft": ("faster-whisper", "large-v3", False),
     "fw-large-v3-forced": ("faster-whisper", "large-v3", True),
-    "ow-large-v3-turbo-soft": ("openai-whisper", "large-v3-turbo", False),
+    "ow-large-v3-turbo-soft": ("openai-whisper", "turbo", False),
     "ow-large-v2-soft": ("openai-whisper", "large-v2", False),
     "ow-large-v2-forced": ("openai-whisper", "large-v2", True),
     "ow-large-v1-soft": ("openai-whisper", "large-v1", False),
@@ -82,6 +84,10 @@ ASR_METHOD_CONFIGS = {
 }
 
 SPEAKER_COUNT_OPTIONS = [("auto", "Авто"), *[(str(index), str(index)) for index in range(1, 10)]]
+VISUAL_MODE_OPTIONS = [
+    ("original", "Оставить исходный видеоряд"),
+    ("random", "Видеоряд скучный, сделай прикольно"),
+]
 TARGET_LANGS = [
     ("ru", "Русский"),
     ("uk", "Украинский"),
@@ -93,6 +99,11 @@ TELEGRAM_DIRECT_DOWNLOAD_SAFE_BYTES = 20 * 1024 * 1024
 RECOVERABLE_JOB_STATUSES = {"starting", "running", "queued", "ready"}
 CLEANUP_JOB_STATUSES = {"done", "failed", "rejected"}
 _LAST_STATUS_TEXT: dict[tuple[int | None, int | None], str] = {}
+MAINTENANCE_MESSAGE = (
+    "?????? ??????? ??????????? ?????? ??? ?????. "
+    "?????? ????? ??????? ?????."
+)
+
 
 
 class _ApplicationContext:
@@ -128,19 +139,27 @@ def main() -> None:
         f"separation={settings.separation} "
         f"audio_bed={settings.audio_bed} "
         f"watermark={settings.watermark_image} "
+        f"audio_visual={settings.audio_visual_source_dir or settings.workdir}/"
+        f"{settings.audio_visual_resolution}/max_slice={settings.audio_visual_max_slice_seconds} "
+        f"audio_visual_safety={settings.audio_visual_safety_enabled}/"
+        f"{settings.audio_visual_safety_model}/"
+        f"{settings.audio_visual_safety_threshold}/"
+        f"{settings.audio_visual_safety_frames}/"
+        f"{settings.audio_visual_safety_device} "
         f"paid_users={len(settings.paid_users)} "
         f"duration_limits=free:{settings.free_max_duration_seconds}/paid:{settings.paid_max_duration_seconds} "
         f"collapse_repetitions={settings.collapse_repetitions}/"
         f"{settings.max_phrase_repeats}/{settings.max_word_repeats} "
         f"inject_artifacts={settings.inject_artifacts}/"
         f"{settings.artifact_max_segments}/{settings.artifact_min_gap_seconds} "
-        f"distort={settings.distort_translation}/{settings.translation_pivots} "
+        f"distort={settings.distort_translation}/{settings.translation_pivots}/pass2={settings.translation_second_pass_ratio} "
         f"asr={settings.asr_backend} "
         f"queue={settings.max_active_jobs}/{settings.max_active_jobs_per_user} "
         f"job_retention={settings.job_retention_seconds}s "
         f"default_asr_method={settings.default_asr_method} "
         f"whisper={settings.whisper_model}/{settings.whisper_device}/{settings.whisper_compute_type} "
         f"whisper_only={settings.whisper_only_model}/{settings.whisper_only_device} "
+        f"maintenance={_maintenance_enabled(settings)} "
         f"suppress_ascii={settings.suppress_plain_ascii_tokens}",
         flush=True,
     )
@@ -148,19 +167,59 @@ def main() -> None:
     application = Application.builder().token(settings.token).post_init(_setup_bot_commands).build()
     application.bot_data["settings"] = settings
     application.bot_data["job_scheduler"] = _JobScheduler(settings)
+    application.add_handler(MessageHandler(filters.ALL, maintenance_message_gate), group=-1)
+    application.add_handler(CallbackQueryHandler(maintenance_callback_gate), group=-1)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("me", me))
     application.add_handler(CommandHandler("queue", queue_status))
     application.add_handler(CommandHandler("resume", resume))
     application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CommandHandler("maintenance", maintenance))
     application.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_video))
+    application.add_handler(MessageHandler(filters.AUDIO | filters.VOICE | filters.Document.AUDIO, receive_audio))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_link))
+    application.add_handler(CallbackQueryHandler(select_visual_mode, pattern=r"^vis:"))
     application.add_handler(CallbackQueryHandler(select_source, pattern=r"^src:"))
     application.add_handler(CallbackQueryHandler(select_asr_method, pattern=r"^asr:"))
     application.add_handler(CallbackQueryHandler(select_speaker_count, pattern=r"^spk:"))
     application.add_handler(CallbackQueryHandler(select_target_lang, pattern=r"^tgt:"))
     application.add_handler(CallbackQueryHandler(resume_callback, pattern=r"^resume:"))
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+def _maintenance_flag_path(settings: BotSettings) -> Path:
+    return settings.workdir / "maintenance.flag"
+
+
+def _maintenance_enabled(settings: BotSettings) -> bool:
+    return _maintenance_flag_path(settings).is_file()
+
+
+def _set_maintenance_enabled(settings: BotSettings, enabled: bool, *, user_id: int | None = None) -> None:
+    flag_path = _maintenance_flag_path(settings)
+    if not enabled:
+        flag_path.unlink(missing_ok=True)
+        return
+
+    flag_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = flag_path.with_suffix(".tmp")
+    temporary_path.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "enabled_at": time.time(),
+                "enabled_by": user_id,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    temporary_path.replace(flag_path)
+
+
+def _maintenance_blocks_user(settings: BotSettings, user_id: int | None) -> bool:
+    return _maintenance_enabled(settings) and not settings.is_paid(user_id)
 
 
 async def _setup_bot_commands(application: Any) -> None:
@@ -174,29 +233,115 @@ async def _setup_bot_commands(application: Any) -> None:
             port=settings.worker_api_port,
             token=settings.worker_api_token,
         )
-    await application.bot.set_my_commands(
-        [
-            ("start", "Инструкция"),
-            ("queue", "Показать очередь задач"),
-            ("resume", "Продолжить последнюю задачу"),
-            ("me", "Показать Telegram ID"),
-            ("cancel", "Сбросить текущую задачу"),
-        ]
-    )
+    commands = [
+        ("start", "Инструкция"),
+        ("queue", "Показать очередь задач"),
+        ("resume", "Продолжить последнюю задачу"),
+        ("me", "Показать Telegram ID"),
+        ("cancel", "Сбросить текущую задачу"),
+    ]
+    await application.bot.set_my_commands(commands)
+    with contextlib.suppress(Exception):
+        from telegram import BotCommandScopeAllPrivateChats, BotCommandScopeDefault
+
+        await application.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+        await application.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
     with contextlib.suppress(Exception):
         from telegram import MenuButtonCommands
 
         await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     asyncio.create_task(_recover_interrupted_jobs(application))
     asyncio.create_task(_cleanup_finished_jobs_loop(application))
+    asyncio.create_task(_maintenance_watch_loop(application))
+
+
+async def _maintenance_watch_loop(application: Any) -> None:
+    settings: BotSettings = application.bot_data["settings"]
+    scheduler: _JobScheduler = application.bot_data["job_scheduler"]
+    previous = _maintenance_enabled(settings)
+    while True:
+        await asyncio.sleep(2.0)
+        current = _maintenance_enabled(settings)
+        if current == previous:
+            continue
+        previous = current
+        print(f"Maintenance mode changed: enabled={current}", flush=True)
+        try:
+            await scheduler.maintenance_changed(_ApplicationContext(application))
+        except Exception:
+            print(traceback.format_exc(), flush=True)
+
+
+async def maintenance_message_gate(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    user = update.effective_user
+    if not _maintenance_blocks_user(settings, user.id if user else None):
+        return
+
+    from telegram.ext import ApplicationHandlerStop
+
+    context.user_data.clear()
+    if update.effective_message is not None:
+        await update.effective_message.reply_text(MAINTENANCE_MESSAGE, reply_markup=_remove_reply_keyboard())
+    raise ApplicationHandlerStop
+
+
+async def maintenance_callback_gate(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    user = update.effective_user
+    if not _maintenance_blocks_user(settings, user.id if user else None):
+        return
+
+    from telegram.ext import ApplicationHandlerStop
+
+    context.user_data.clear()
+    query = update.callback_query
+    if query is not None:
+        await query.answer("Ведутся технические работы. Попробуй позже.", show_alert=True)
+        with contextlib.suppress(Exception):
+            await query.edit_message_text(MAINTENANCE_MESSAGE)
+    raise ApplicationHandlerStop
+
+
+async def maintenance(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    user = update.effective_user
+    if user is None or not settings.is_paid(user.id):
+        await update.effective_message.reply_text("Команда доступна только администратору.")
+        return
+
+    action = str(context.args[0] if context.args else "status").strip().lower()
+    if action in {"on", "enable", "1"}:
+        _set_maintenance_enabled(settings, True, user_id=user.id)
+        enabled = True
+    elif action in {"off", "disable", "0"}:
+        _set_maintenance_enabled(settings, False, user_id=user.id)
+        enabled = False
+    elif action in {"status", "state"}:
+        enabled = _maintenance_enabled(settings)
+    else:
+        await update.effective_message.reply_text("Использование: /maintenance on, /maintenance off или /maintenance status")
+        return
+
+    scheduler: _JobScheduler = context.application.bot_data["job_scheduler"]
+    await scheduler.maintenance_changed(context)
+    state = "включён" if enabled else "выключен"
+    details = (
+        "Обычные пользователи временно заблокированы. Текущие задачи продолжат работу."
+        if enabled
+        else "Приём новых задач восстановлен, сохранённая очередь продолжит работу."
+    )
+    await update.effective_message.reply_text(f"Режим технических работ {state}.\n{details}")
 
 
 async def start(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    free_limit = settings.free_max_duration_seconds if settings.free_max_duration_seconds > 0 else None
+    limit_text = _format_duration(free_limit) if free_limit is not None else "без лимита"
     await update.effective_message.reply_text(
-        "Пришли видео. Я попрошу выбрать input-язык, метод извлечения текста, количество голосов и язык озвучки.\n\n"
-        "Soft-методы дают Whisper самому определить исходник, а выбранный input-язык используется как промежуточный перевод. "
-        "Forced-методы насильно задают выбранный input-язык самому Whisper.\n"
-        "У бесплатных пользователей лимит видео 3 минуты и на видео будет водяной знак.",
+        "Пришли видео или аудио. Я попрошу выбрать видеоряд, input-язык, количество голосов и язык озвучки.\n\n"
+        "Input-язык используется как промежуточный язык перевода и источник Whisper-артефактов.\n"
+        f"У бесплатных пользователей лимит: {limit_text}. На итоговом видео будет водяной знак.",
         reply_markup=_remove_reply_keyboard(),
     )
 
@@ -345,6 +490,44 @@ async def receive_video(update: Any, context: Any) -> None:
     await _remember_job_and_ask_source(context, status, job_dir, input_path, source_title, input_source="telegram_upload")
 
 
+async def receive_audio(update: Any, context: Any) -> None:
+    message = update.effective_message
+    settings: BotSettings = context.application.bot_data["settings"]
+    media = message.audio or message.voice or message.document
+    if not media:
+        return
+
+    file_size = getattr(media, "file_size", 0) or 0
+    max_configured_bytes = settings.max_file_mb * 1024 * 1024
+    direct_limit_bytes = min(max_configured_bytes, TELEGRAM_DIRECT_DOWNLOAD_SAFE_BYTES)
+    if file_size > direct_limit_bytes:
+        await message.reply_text(_direct_video_too_large_text(direct_limit_bytes))
+        return
+
+    await _clear_reply_keyboard(message)
+
+    user_id = update.effective_user.id
+    job_dir = settings.workdir / str(user_id) / str(message.message_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    suffix = _guess_audio_suffix(media)
+    audio_path = job_dir / f"input_audio{suffix}"
+    source_title = _source_title_from_audio(media, message.message_id)
+
+    status = await message.reply_text("Скачиваю аудио...")
+    try:
+        tg_file = await media.get_file()
+        await tg_file.download_to_drive(custom_path=str(audio_path))
+    except Exception as exc:
+        traceback_text = traceback.format_exc()
+        print(traceback_text, flush=True)
+        (job_dir / "error.log").write_text(traceback_text, encoding="utf-8")
+        details = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+        await status.edit_text(f"Не смог скачать аудио:\n{details}")
+        return
+
+    await _remember_job_and_ask_source(context, status, job_dir, audio_path, source_title, input_source="telegram_audio")
+
+
 async def receive_link(update: Any, context: Any) -> None:
     message = update.effective_message
     settings: BotSettings = context.application.bot_data["settings"]
@@ -388,6 +571,104 @@ async def receive_link(update: Any, context: Any) -> None:
         input_source="coordinator_download",
         source_url=url,
     )
+
+
+async def _prepare_input_audio_as_video(
+    status: Any,
+    settings: BotSettings,
+    user_id: int | None,
+    job_dir: Path,
+    audio_path: Path,
+) -> Path | None:
+    try:
+        duration = await asyncio.to_thread(probe_duration, audio_path)
+    except Exception as exc:
+        print(f"Audio duration check failed: {type(exc).__name__}: {exc}", flush=True)
+        await status.edit_text(f"Не смог определить длительность аудио:\n{type(exc).__name__}: {exc}")
+        return None
+
+    target_duration = duration
+    limit = _duration_limit_seconds(settings, user_id)
+    if limit is not None and duration > limit + 0.5:
+        target_duration = limit
+        await status.edit_text(
+            f"Аудио длиннее лимита: {_format_duration(duration)}.\n"
+            f"Взял первые {_format_duration(limit)} и собираю видеоряд."
+        )
+    else:
+        await status.edit_text("Собираю случайный видеоряд для аудио...")
+
+    visual_source = settings.audio_visual_source_dir or settings.workdir
+    source_roots = [visual_source]
+    if visual_source.resolve() != settings.workdir.resolve():
+        source_roots.append(settings.workdir)
+    output_path = job_dir / "input_audio_visual.mp4"
+    await asyncio.to_thread(
+        make_audio_visual_video,
+        audio_path,
+        output_path,
+        source_roots=source_roots,
+        temp_dir=job_dir / "audio_visual_segments",
+        duration=target_duration,
+        resolution=settings.audio_visual_resolution,
+        max_slice_seconds=settings.audio_visual_max_slice_seconds,
+        exclude_dirs=[job_dir],
+        safety_enabled=settings.audio_visual_safety_enabled,
+        safety_cache_dir=settings.media_cache_dir / "visual_safety",
+        safety_model=settings.audio_visual_safety_model,
+        safety_threshold=settings.audio_visual_safety_threshold,
+        safety_frames=settings.audio_visual_safety_frames,
+        safety_device=settings.audio_visual_safety_device,
+    )
+
+    if not output_path.exists() or output_path.stat().st_size < 1024:
+        await status.edit_text("Не удалось собрать видео из аудио: получился пустой файл.")
+        return None
+    if not await asyncio.to_thread(has_video_and_audio, output_path):
+        await status.edit_text("Не удалось собрать видео из аудио: в результате нет видео и аудио.")
+        return None
+
+    await status.edit_text("Аудио превращено в видео. Продолжаю.")
+    return output_path
+
+
+async def _prepare_random_visual_video(
+    status: Any,
+    settings: BotSettings,
+    job_dir: Path,
+    input_path: Path,
+) -> Path | None:
+    try:
+        duration = await asyncio.to_thread(probe_duration, input_path)
+    except Exception as exc:
+        print(f"Video duration check failed for random visual: {type(exc).__name__}: {exc}", flush=True)
+        await _safe_edit_status(status, f"Не смог определить длительность видео:\n{type(exc).__name__}: {exc}")
+        return None
+
+    visual_source = settings.audio_visual_source_dir or settings.workdir
+    source_roots = [visual_source]
+    if visual_source.resolve() != settings.workdir.resolve():
+        source_roots.append(settings.workdir)
+    output_path = job_dir / f"{input_path.stem}_fun_visual.mp4"
+    await asyncio.to_thread(
+        make_audio_visual_video,
+        input_path,
+        output_path,
+        source_roots=source_roots,
+        temp_dir=job_dir / "fun_visual_segments",
+        duration=duration,
+        resolution=settings.audio_visual_resolution,
+        max_slice_seconds=settings.audio_visual_max_slice_seconds,
+        exclude_dirs=[job_dir],
+    )
+
+    if not output_path.exists() or output_path.stat().st_size < 1024:
+        await _safe_edit_status(status, "Не удалось собрать прикольный видеоряд: получился пустой файл.")
+        return None
+    if not await asyncio.to_thread(has_video_and_audio, output_path):
+        await _safe_edit_status(status, "Не удалось собрать прикольный видеоряд: в результате нет видео и аудио.")
+        return None
+    return output_path
 
 
 async def _prepare_input_video_duration(
@@ -569,10 +850,33 @@ async def _remember_job_and_ask_source(
     }
     if source_url:
         context.user_data["job"]["source_url"] = source_url
-    _save_job_snapshot(job_dir, context.user_data["job"], status="select_source")
+    if input_source == "telegram_audio":
+        context.user_data["job"]["visual_mode"] = "random"
+        _save_job_snapshot(job_dir, context.user_data["job"], status="select_source")
+        await _ask_source_language(status, context.user_data["job"])
+        return
+
+    context.user_data["job"]["visual_mode"] = "original"
+    _save_job_snapshot(job_dir, context.user_data["job"], status="select_visual")
+    try:
+        await status.edit_text(
+            "Выбери видеоряд.",
+            reply_markup=_language_keyboard("vis", VISUAL_MODE_OPTIONS, columns=1),
+        )
+    except Exception as exc:
+        if "Message can't be edited" not in f"{type(exc).__name__}: {exc}":
+            raise
+        await status.reply_text(
+            "Выбери видеоряд.",
+            reply_markup=_language_keyboard("vis", VISUAL_MODE_OPTIONS, columns=1),
+        )
+
+
+async def _ask_source_language(status: Any, job: dict[str, Any]) -> None:
+    _save_job_snapshot(Path(job["job_dir"]), job, status="select_source")
     text = (
-        "Выбери input-язык. Для soft-методов это будет промежуточный язык перевода; "
-        "для forced-методов это будет язык, насильно заданный Whisper."
+        "Выбери input-язык. Он будет использоваться как промежуточный язык перевода "
+        "и источник Whisper-артефактов."
     )
     reply_markup = _language_keyboard("src", SOURCE_LANGS)
     try:
@@ -581,6 +885,26 @@ async def _remember_job_and_ask_source(
         if "Message can't be edited" not in f"{type(exc).__name__}: {exc}":
             raise
         await status.reply_text(text, reply_markup=reply_markup)
+
+
+async def select_visual_mode(update: Any, context: Any) -> None:
+    query = update.callback_query
+    await query.answer()
+    job = context.user_data.get("job")
+    if not job:
+        await query.edit_message_text("Нет активной задачи. Сначала пришли видео.")
+        return
+
+    mode = query.data.split(":", 1)[1]
+    if mode not in {"original", "random"}:
+        await query.edit_message_text("Неизвестный режим видеоряда. Пришли видео ещё раз.")
+        return
+
+    job["visual_mode"] = mode
+    job_dir = Path(str(job["job_dir"]))
+    _save_job_snapshot(job_dir, job, status="select_source")
+
+    await _ask_source_language(query.message, job)
 
 
 async def select_source(update: Any, context: Any) -> None:
@@ -593,10 +917,13 @@ async def select_source(update: Any, context: Any) -> None:
 
     source_lang = query.data.split(":", 1)[1]
     job["source_lang"] = None if source_lang == "auto" else source_lang
-    _save_job_snapshot(Path(job["job_dir"]), job, status="select_method")
+    job["asr_method"] = "ow-large-v3-chaos-backbone"
+    job["mode"] = "dub"
+    job["glitch_profile"] = "clean"
+    _save_job_snapshot(Path(job["job_dir"]), job, status="select_speakers")
     await query.edit_message_text(
-        "Выбери метод извлечения текста.",
-        reply_markup=_language_keyboard("asr", ASR_METHODS, columns=1),
+        "Выбери количество голосов.",
+        reply_markup=_language_keyboard("spk", SPEAKER_COUNT_OPTIONS, columns=5),
     )
 
 
@@ -688,22 +1015,40 @@ async def _enqueue_job(update: Any, context: Any, job: dict[str, Any], status_me
 
     input_path = Path(str(job.get("input_path") or ""))
     if input_path.exists():
-        input_path = await _ensure_job_input_video(status_message, job, settings, input_path)
-        if input_path is None:
-            _save_job_snapshot(Path(job["job_dir"]), job, status="rejected", error="invalid_input_media")
-            return
-        prepared_input_path = await _prepare_input_video_duration(
-            status_message,
-            settings,
-            user.id if user else None,
-            input_path,
-        )
-        if prepared_input_path is None:
-            _save_job_snapshot(Path(job["job_dir"]), job, status="rejected", error="duration_limit")
-            return
-        if prepared_input_path != input_path:
-            job["input_path"] = str(prepared_input_path)
-            _save_job_snapshot(Path(job["job_dir"]), job, status="queued", trimmed=True)
+        job_dir = Path(job["job_dir"])
+        if job.get("input_source") == "telegram_audio":
+            input_path = await _prepare_input_audio_as_video(status_message, settings, user.id if user else None, job_dir, input_path)
+            if input_path is None:
+                _save_job_snapshot(job_dir, job, status="rejected", error="audio_visual_failed")
+                return
+            job["input_path"] = str(input_path)
+            _save_job_snapshot(job_dir, job, status="queued", audio_visual=True)
+        else:
+            input_path = await _ensure_job_input_video(status_message, job, settings, input_path)
+            if input_path is None:
+                _save_job_snapshot(job_dir, job, status="rejected", error="invalid_input_media")
+                return
+            prepared_input_path = await _prepare_input_video_duration(
+                status_message,
+                settings,
+                user.id if user else None,
+                input_path,
+            )
+            if prepared_input_path is None:
+                _save_job_snapshot(job_dir, job, status="rejected", error="duration_limit")
+                return
+            if prepared_input_path != input_path:
+                input_path = prepared_input_path
+                job["input_path"] = str(prepared_input_path)
+                _save_job_snapshot(job_dir, job, status="queued", trimmed=True)
+            if job.get("visual_mode") == "random":
+                await _safe_edit_status(status_message, "Собираю случайный видеоряд...")
+                visual_path = await _prepare_random_visual_video(status_message, settings, job_dir, input_path)
+                if visual_path is None:
+                    _save_job_snapshot(job_dir, job, status="rejected", error="random_visual_failed")
+                    return
+                job["input_path"] = str(visual_path)
+                _save_job_snapshot(job_dir, job, status="queued", random_visual=True)
 
     await scheduler.enqueue(
         context,
@@ -999,6 +1344,11 @@ class _JobScheduler:
             await self._dispatch_locked(context)
             await self._refresh_pending_locked()
 
+    async def maintenance_changed(self, context: Any) -> None:
+        async with self._lock:
+            await self._dispatch_locked(context)
+            await self._refresh_pending_locked()
+
     async def lease_remote(self, context: Any, worker_id: str) -> dict[str, Any] | None:
         async with self._lock:
             if self._settings.executor_mode not in {"remote", "hybrid"}:
@@ -1153,6 +1503,8 @@ class _JobScheduler:
     def _can_start(self, item: _QueuedJob, *, execution_kind: str) -> bool:
         if self._active_total >= self._settings.max_active_jobs:
             return False
+        if _maintenance_enabled(self._settings) and not item.premium:
+            return False
         if execution_kind == "remote" and _target_lang_value(item.job.get("target_lang")) != "ru":
             return False
         if item.user_id is None:
@@ -1172,6 +1524,14 @@ class _JobScheduler:
 
     def _queue_text(self, item: _QueuedJob, position: int) -> str:
         title = "Сырой Whisper" if item.job.get("mode") == "raw_text" else "Полноценный дубляж"
+        if _maintenance_enabled(self._settings) and not item.premium:
+            return "\n".join(
+                [
+                    f"{title}: Приостановлен",
+                    MAINTENANCE_MESSAGE,
+                    "Задача сохранена и продолжится после завершения работ.",
+                ]
+            )
         active_for_user = self._active_by_user.get(item.user_id, 0) if item.user_id is not None else 0
         tier = "премиум" if item.premium else "обычный"
         target_label = _target_lang_label(item.job.get("target_lang"))
@@ -1603,6 +1963,7 @@ async def _process_job(
         f5_ckpt_file=settings.f5_ckpt_file,
         f5_vocab_file=settings.f5_vocab_file,
         f5_cache_dir=settings.f5_cache_dir,
+        media_cache_dir=settings.media_cache_dir,
         f5_device=settings.f5_device,
         f5_speed=settings.f5_speed,
         f5_nfe_step=settings.f5_nfe_step,
@@ -1634,6 +1995,7 @@ async def _process_job(
         artifact_min_gap_seconds=settings.artifact_min_gap_seconds,
         distort_translation=settings.distort_translation,
         translation_pivots=settings.translation_pivots,
+        translation_second_pass_ratio=settings.translation_second_pass_ratio,
         collapse_repetitions=settings.collapse_repetitions,
         max_phrase_repeats=settings.max_phrase_repeats,
         max_word_repeats=settings.max_word_repeats,
@@ -2006,6 +2368,16 @@ def _source_title_from_media(media: Any, fallback_id: int | str) -> str:
     return f"telegram_video_{fallback_id}"
 
 
+def _source_title_from_audio(media: Any, fallback_id: int | str) -> str:
+    file_name = getattr(media, "file_name", "") or ""
+    if file_name:
+        return Path(file_name).stem
+    title = getattr(media, "title", "") or ""
+    if title:
+        return str(title).strip()
+    return f"telegram_audio_{fallback_id}"
+
+
 def _source_title_from_download(job_dir: Path, input_path: Path, url: str) -> str:
     meta_path = job_dir / "download_meta.json"
     if meta_path.exists():
@@ -2173,6 +2545,27 @@ def _guess_suffix(media: Any) -> str:
     if "webm" in mime_type:
         return ".webm"
     return ".mp4"
+
+
+def _guess_audio_suffix(media: Any) -> str:
+    file_name = getattr(media, "file_name", "") or ""
+    suffix = Path(file_name).suffix.lower()
+    if suffix in {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".oga", ".opus", ".flac", ".webm", ".mp4"}:
+        return suffix
+    mime_type = (getattr(media, "mime_type", "") or "").lower()
+    if "mpeg" in mime_type or "mp3" in mime_type:
+        return ".mp3"
+    if "mp4" in mime_type or "m4a" in mime_type:
+        return ".m4a"
+    if "wav" in mime_type:
+        return ".wav"
+    if "flac" in mime_type:
+        return ".flac"
+    if "webm" in mime_type:
+        return ".webm"
+    if "ogg" in mime_type or "opus" in mime_type:
+        return ".ogg"
+    return ".ogg"
 
 
 if __name__ == "__main__":

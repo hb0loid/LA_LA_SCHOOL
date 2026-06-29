@@ -1,0 +1,50 @@
+# Words and fragments that make a Whisper line count as an artifact candidate.
+# One item per line. Empty lines and lines starting with # are ignored.
+subtitle
+subtitles
+caption
+captions
+amara.org
+solanya
+dimatorzok
+dima torzok
+subscribe
+subscribed
+thanks for watching
+thank you for watching
+like and subscribe
+description
+субтитр
+подпис
+спасибо за просмотр
+спасибо за субтитр
+продолжение следует
+редактор субтитр
+корректор
+подогнал
+дубровск
+семкин
+егоров
+лайк
+описани
+phụ đề
+đăng ký
+cảm ơn
+cám ơn
+คำบรรยาย
+ติดตาม
+ขอบคุณ
+字幕
+チャンネル登録
+ご視聴
+자막
+구독
+감사
+订阅
+感谢观看
+sous-titres
+abonnez
+subtítulos
+suscr
+untertitel
+abonnieren

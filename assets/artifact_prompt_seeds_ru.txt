@@ -1,0 +1,13 @@
+# Russian prompt-bias phrases for Whisper artifact hunting.
+# These are only used as initial_prompt hints. They are not inserted directly.
+# One phrase per line. Empty lines and lines starting with # are ignored.
+Субтитры сделал DimaTorzok.
+Субтитры создавал DimaTorzok.
+Перевод и субтитры DimaTorzok.
+Спасибо за субтитры Алексею Дубровскому!
+Субтитры подогнал Симон.
+Продолжение следует...
+Редактор субтитров А.Семкин. Корректор А.Егорова.
+Subtitles by DimaTorzok.
+Captions created by DimaTorzok.
+amara.org.

@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from pathlib import Path
 
-from .ffmpeg import require_tool, run
+from .ffmpeg import probe_duration, require_tool, run
 
 
 def add_watermark(
@@ -51,36 +51,58 @@ def add_image_watermark(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     alpha = max(0.0, min(1.0, opacity))
     filter_value = (
+        "[0:v]setpts=PTS-STARTPTS,"
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2,"
+        "format=yuv420p,"
+        "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709[base];"
         f"[1:v]format=rgba,scale={width}:-1,colorchannelmixer=aa={alpha:.2f}[wm];"
-        f"[0:v][wm]overlay=W-w-{margin}:H-h-{margin}:format=auto,format=yuv420p[v]"
+        f"[base][wm]overlay="
+        f"x=W-w-{margin}:y=H-h-{margin}:"
+        "eval=init:shortest=0:repeatlast=1:eof_action=repeat:"
+        "format=auto,format=yuv420p[v]"
     )
-    run(
-        [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(input_path),
-            "-i",
-            str(image_path),
-            "-filter_complex",
-            filter_value,
-            "-map",
-            "[v]",
-            "-map",
-            "0:a?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "22",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "copy",
-            str(output_path),
-        ]
-    )
+    duration_args: list[str] = []
+    with_duration = True
+    try:
+        duration = probe_duration(input_path)
+    except Exception:
+        with_duration = False
+    if with_duration:
+        duration_args = ["-t", f"{max(0.1, duration):.3f}"]
+
+    command = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(input_path),
+        "-loop",
+        "1",
+        "-framerate",
+        "30",
+        "-i",
+        str(image_path),
+        "-filter_complex",
+        filter_value,
+        "-map",
+        "[v]",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "22",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+    ]
+    command.extend(duration_args)
+    command.append(str(output_path))
+    run(command)
 
 
 def add_text_watermark(

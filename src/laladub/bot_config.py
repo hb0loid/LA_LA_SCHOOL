@@ -42,6 +42,15 @@ class BotSettings:
     f5_ckpt_file: Path | None
     f5_vocab_file: Path | None
     f5_cache_dir: Path
+    media_cache_dir: Path
+    audio_visual_source_dir: Path | None
+    audio_visual_resolution: int
+    audio_visual_max_slice_seconds: float
+    audio_visual_safety_enabled: bool
+    audio_visual_safety_model: str
+    audio_visual_safety_threshold: float
+    audio_visual_safety_frames: int
+    audio_visual_safety_device: str
     f5_device: str
     f5_speed: float
     f5_nfe_step: int
@@ -77,6 +86,7 @@ class BotSettings:
     artifact_min_gap_seconds: float
     distort_translation: bool
     translation_pivots: str
+    translation_second_pass_ratio: float
 
     def is_paid(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.paid_users
@@ -100,7 +110,7 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
             os.environ.get("LALADUB_WORKER_PACKAGE_MANIFEST", "dist/LaLaDubWorker-update.manifest.json")
         ),
         worker_version=os.environ.get("LALADUB_WORKER_VERSION", "0.1.0").strip() or "0.1.0",
-        job_retention_seconds=max(0.0, float(os.environ.get("LALADUB_JOB_RETENTION_SECONDS", "86400"))),
+        job_retention_seconds=max(0.0, float(os.environ.get("LALADUB_JOB_RETENTION_SECONDS", "2592000"))),
         cleanup_interval_seconds=max(60.0, float(os.environ.get("LALADUB_CLEANUP_INTERVAL_SECONDS", "3600"))),
         paid_users=frozenset(_parse_user_ids(os.environ.get("LALADUB_PAID_USERS", ""))),
         max_active_jobs=max(1, int(os.environ.get("LALADUB_MAX_ACTIVE_JOBS", "2"))),
@@ -128,6 +138,22 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         f5_ckpt_file=_optional_path(os.environ.get("LALADUB_F5_CKPT_FILE")),
         f5_vocab_file=_optional_path(os.environ.get("LALADUB_F5_VOCAB_FILE")),
         f5_cache_dir=Path(os.environ.get("LALADUB_F5_CACHE_DIR", "models/f5tts")),
+        media_cache_dir=Path(os.environ.get("LALADUB_MEDIA_CACHE_DIR", "runs/cache/media")),
+        audio_visual_source_dir=_optional_path(os.environ.get("LALADUB_AUDIO_VISUAL_SOURCE_DIR")),
+        audio_visual_resolution=max(64, int(os.environ.get("LALADUB_AUDIO_VISUAL_RESOLUTION", "512"))),
+        audio_visual_max_slice_seconds=max(0.2, float(os.environ.get("LALADUB_AUDIO_VISUAL_MAX_SLICE_SECONDS", "3.0"))),
+        audio_visual_safety_enabled=_parse_bool(os.environ.get("LALADUB_AUDIO_VISUAL_SAFETY_ENABLED", "1")),
+        audio_visual_safety_model=os.environ.get(
+            "LALADUB_AUDIO_VISUAL_SAFETY_MODEL",
+            "Falconsai/nsfw_image_detection",
+        ).strip()
+        or "Falconsai/nsfw_image_detection",
+        audio_visual_safety_threshold=max(
+            0.01,
+            min(0.99, float(os.environ.get("LALADUB_AUDIO_VISUAL_SAFETY_THRESHOLD", "0.72"))),
+        ),
+        audio_visual_safety_frames=max(1, int(os.environ.get("LALADUB_AUDIO_VISUAL_SAFETY_FRAMES", "5"))),
+        audio_visual_safety_device=os.environ.get("LALADUB_AUDIO_VISUAL_SAFETY_DEVICE", "cpu").strip() or "cpu",
         f5_device=os.environ.get("LALADUB_F5_DEVICE", "auto"),
         f5_speed=float(os.environ.get("LALADUB_F5_SPEED", "1.0")),
         f5_nfe_step=int(os.environ.get("LALADUB_F5_NFE_STEP", "32")),
@@ -148,12 +174,12 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         asr_backend=os.environ.get("LALADUB_ASR_BACKEND", "faster-whisper"),
         default_asr_method=os.environ.get("LALADUB_DEFAULT_ASR_METHOD", "ow-large-v3-chaos-backbone").strip().lower(),
         whisper_model=os.environ.get("LALADUB_WHISPER_MODEL", "small"),
-        whisper_only_model=os.environ.get("LALADUB_WHISPER_ONLY_MODEL", "large-v3"),
+        whisper_only_model=os.environ.get("LALADUB_WHISPER_ONLY_MODEL", "turbo"),
         whisper_only_device=os.environ.get("LALADUB_WHISPER_ONLY_DEVICE", "cpu"),
         whisper_device=os.environ.get("LALADUB_WHISPER_DEVICE", "cpu"),
         whisper_compute_type=os.environ.get("LALADUB_WHISPER_COMPUTE_TYPE", "int8"),
         suppress_plain_ascii_tokens=_parse_bool(os.environ.get("LALADUB_SUPPRESS_PLAIN_ASCII_TOKENS", "0")),
-        original_volume=float(os.environ.get("LALADUB_ORIGINAL_VOLUME", "1.0")),
+        original_volume=float(os.environ.get("LALADUB_ORIGINAL_VOLUME", "0.35")),
         dub_volume=float(os.environ.get("LALADUB_DUB_VOLUME", "1.0")),
         collapse_repetitions=_parse_bool(os.environ.get("LALADUB_COLLAPSE_REPETITIONS", "1")),
         max_phrase_repeats=int(os.environ.get("LALADUB_MAX_PHRASE_REPEATS", "2")),
@@ -164,7 +190,11 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         distort_translation=_parse_bool(os.environ.get("LALADUB_DISTORT_TRANSLATION", "1")),
         translation_pivots=os.environ.get(
             "LALADUB_TRANSLATION_PIVOTS",
-            "input,en|en,de|en,fr|en,es|input,en,de|en,es,de",
+            "input,en|input,ja,en|input,tr,de,en|en,de|en,fr|en,es|en,ja,ko|en,tr,ar|input,en,de|input,ja,ko,en|input,tr,ar,en|en,ms,he,en",
+        ),
+        translation_second_pass_ratio=max(
+            0.0,
+            min(1.0, float(os.environ.get("LALADUB_TRANSLATION_SECOND_PASS_RATIO", "0.0"))),
         ),
     )
 

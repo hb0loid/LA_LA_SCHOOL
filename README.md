@@ -157,7 +157,7 @@ laladub-bot
 - `LALADUB_FREE_MAX_DURATION_SECONDS` - лимит длительности для free-пользователей, по умолчанию `180` секунд.
 - `LALADUB_PAID_MAX_DURATION_SECONDS` - лимит длительности для paid-пользователей, по умолчанию `0` без ограничения.
 - `LALADUB_BOT_WORKDIR` - папка задач, по умолчанию `runs/bot`.
-- `LALADUB_JOB_RETENTION_SECONDS` - сколько хранить завершённые задачи (`done`, `failed`, `rejected`) перед автоочисткой, по умолчанию `86400` секунд. `0` отключает очистку.
+- `LALADUB_JOB_RETENTION_SECONDS` - сколько хранить завершённые задачи (`done`, `failed`, `rejected`) перед автоочисткой, по умолчанию `2592000` секунд (30 дней). `0` отключает очистку.
 - `LALADUB_CLEANUP_INTERVAL_SECONDS` - как часто запускать автоочистку, по умолчанию `3600` секунд.
 - `LALADUB_TRANSLATOR` - `hybrid`, `googleweb`, `mymemory`, `argos`, `libretranslate` или `identity`.
 - `LALADUB_TTS` - `xtts`, `f5`, `sapi`, `piper` или `none`; `Start-Bot.ps1` по умолчанию ставит `f5`.
@@ -180,7 +180,7 @@ laladub-bot
 - `LALADUB_AUDIO_BED` - `instrumental`, `original` или `dub-only`.
 - `LALADUB_WHISPER_MODEL` - модель faster-whisper, по умолчанию `small`.
 - `LALADUB_ASR_BACKEND` - backend обычного дубляжа, по умолчанию `faster-whisper`.
-- `LALADUB_WHISPER_ONLY_MODEL` - модель для режима bug hunt, по умолчанию `large-v3`.
+- `LALADUB_WHISPER_ONLY_MODEL` - модель для режима bug hunt и artifact-hunt, по умолчанию `turbo`.
 - `LALADUB_WHISPER_ONLY_DEVICE` - устройство для bug hunt, по умолчанию `cpu`.
 - `LALADUB_WHISPER_DEVICE` - `cpu` по умолчанию. Можно поставить `cuda`, если установлены CUDA/cuBLAS DLL.
 - `LALADUB_WHISPER_COMPUTE_TYPE` - `int8` по умолчанию для CPU.

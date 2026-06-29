@@ -52,6 +52,7 @@ def main(argv: list[str] | None = None) -> None:
             f5_ckpt_file=args.f5_ckpt_file,
             f5_vocab_file=args.f5_vocab_file,
             f5_cache_dir=args.f5_cache_dir,
+            media_cache_dir=args.media_cache_dir,
             f5_device=args.f5_device,
             f5_speed=args.f5_speed,
             f5_nfe_step=args.f5_nfe_step,
@@ -74,6 +75,8 @@ def main(argv: list[str] | None = None) -> None:
             max_phrase_repeats=args.max_phrase_repeats,
             max_word_repeats=args.max_word_repeats,
             fit_to_segments=not args.no_fit_to_segments,
+            translation_pivots=args.translation_pivots,
+            translation_second_pass_ratio=args.translation_second_pass_ratio,
             keep_workdir=True,
         )
         run_dub(args.video, config)
@@ -145,6 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument("--f5-ckpt-file", type=Path, default=None)
     dub.add_argument("--f5-vocab-file", type=Path, default=None)
     dub.add_argument("--f5-cache-dir", type=Path, default=Path("models/f5tts"))
+    dub.add_argument("--media-cache-dir", type=Path, default=Path("runs/cache/media"))
     dub.add_argument("--f5-device", default="auto", choices=["auto", "cpu", "cuda"])
     dub.add_argument("--f5-speed", type=float, default=1.0)
     dub.add_argument("--f5-nfe-step", type=int, default=32)
@@ -181,6 +185,17 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument("--no-collapse-repetitions", action="store_true", help="Keep repeated ASR/translation loops.")
     dub.add_argument("--max-phrase-repeats", type=int, default=2, help="Maximum consecutive repeated phrase copies.")
     dub.add_argument("--max-word-repeats", type=int, default=3, help="Maximum consecutive repeated single words.")
+    dub.add_argument(
+        "--translation-pivots",
+        default="input,en|input,ja,en|input,tr,de,en|en,de|en,fr|en,es|en,ja,ko|en,tr,ar|input,en,de|input,ja,ko,en|input,tr,ar,en|en,ms,he,en",
+        help="Round-trip pivot chains separated by |.",
+    )
+    dub.add_argument(
+        "--translation-second-pass-ratio",
+        type=float,
+        default=0.0,
+        help="Share of regular translated segments that go through a second pivot pass.",
+    )
     dub.add_argument("--no-fit-to-segments", action="store_true", help="Do not time-stretch TTS clips.")
 
     subparsers.add_parser("voices", help="List Windows SAPI voices.")

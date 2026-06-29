@@ -5,9 +5,12 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
+import shutil
+from typing import Any
 import wave
 
 from .asr import clear_openai_whisper_cache, transcribe
@@ -33,7 +36,7 @@ from .translation import translate_segments, translate_text_chain
 from .tts import synthesize_segment
 
 
-_META_HALLUCINATION_TERMS = [
+_DEFAULT_META_HALLUCINATION_TERMS = [
     "subtitle",
     "subtitles",
     "caption",
@@ -51,6 +54,14 @@ _META_HALLUCINATION_TERMS = [
     "\u0441\u0443\u0431\u0442\u0438\u0442\u0440",
     "\u043f\u043e\u0434\u043f\u0438\u0441",
     "\u0441\u043f\u0430\u0441\u0438\u0431\u043e \u0437\u0430 \u043f\u0440\u043e\u0441\u043c\u043e\u0442\u0440",
+    "\u0441\u043f\u0430\u0441\u0438\u0431\u043e \u0437\u0430 \u0441\u0443\u0431\u0442\u0438\u0442\u0440",
+    "\u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0435\u043d\u0438\u0435 \u0441\u043b\u0435\u0434\u0443\u0435\u0442",
+    "\u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440 \u0441\u0443\u0431\u0442\u0438\u0442\u0440",
+    "\u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043e\u0440",
+    "\u043f\u043e\u0434\u043e\u0433\u043d\u0430\u043b",
+    "\u0434\u0443\u0431\u0440\u043e\u0432\u0441\u043a",
+    "\u0441\u0435\u043c\u043a\u0438\u043d",
+    "\u0435\u0433\u043e\u0440\u043e\u0432",
     "\u043b\u0430\u0439\u043a",
     "\u043e\u043f\u0438\u0441\u0430\u043d\u0438",
     "ph\u1ee5 \u0111\u1ec1",
@@ -81,10 +92,98 @@ def _literal_regex(term: str) -> str:
     return re.escape(term).replace(r"\ ", r"\s+")
 
 
-_META_HALLUCINATION_RE = re.compile(
-    "(" + "|".join(_literal_regex(term) for term in _META_HALLUCINATION_TERMS) + ")",
-    re.IGNORECASE,
-)
+_DEFAULT_RU_ARTIFACT_PROMPT_SEEDS = [
+    "Субтитры сделал DimaTorzok.",
+    "Субтитры создавал DimaTorzok.",
+    "Перевод и субтитры DimaTorzok.",
+    "Спасибо за субтитры Алексею Дубровскому!",
+    "Субтитры подогнал Симон.",
+    "Продолжение следует...",
+    "Редактор субтитров А.Семкин. Корректор А.Егорова.",
+    "Subtitles by DimaTorzok.",
+    "Captions created by DimaTorzok.",
+    "amara.org.",
+]
+
+_ARTIFACT_TEXT_CONFIG_CACHE: dict[str, tuple[tuple[str | None, float | None], Any]] = {}
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _artifact_text_file_path(filename: str, env_name: str) -> Path:
+    configured = os.environ.get(env_name, "").strip()
+    if configured:
+        return Path(configured)
+    return _repo_root() / "assets" / filename
+
+
+def _read_artifact_text_file(filename: str, env_name: str, defaults: list[str]) -> list[str]:
+    path = _artifact_text_file_path(filename, env_name)
+    try:
+        stat = path.stat()
+        stamp: tuple[str | None, float | None] = (str(path), stat.st_mtime)
+    except OSError:
+        stamp = (str(path), None)
+
+    cache_key = f"{env_name}:{filename}"
+    cached = _ARTIFACT_TEXT_CONFIG_CACHE.get(cache_key)
+    if cached and cached[0] == stamp:
+        return cached[1]
+
+    lines: list[str] = []
+    if stamp[1] is not None:
+        try:
+            for raw_line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                lines.append(line)
+        except Exception as exc:
+            print(f"      Artifact text config ignored {path}: {type(exc).__name__}: {exc}")
+            lines = []
+
+    source = lines or defaults
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in source:
+        normalized = item.strip()
+        key = normalized.casefold()
+        if normalized and key not in seen:
+            seen.add(key)
+            result.append(normalized)
+    _ARTIFACT_TEXT_CONFIG_CACHE[cache_key] = (stamp, result)
+    return result
+
+
+def _meta_hallucination_terms() -> list[str]:
+    return _read_artifact_text_file(
+        "artifact_triggers.txt",
+        "LALADUB_ARTIFACT_TRIGGERS_FILE",
+        _DEFAULT_META_HALLUCINATION_TERMS,
+    )
+
+
+def _meta_hallucination_re() -> re.Pattern[str]:
+    terms = _meta_hallucination_terms()
+    stamp = ("|".join(terms), float(len(terms)))
+    cached = _ARTIFACT_TEXT_CONFIG_CACHE.get("compiled-meta-re")
+    if cached and cached[0] == stamp:
+        return cached[1]
+    pattern = "(" + "|".join(_literal_regex(term) for term in terms) + ")"
+    compiled = re.compile(pattern, re.IGNORECASE)
+    _ARTIFACT_TEXT_CONFIG_CACHE["compiled-meta-re"] = (stamp, compiled)
+    return compiled
+
+
+def _ru_artifact_prompt_seeds() -> list[str]:
+    return _read_artifact_text_file(
+        "artifact_prompt_seeds_ru.txt",
+        "LALADUB_ARTIFACT_PROMPT_SEEDS_RU_FILE",
+        _DEFAULT_RU_ARTIFACT_PROMPT_SEEDS,
+    )
+
 
 _ROOT_DEBUG_SRT_FILES = [
     "artifact_injected.srt",
@@ -274,6 +373,218 @@ def _file_ready(path: Path, min_size: int = 1024) -> bool:
     return path.exists() and path.stat().st_size >= min_size
 
 
+def _media_cache_entry(video_path: Path, config: DubConfig) -> Path | None:
+    cache_root = config.media_cache_dir
+    if not cache_root:
+        return None
+    if not cache_root.is_absolute():
+        cache_root = _repo_root() / cache_root
+    try:
+        digest = _sha256_file(video_path)
+    except Exception as exc:
+        print(f"      Media cache disabled for this file: {type(exc).__name__}: {exc}")
+        return None
+    entry = cache_root / digest[:2] / digest
+    entry.mkdir(parents=True, exist_ok=True)
+    metadata_path = entry / "media.json"
+    if not metadata_path.exists():
+        try:
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "sha256": digest,
+                        "source_name": video_path.name,
+                        "source_size": video_path.stat().st_size,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+    return entry
+
+
+def _media_cache_metadata(cache_entry: Path | None) -> dict[str, object]:
+    if cache_entry is None:
+        return {}
+    metadata_path = cache_entry / "media.json"
+    if not metadata_path.exists():
+        return {}
+    try:
+        data = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _restore_cached_file(cache_entry: Path | None, cache_name: str, destination: Path, min_size: int = 1024) -> bool:
+    if cache_entry is None:
+        return False
+    source = cache_entry / cache_name
+    if not _file_ready(source, min_size=min_size):
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(source, destination)
+    except Exception as exc:
+        print(f"      Media cache restore skipped {cache_name}: {type(exc).__name__}: {exc}")
+        return False
+    return _file_ready(destination, min_size=min_size)
+
+
+def _store_cached_file(cache_entry: Path | None, source: Path, cache_name: str, min_size: int = 1024) -> None:
+    if cache_entry is None or not _file_ready(source, min_size=min_size):
+        return
+    destination = cache_entry / cache_name
+    if _file_ready(destination, min_size=min_size):
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = destination.with_name(destination.name + ".tmp")
+    try:
+        shutil.copy2(source, temp_path)
+        temp_path.replace(destination)
+    except Exception as exc:
+        print(f"      Media cache store skipped {destination.name}: {type(exc).__name__}: {exc}")
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _restore_cached_separation(
+    cache_entry: Path | None,
+    mix_audio: Path,
+    config: DubConfig,
+) -> SeparationResult | None:
+    if cache_entry is None:
+        return None
+    cache_dir = cache_entry / "separation" / _safe_label(config.demucs_model, fallback="demucs")
+    vocals_cache = cache_dir / "vocals.wav"
+    no_vocals_cache = cache_dir / "no_vocals.wav"
+    if not (_file_ready(vocals_cache) and _file_ready(no_vocals_cache)):
+        return None
+
+    stem_dir = config.workdir / "separated" / config.demucs_model / mix_audio.stem
+    stem_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(vocals_cache, stem_dir / "vocals.wav")
+        shutil.copy2(no_vocals_cache, stem_dir / "no_vocals.wav")
+    except Exception as exc:
+        print(f"      Media cache separation restore skipped: {type(exc).__name__}: {exc}")
+        return None
+    return _existing_separation_result(mix_audio, config)
+
+
+def _store_cached_separation(cache_entry: Path | None, result: SeparationResult | None, config: DubConfig) -> None:
+    if cache_entry is None or result is None:
+        return
+    cache_dir = cache_entry / "separation" / _safe_label(config.demucs_model, fallback="demucs")
+    _store_cached_file(cache_dir, result.vocals_path, "vocals.wav")
+    _store_cached_file(cache_dir, result.instrumental_path, "no_vocals.wav")
+
+
+def _seed_media_cache_from_legacy_jobs(video_path: Path, cache_entry: Path | None, config: DubConfig) -> bool:
+    if cache_entry is None:
+        return False
+
+    cache_has_audio = _file_ready(cache_entry / "source_16k.wav") and _file_ready(cache_entry / "source_mix.wav")
+    cache_has_separation = _restore_cached_separation_ready(cache_entry, config)
+    if cache_has_audio and cache_has_separation:
+        return False
+
+    metadata = _media_cache_metadata(cache_entry)
+    expected_sha = str(metadata.get("sha256") or cache_entry.name)
+    expected_size = metadata.get("source_size")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+        return False
+
+    runs_root = _runs_root_from_workdir(config.workdir)
+    if runs_root is None or not runs_root.exists():
+        return False
+
+    current_job_dir = config.workdir.parent.resolve()
+    job_files = sorted(
+        runs_root.glob("*/*/job.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    video_suffixes = {".mp4", ".mkv", ".mov", ".webm", ".avi"}
+    matched_without_work = False
+    for job_file in job_files[:300]:
+        job_dir = job_file.parent
+        try:
+            if job_dir.resolve() == current_job_dir:
+                continue
+        except Exception:
+            pass
+
+        candidates: list[Path] = []
+        for name in ("input_trimmed.mp4", "input.mp4"):
+            candidate = job_dir / name
+            if candidate.exists():
+                candidates.append(candidate)
+        candidates.extend(
+            path
+            for path in job_dir.glob("input*")
+            if path.is_file() and path.suffix.lower() in video_suffixes and path not in candidates
+        )
+        for candidate in candidates:
+            try:
+                if expected_size is not None and candidate.stat().st_size != int(expected_size):
+                    continue
+                if _sha256_file(candidate) != expected_sha:
+                    continue
+            except Exception:
+                continue
+            if _store_legacy_media_cache(cache_entry, job_dir / "work", config):
+                print(f"      Media cache: seeded from previous job {job_dir}")
+                return True
+            matched_without_work = True
+    if matched_without_work:
+        print("      Media cache: previous matching job found, but reusable work audio was not stored")
+    return False
+
+
+def _restore_cached_separation_ready(cache_entry: Path | None, config: DubConfig) -> bool:
+    if cache_entry is None:
+        return False
+    cache_dir = cache_entry / "separation" / _safe_label(config.demucs_model, fallback="demucs")
+    return _file_ready(cache_dir / "vocals.wav") and _file_ready(cache_dir / "no_vocals.wav")
+
+
+def _store_legacy_media_cache(cache_entry: Path, legacy_workdir: Path, config: DubConfig) -> bool:
+    stored = False
+    source_audio = legacy_workdir / "source_16k.wav"
+    if _file_ready(source_audio) and not _file_ready(cache_entry / "source_16k.wav"):
+        _store_cached_file(cache_entry, source_audio, "source_16k.wav")
+        stored = True
+
+    mix_audio = legacy_workdir / "source_mix.wav"
+    if _file_ready(mix_audio) and not _file_ready(cache_entry / "source_mix.wav"):
+        _store_cached_file(cache_entry, mix_audio, "source_mix.wav")
+        stored = True
+
+    stem_dir = legacy_workdir / "separated" / config.demucs_model / "source_mix"
+    separation_result = SeparationResult(
+        vocals_path=stem_dir / "vocals.wav",
+        instrumental_path=stem_dir / "no_vocals.wav",
+    )
+    if _file_ready(separation_result.vocals_path) and _file_ready(separation_result.instrumental_path):
+        _store_cached_separation(cache_entry, separation_result, config)
+        stored = True
+    return stored
+
+
 def _srt_ready(path: Path) -> bool:
     return path.exists() and bool(read_srt(path, translated=True))
 
@@ -292,6 +603,8 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     config.workdir.mkdir(parents=True, exist_ok=True)
     config.output.parent.mkdir(parents=True, exist_ok=True)
     resume_state = _load_resume_state(config)
+    media_cache = _media_cache_entry(video_path, config)
+    _seed_media_cache_from_legacy_jobs(video_path, media_cache, config)
     if not config.resume:
         _prepare_workdir_outputs(config)
 
@@ -305,8 +618,11 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     source_audio = config.workdir / "source_16k.wav"
     if config.resume and _file_ready(source_audio):
         print(f"      Resume: using existing audio {source_audio}")
+    elif _restore_cached_file(media_cache, "source_16k.wav", source_audio):
+        print("      Media cache: restored source_16k.wav")
     else:
         extract_audio(video_path, source_audio)
+        _store_cached_file(media_cache, source_audio, "source_16k.wav")
     mix_audio = config.workdir / "source_mix.wav"
     separation_result = None
     bed_path = None
@@ -314,14 +630,22 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         _report_progress(config, "Разделяю голос и фон", 10, 100, f"provider={config.separation}")
         if config.resume and _file_ready(mix_audio):
             print(f"      Resume: using existing mix audio {mix_audio}")
+        elif _restore_cached_file(media_cache, "source_mix.wav", mix_audio):
+            print("      Media cache: restored source_mix.wav")
         else:
             extract_audio_track(video_path, mix_audio)
+            _store_cached_file(media_cache, mix_audio, "source_mix.wav")
         separation_result = _existing_separation_result(mix_audio, config) if config.resume else None
         if separation_result is not None:
             print(f"      Resume: using existing separation {separation_result.vocals_path.parent}")
         else:
-            print(f"      Separating audio provider={config.separation}")
-            separation_result = separate_audio(mix_audio, config.workdir / "separated", config)
+            separation_result = _restore_cached_separation(media_cache, mix_audio, config)
+            if separation_result is not None:
+                print(f"      Media cache: restored separation {separation_result.vocals_path.parent}")
+            else:
+                print(f"      Separating audio provider={config.separation}")
+                separation_result = separate_audio(mix_audio, config.workdir / "separated", config)
+                _store_cached_separation(media_cache, separation_result, config)
         if separation_result and config.audio_bed == "instrumental":
             bed_path = separation_result.instrumental_path
         elif config.audio_bed == "instrumental":
@@ -561,30 +885,39 @@ def _build_artifact_segments(
     if same_language_hunt and not ru_same_language_hunt:
         return []
 
+    artifact_model = _artifact_whisper_model(config, artifact_lang)
     _report_progress(
         config,
         "Ищу Whisper-артефакты",
         34,
         100,
-        f"openai-whisper {config.artifact_whisper_model}, вход={artifact_lang}",
+        f"openai-whisper {artifact_model}, вход={artifact_lang}",
     )
     print(
         "      Building artifact layer "
-        f"source={artifact_lang} detected={config.source_lang or 'auto'}"
+        f"source={artifact_lang} detected={config.source_lang or 'auto'} model={artifact_model}"
     )
     artifact_config = copy(config)
     artifact_config.source_lang = artifact_lang
     artifact_config.asr_backend = "openai-whisper"
-    artifact_config.whisper_model = config.artifact_whisper_model
+    artifact_config.whisper_model = artifact_model
     artifact_config.whisper_device = config.artifact_whisper_device
     artifact_config.whisper_compute_type = "auto"
     artifact_config.glitch_profile = "faithful"
     artifact_config.force_source_language = True
     artifact_config.suppress_plain_ascii_tokens = False
     artifact_config.condition_on_previous_text = True
-    artifact_config.initial_prompt = _artifact_initial_prompt(artifact_lang, same_language=ru_same_language_hunt)
+    artifact_config.initial_prompt = _artifact_initial_prompt(
+        artifact_lang,
+        same_language=ru_same_language_hunt,
+        seed_material=f"{config.workdir}|artifact|full",
+    )
     artifact_config.hallucination_silence_threshold = None
     artifact_config.collapse_repetitions = True
+    try:
+        source_duration = probe_duration(source_audio)
+    except Exception:
+        source_duration = max((segment.end for segment in base_segments), default=0.0)
 
     whole_artifacts = _load_resumable_artifact_source(config, artifact_lang) if config.resume else []
     if whole_artifacts:
@@ -609,7 +942,6 @@ def _build_artifact_segments(
         )
     else:
         try:
-            source_duration = probe_duration(source_audio)
             artifact_audio = _whisper_chaos_audio(source_audio, artifact_config, purpose="artifact")
             full_artifacts = transcribe(artifact_audio, artifact_config)
             full_artifacts = _clamp_segments_to_duration(full_artifacts, source_duration)
@@ -645,6 +977,14 @@ def _build_artifact_segments(
             print(f"      Whisper artifact layer skipped: {type(exc).__name__}: {exc}")
 
     artifacts = whole_artifacts if config.artifact_chaos_mode else _dedupe_artifact_segments(whole_artifacts)
+    if config.artifact_chaos_mode:
+        artifacts = _fill_sparse_artifacts_from_history(
+            artifacts,
+            config,
+            artifact_lang,
+            base_segments,
+            source_duration,
+        )
     if artifacts:
         write_srt(_debug_path(config, "artifact_translated.srt"), artifacts, translated=True)
         print(f"      Artifact candidates: {len(artifacts)}")
@@ -975,19 +1315,25 @@ def _normalize_lang(language: str | None) -> str | None:
     return language
 
 
-def _artifact_initial_prompt(language: str | None, *, same_language: bool) -> str | None:
+def _artifact_initial_prompt(
+    language: str | None,
+    *,
+    same_language: bool,
+    seed_material: str | None = None,
+) -> str | None:
     if language != "ru":
         return None
+    seeds = list(_ru_artifact_prompt_seeds())
+    if seed_material:
+        seed = int.from_bytes(hashlib.sha256(seed_material.encode("utf-8", errors="ignore")).digest()[:8], "big")
+        random.Random(seed).shuffle(seeds)
     if same_language:
-        return (
-            "Субтитры сделал DimaTorzok. "
-            "Перевод и субтитры DimaTorzok. "
-            "Subtitles by DimaTorzok. Captions created by DimaTorzok. amara.org."
-        )
-    return (
-        "Субтитры DimaTorzok. "
-        "Subtitles by DimaTorzok. amara.org."
-    )
+        return " ".join(seeds[:6])
+    return " ".join(seeds[:3])
+
+
+def _artifact_whisper_model(config: DubConfig, artifact_lang: str | None) -> str:
+    return config.artifact_whisper_model or "turbo"
 
 
 def _translate_artifact_segments(artifacts: list[Segment], artifact_config: DubConfig) -> list[Segment]:
@@ -1062,18 +1408,250 @@ def _clean_chaos_artifact_source_segments(segments: list[Segment]) -> list[Segme
 
 def _filter_same_language_ru_artifacts(segments: list[Segment]) -> list[Segment]:
     result: list[Segment] = []
-    seen_per_text: dict[str, int] = {}
-    for segment in sorted(segments, key=lambda item: (item.start, item.end)):
+    seen_signatures: set[str] = set()
+    seen_segment_keys: set[tuple[int, int, str]] = set()
+    used_signature_counts: dict[str, int] = {}
+    seen_per_family: dict[str, int] = {}
+    candidates = [
+        segment
+        for segment in sorted(segments, key=lambda item: (item.start, item.end))
+        if _looks_like_meta_hallucination(segment.text)
+    ]
+    max_total = 8
+    min_total = min(6, len(candidates))
+
+    for segment in candidates:
         if not _looks_like_meta_hallucination(segment.text):
             continue
-        key = " ".join(segment.text.casefold().split())
-        if seen_per_text.get(key, 0) >= 2:
+        signature = _artifact_signature(segment.text)
+        if signature in seen_signatures:
             continue
-        seen_per_text[key] = seen_per_text.get(key, 0) + 1
+        family = _artifact_family(segment.text)
+        if seen_per_family.get(family, 0) >= 2:
+            continue
+        seen_signatures.add(signature)
+        seen_segment_keys.add(_artifact_segment_key(segment))
+        used_signature_counts[signature] = used_signature_counts.get(signature, 0) + 1
+        seen_per_family[family] = seen_per_family.get(family, 0) + 1
         result.append(segment)
-        if len(result) >= 8:
+        if len(result) >= max_total:
+            break
+
+    if len(result) >= min_total:
+        return result
+
+    for segment in candidates:
+        signature = _artifact_signature(segment.text)
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        seen_segment_keys.add(_artifact_segment_key(segment))
+        used_signature_counts[signature] = used_signature_counts.get(signature, 0) + 1
+        result.append(segment)
+        if len(result) >= min_total or len(result) >= max_total:
+            break
+
+    if len(result) >= min_total:
+        return result
+
+    for segment in candidates:
+        segment_key = _artifact_segment_key(segment)
+        if segment_key in seen_segment_keys:
+            continue
+        signature = _artifact_signature(segment.text)
+        if used_signature_counts.get(signature, 0) >= 2:
+            continue
+        seen_segment_keys.add(segment_key)
+        used_signature_counts[signature] = used_signature_counts.get(signature, 0) + 1
+        result.append(segment)
+        if len(result) >= min_total or len(result) >= max_total:
             break
     return result
+
+
+def _fill_sparse_artifacts_from_history(
+    artifacts: list[Segment],
+    config: DubConfig,
+    artifact_lang: str | None,
+    base_segments: list[Segment],
+    source_duration: float,
+) -> list[Segment]:
+    if config.target_lang != "ru" or artifact_lang != "ru":
+        return artifacts
+
+    max_total = min(max(0, config.artifact_max_segments), 8)
+    if max_total <= 0:
+        return artifacts
+    min_total = min(5, max_total)
+    if len(artifacts) >= min_total:
+        return artifacts
+
+    needed = min_total - len(artifacts)
+    borrowed = _borrow_historical_artifacts(config, artifacts, base_segments, source_duration, needed)
+    if not borrowed:
+        return artifacts
+
+    print(f"      Historical artifact borrow: added={len(borrowed)}")
+    write_srt(_debug_path(config, "artifact_borrowed.srt"), borrowed, translated=True)
+    return [*artifacts, *borrowed]
+
+
+def _borrow_historical_artifacts(
+    config: DubConfig,
+    existing: list[Segment],
+    base_segments: list[Segment],
+    source_duration: float,
+    needed: int,
+) -> list[Segment]:
+    source_duration = max(source_duration, max((segment.end for segment in base_segments), default=0.0))
+    if needed <= 0 or source_duration <= 0.5:
+        return []
+
+    existing_signatures = {_artifact_signature(segment.spoken_text or segment.text) for segment in existing}
+    texts = _historical_artifact_texts(config, existing_signatures, limit=needed * 4)
+    if not texts:
+        return []
+
+    slots = _historical_artifact_slots(base_segments, existing, source_duration, len(texts))
+    borrowed: list[Segment] = []
+    for text, (slot_start, slot_end) in zip(texts, slots):
+        duration = min(max(1.2, _estimated_chaos_spoken_duration(text)), max(0.4, slot_end - slot_start))
+        start = max(0.0, min(source_duration, slot_start))
+        end = min(source_duration, start + duration)
+        if end - start < 0.4:
+            continue
+        borrowed.append(Segment(start=start, end=end, text=text, translated_text=text))
+        if len(borrowed) >= needed:
+            break
+    return borrowed
+
+
+def _historical_artifact_texts(
+    config: DubConfig,
+    existing_signatures: set[str],
+    *,
+    limit: int,
+) -> list[str]:
+    runs_root = _runs_root_from_workdir(config.workdir)
+    if runs_root is None or not runs_root.exists():
+        return []
+
+    paths = [
+        path
+        for pattern in (
+            "*/**/work/debug/artifact_translated.srt",
+            "*/**/work/debug/artifact_injected.srt",
+            "*/**/work/debug/artifact_source.srt",
+        )
+        for path in runs_root.glob(pattern)
+        if path.is_file() and config.workdir not in path.parents
+    ]
+    paths.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+
+    result: list[str] = []
+    seen = set(existing_signatures)
+    family_counts: dict[str, int] = {}
+    for path in paths[:100]:
+        try:
+            segments = read_srt(path, translated=True)
+            if not segments:
+                segments = read_srt(path, translated=False)
+        except Exception:
+            continue
+        for segment in segments:
+            text = " ".join((segment.spoken_text or segment.text).split()).strip()
+            if not text or not _looks_like_meta_hallucination(text):
+                continue
+            signature = _artifact_signature(text)
+            if signature in seen:
+                continue
+            family = _artifact_family(text)
+            if family_counts.get(family, 0) >= 2:
+                continue
+            seen.add(signature)
+            family_counts[family] = family_counts.get(family, 0) + 1
+            result.append(text)
+            if len(result) >= limit:
+                return result
+    return result
+
+
+def _runs_root_from_workdir(workdir: Path) -> Path | None:
+    for parent in workdir.parents:
+        if parent.name in {"bot", "bot-release"}:
+            return parent
+    return None
+
+
+def _historical_artifact_slots(
+    base_segments: list[Segment],
+    existing_artifacts: list[Segment],
+    source_duration: float,
+    needed: int,
+) -> list[tuple[float, float]]:
+    occupied = sorted(
+        [
+            (max(0.0, segment.start), min(source_duration, segment.end))
+            for segment in [*base_segments, *existing_artifacts]
+            if segment.end > segment.start
+        ]
+    )
+    gaps: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in occupied:
+        if start - cursor >= 1.0:
+            gaps.append((cursor, start))
+        cursor = max(cursor, end)
+    if source_duration - cursor >= 1.0:
+        gaps.append((cursor, source_duration))
+
+    slots: list[tuple[float, float]] = []
+    for start, end in sorted(gaps, key=lambda item: item[1] - item[0], reverse=True):
+        slots.append((start + 0.1, end - 0.1))
+        if len(slots) >= needed:
+            return slots
+
+    step = source_duration / max(1, needed + 1)
+    for index in range(needed):
+        center = min(source_duration - 0.7, max(0.7, step * (index + 1)))
+        slots.append((center - 0.6, center + 0.8))
+    return slots[:needed]
+
+
+def _artifact_segment_key(segment: Segment) -> tuple[int, int, str]:
+    return (round(segment.start * 100), round(segment.end * 100), _artifact_signature(segment.text))
+
+
+def _artifact_signature(text: str) -> str:
+    normalized = re.sub(r"[^\w\s]+", " ", text.casefold(), flags=re.UNICODE)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    normalized = normalized.replace("dima torzok", "dimatorzok")
+    return normalized
+
+
+def _artifact_family(text: str) -> str:
+    normalized = _artifact_signature(text)
+    if "продолжение следует" in normalized:
+        return "continued"
+    if "редактор" in normalized or "корректор" in normalized or "семкин" in normalized or "егорова" in normalized:
+        return "editor_credit"
+    if "спасибо" in normalized and "субтитр" in normalized:
+        return "thanks_subtitles"
+    if "подогнал" in normalized:
+        return "subtitle_sync"
+    if "подпис" in normalized or "subscribe" in normalized or "abonnieren" in normalized:
+        return "subscribe"
+    if "amara" in normalized:
+        return "amara"
+    if (
+        "субтитр" in normalized
+        or "subtitle" in normalized
+        or "caption" in normalized
+        or "dimatorzok" in normalized
+        or "дубровск" in normalized
+    ):
+        return "subtitle_credit"
+    return "meta"
 
 
 def _whisper_chaos_audio(source_audio: Path, config: DubConfig, *, purpose: str) -> Path:
@@ -1111,9 +1689,18 @@ def _harvest_chunked_forced_artifacts(
     print(f"      Chaos artifact chunk harvest: windows={len(windows)}")
     chunk_config = copy(artifact_config)
     chunk_config.condition_on_previous_text = True
-    chunk_config.initial_prompt = artifact_config.initial_prompt
+    same_language_ru = bool(
+        artifact_config.source_lang == "ru"
+        and config.source_lang
+        and artifact_config.source_lang == config.source_lang
+    )
     result: list[Segment] = []
     for index, (start, duration) in enumerate(windows, start=1):
+        chunk_config.initial_prompt = _artifact_initial_prompt(
+            artifact_config.source_lang,
+            same_language=same_language_ru,
+            seed_material=f"{config.workdir}|artifact|chunk|{index}",
+        ) or artifact_config.initial_prompt
         chunk_path = chunk_dir / f"{index:04d}_{start:.2f}_{duration:.2f}.wav"
         try:
             extract_wav_slice(source_audio, chunk_path, start, duration)
@@ -1234,6 +1821,8 @@ def _maybe_distort_translations(
     print(f"      Distorting translation through {len(chains)} chain variant(s): {summary}")
     changed = 0
     fallback_count = 0
+    second_pass_count = 0
+    second_pass_failures = 0
     for index, segment in enumerate(segments):
         text = (segment.translated_text or segment.text).strip()
         if not text:
@@ -1241,7 +1830,7 @@ def _maybe_distort_translations(
         if _looks_like_meta_hallucination(segment.text) or _looks_like_meta_hallucination(text):
             continue
 
-        chain = _select_translation_distortion_chain(config, chains, index, text)
+        chain = _select_translation_distortion_chain(config, chains, index, text, pass_index=0)
         try:
             distorted = translate_text_chain(text, chain, config).strip()
             if _bad_pivot_result(distorted, text):
@@ -1258,6 +1847,21 @@ def _maybe_distort_translations(
                 )
             distorted = _telephone_distort_text(text)
 
+        if distorted and _should_apply_translation_second_pass(config, index, text):
+            second_chain = _select_translation_distortion_chain(config, chains, index, distorted, pass_index=1)
+            try:
+                second_distorted = translate_text_chain(distorted, second_chain, config).strip()
+                if not _bad_pivot_result(second_distorted, distorted):
+                    distorted = second_distorted
+                    second_pass_count += 1
+            except Exception as exc:
+                second_pass_failures += 1
+                if second_pass_failures <= 3:
+                    print(
+                        "      Second pivot pass skipped after failure: "
+                        f"{' -> '.join(second_chain)}: {type(exc).__name__}: {exc}"
+                    )
+
         if distorted:
             segment.translated_text = distorted
             changed += int(distorted != text)
@@ -1265,7 +1869,8 @@ def _maybe_distort_translations(
     if output_path is not None:
         write_srt(output_path, segments, translated=True)
     fallback_detail = f", fallback={fallback_count}" if fallback_count else ""
-    print(f"      Distorted translated segments: {changed}/{len(segments)}{fallback_detail}")
+    second_pass_detail = f", pass2={second_pass_count}" if second_pass_count else ""
+    print(f"      Distorted translated segments: {changed}/{len(segments)}{fallback_detail}{second_pass_detail}")
     return segments
 
 
@@ -1377,16 +1982,27 @@ def _select_translation_distortion_chain(
     chains: list[list[str]],
     segment_index: int,
     text: str,
+    *,
+    pass_index: int = 0,
 ) -> list[str]:
     if len(chains) == 1:
         return chains[0]
-    seed_material = f"{config.workdir}|{segment_index}|{text[:96]}|{config.translation_pivots}"
+    seed_material = f"{config.workdir}|{segment_index}|{pass_index}|{text[:96]}|{config.translation_pivots}"
     seed = int.from_bytes(hashlib.sha256(seed_material.encode("utf-8", errors="ignore")).digest()[:8], "big")
     return random.Random(seed).choice(chains)
 
 
+def _should_apply_translation_second_pass(config: DubConfig, segment_index: int, text: str) -> bool:
+    ratio = max(0.0, min(1.0, config.translation_second_pass_ratio))
+    if ratio <= 0.0:
+        return False
+    seed_material = f"{config.workdir}|second-pass|{segment_index}|{text[:96]}|{config.translation_pivots}"
+    bucket = int.from_bytes(hashlib.sha256(seed_material.encode("utf-8", errors="ignore")).digest()[:8], "big")
+    return (bucket / float(1 << 64)) < ratio
+
+
 def _looks_like_meta_hallucination(text: str) -> bool:
-    return bool(text and _META_HALLUCINATION_RE.search(text))
+    return bool(text and _meta_hallucination_re().search(text))
 
 
 def _dedupe_artifact_segments(segments: list[Segment]) -> list[Segment]:

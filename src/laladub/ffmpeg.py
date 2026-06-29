@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import shutil
 import subprocess
 import wave
@@ -61,6 +62,332 @@ def probe_duration(path: Path) -> float:
                 return frames / float(rate)
 
     raise ToolError(f"Could not determine media duration: {path}")
+
+
+def has_video_stream(path: Path) -> bool:
+    ffprobe = require_tool("ffprobe")
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError:
+        return False
+    return "video" in result.stdout.lower()
+
+
+def make_audio_visual_video(
+    audio_path: Path,
+    output_path: Path,
+    *,
+    source_roots: list[Path],
+    temp_dir: Path,
+    duration: float | None = None,
+    resolution: int = 512,
+    min_slice_seconds: float = 0.2,
+    max_slice_seconds: float = 3.0,
+    min_speed: float = 1.0,
+    max_speed: float = 4.0,
+    exclude_dirs: list[Path] | None = None,
+    safety_enabled: bool = False,
+    safety_cache_dir: Path | None = None,
+    safety_model: str = "Falconsai/nsfw_image_detection",
+    safety_threshold: float = 0.72,
+    safety_frames: int = 5,
+    safety_device: str = "cpu",
+) -> None:
+    target_duration = duration if duration is not None else probe_duration(audio_path)
+    target_duration = max(0.1, target_duration)
+    resolution = max(64, int(resolution))
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    sources = _find_visual_source_videos(source_roots, exclude_dirs=exclude_dirs or [])
+    if not sources:
+        _make_fallback_audio_video(audio_path, output_path, target_duration, resolution)
+        return
+
+    safety_cache: dict[Path, bool] = {}
+    segment_paths: list[Path] = []
+    visual_duration = 0.0
+    attempts = 0
+    max_attempts = max(30, min(800, int(target_duration / max(min_slice_seconds, 0.1) * 3)))
+    while visual_duration < target_duration + 1.0 and attempts < max_attempts:
+        attempts += 1
+        if not sources:
+            break
+        source = random.choice(sources)
+        if safety_enabled and not _visual_source_is_safe(
+            source,
+            safety_cache=safety_cache,
+            safety_cache_dir=safety_cache_dir,
+            temp_dir=temp_dir / "safety_frames",
+            model_name=safety_model,
+            threshold=safety_threshold,
+            frame_count=safety_frames,
+            device=safety_device,
+        ):
+            sources.remove(source)
+            continue
+        try:
+            source_duration = probe_duration(source)
+        except Exception:
+            continue
+        if source_duration < 0.3:
+            continue
+
+        out_duration = min(
+            random.uniform(min_slice_seconds, max_slice_seconds),
+            max(0.2, target_duration + 1.0 - visual_duration),
+        )
+        speed = random.uniform(min_speed, max_speed)
+        input_duration = min(max(0.2, out_duration * speed), max(0.2, source_duration))
+        max_start = max(0.0, source_duration - input_duration)
+        start = random.uniform(0.0, max_start) if max_start > 0.05 else 0.0
+        segment_path = temp_dir / f"visual_segment_{len(segment_paths):04d}.mp4"
+        try:
+            _make_visual_segment(source, segment_path, start, input_duration, speed, resolution)
+        except subprocess.CalledProcessError:
+            segment_path.unlink(missing_ok=True)
+            continue
+        if segment_path.exists() and segment_path.stat().st_size > 1024:
+            segment_paths.append(segment_path)
+            visual_duration += out_duration
+
+    if not segment_paths:
+        _make_fallback_audio_video(audio_path, output_path, target_duration, resolution)
+        return
+
+    _concat_visual_segments_with_audio(segment_paths, audio_path, output_path, target_duration)
+
+
+def _visual_source_is_safe(
+    path: Path,
+    *,
+    safety_cache: dict[Path, bool],
+    safety_cache_dir: Path | None,
+    temp_dir: Path,
+    model_name: str,
+    threshold: float,
+    frame_count: int,
+    device: str,
+) -> bool:
+    resolved = path.resolve()
+    cached = safety_cache.get(resolved)
+    if cached is not None:
+        return cached
+    if safety_cache_dir is None:
+        safety_cache[resolved] = False
+        return False
+    from .visual_safety import is_video_safe_for_visual_source
+
+    safe = is_video_safe_for_visual_source(
+        path,
+        cache_dir=safety_cache_dir,
+        temp_dir=temp_dir,
+        model_name=model_name,
+        threshold=threshold,
+        frame_count=frame_count,
+        device=device,
+    )
+    safety_cache[resolved] = safe
+    return safe
+
+
+def _find_visual_source_videos(
+    source_roots: list[Path],
+    *,
+    exclude_dirs: list[Path],
+    max_candidates: int = 120,
+) -> list[Path]:
+    suffixes = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+    excluded = [path.resolve() for path in exclude_dirs if path.exists()]
+    raw_candidates: list[Path] = []
+    seen: set[Path] = set()
+    for root in source_roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in suffixes:
+                continue
+            resolved = path.resolve()
+            if resolved in seen or any(_is_relative_to(resolved, directory) for directory in excluded):
+                continue
+            if path.name.lower().startswith("input_audio_visual"):
+                continue
+            seen.add(resolved)
+            raw_candidates.append(path)
+
+    random.shuffle(raw_candidates)
+    raw_candidates.sort(key=_visual_source_priority)
+    candidates: list[Path] = []
+    for path in raw_candidates:
+        if len(candidates) >= max_candidates:
+            break
+        try:
+            if has_video_stream(path):
+                candidates.append(path)
+        except Exception:
+            continue
+    return candidates
+
+
+def _visual_source_priority(path: Path) -> int:
+    name = path.name.lower()
+    if name.startswith("input") and "audio_visual" not in name:
+        return 0
+    if name == "dubbed.mp4":
+        return 1
+    if "watermarked" in name:
+        return 3
+    return 2
+
+
+def _is_relative_to(path: Path, directory: Path) -> bool:
+    try:
+        path.relative_to(directory)
+    except ValueError:
+        return False
+    return True
+
+
+def _make_visual_segment(
+    source_path: Path,
+    output_path: Path,
+    start: float,
+    input_duration: float,
+    speed: float,
+    resolution: int,
+) -> None:
+    ffmpeg = require_tool("ffmpeg")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    scale_filter = (
+        f"setpts=PTS/{max(0.1, speed):.4f},"
+        f"scale={resolution}:{resolution}:force_original_aspect_ratio=increase,"
+        f"crop={resolution}:{resolution},fps=30,format=yuv420p"
+    )
+    run(
+        [
+            ffmpeg,
+            "-y",
+            "-ss",
+            f"{max(0.0, start):.3f}",
+            "-t",
+            f"{max(0.1, input_duration):.3f}",
+            "-i",
+            str(source_path),
+            "-an",
+            "-vf",
+            scale_filter,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "26",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+    )
+
+
+def _concat_visual_segments_with_audio(
+    segment_paths: list[Path],
+    audio_path: Path,
+    output_path: Path,
+    duration: float,
+) -> None:
+    ffmpeg = require_tool("ffmpeg")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    list_path = output_path.with_name(f"{output_path.stem}_segments.txt")
+    list_path.write_text(
+        "".join(f"file '{_concat_file_path(path)}'\n" for path in segment_paths),
+        encoding="utf-8",
+    )
+    run(
+        [
+            ffmpeg,
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-i",
+            str(audio_path),
+            "-t",
+            f"{max(0.1, duration):.3f}",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+    )
+
+
+def _concat_file_path(path: Path) -> str:
+    return path.resolve().as_posix().replace("'", "'\\''")
+
+
+def _make_fallback_audio_video(audio_path: Path, output_path: Path, duration: float, resolution: int) -> None:
+    ffmpeg = require_tool("ffmpeg")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    run(
+        [
+            ffmpeg,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=size={resolution}x{resolution}:rate=30",
+            "-i",
+            str(audio_path),
+            "-t",
+            f"{max(0.1, duration):.3f}",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "28",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+    )
 
 
 def extract_audio(video_path: Path, wav_path: Path) -> None:
@@ -464,7 +791,8 @@ def combine_video_audio(
         filter_complex = (
             f"[1:a]volume={original_volume:.3f}[bed];"
             f"[2:a]volume={dub_volume:.3f}[dub];"
-            "[bed][dub]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+            "[bed][dub]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+            "alimiter=limit=0.95[aout]"
         )
         cmd = [
             ffmpeg,
@@ -492,7 +820,8 @@ def combine_video_audio(
         filter_complex = (
             f"[0:a]volume={original_volume:.3f}[orig];"
             f"[1:a]volume={dub_volume:.3f}[dub];"
-            "[orig][dub]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+            "[orig][dub]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+            "alimiter=limit=0.95[aout]"
         )
         cmd = [
             ffmpeg,

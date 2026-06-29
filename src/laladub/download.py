@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from .ffmpeg import require_tool
 
@@ -30,13 +32,18 @@ def download_video_url(url: str, output_dir: Path, max_file_mb: int) -> Path:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise DownloadError("Это не похоже на корректную ссылку.")
 
+    output_dir.mkdir(parents=True, exist_ok=True)
+    max_bytes = max_file_mb * 1024 * 1024
+    cached_path = _restore_cached_download(url, output_dir, max_bytes)
+    if cached_path is not None:
+        print(f"Download cache hit: {url} -> {cached_path}", flush=True)
+        return cached_path
+
     try:
         import yt_dlp
     except ImportError as exc:
         raise DownloadError("Для скачивания ссылок нужен yt-dlp: python -m pip install yt-dlp") from exc
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    max_bytes = max_file_mb * 1024 * 1024
     output_template = str(output_dir / "input.%(ext)s")
     options: dict[str, object] = {
         "format": "bv*[vcodec!=none][height<=720]+ba/b[vcodec!=none][height<=720]/bv*[vcodec!=none]+ba/b[vcodec!=none]",
@@ -101,7 +108,110 @@ def download_video_url(url: str, output_dir: Path, max_file_mb: int) -> Path:
         video_path.unlink(missing_ok=True)
         raise DownloadError(f"Видео получилось слишком большим: {size_mb:.1f} МБ. Лимит: {max_file_mb} МБ.")
 
+    _store_cached_download(url, output_dir, video_path)
     return video_path
+
+
+def _restore_cached_download(url: str, output_dir: Path, max_bytes: int) -> Path | None:
+    cache_dir = _download_cache_entry(url)
+    if cache_dir is None:
+        return None
+    cached_video = _find_downloaded_video(cache_dir)
+    if cached_video is None:
+        return None
+    if cached_video.stat().st_size > max_bytes:
+        return None
+
+    for candidate in output_dir.glob("input.*"):
+        if candidate.is_file():
+            candidate.unlink(missing_ok=True)
+
+    output_path = output_dir / f"input{cached_video.suffix.lower() or '.mp4'}"
+    try:
+        shutil.copy2(cached_video, output_path)
+        cached_meta = cache_dir / "download_meta.json"
+        if cached_meta.exists():
+            meta = json.loads(cached_meta.read_text(encoding="utf-8"))
+            if isinstance(meta, dict):
+                meta["cache_hit"] = True
+                meta["cache_key"] = cache_dir.name
+                (output_dir / "download_meta.json").write_text(
+                    json.dumps(meta, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+    except Exception as exc:
+        print(f"Download cache restore skipped: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+    return output_path if has_video_and_audio(output_path) else None
+
+
+def _store_cached_download(url: str, output_dir: Path, video_path: Path) -> None:
+    cache_dir = _download_cache_entry(url)
+    if cache_dir is None or not has_video_and_audio(video_path):
+        return
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    output_path = cache_dir / f"input{video_path.suffix.lower() or '.mp4'}"
+    if not output_path.exists():
+        temp_path = output_path.with_name(output_path.name + ".tmp")
+        try:
+            shutil.copy2(video_path, temp_path)
+            temp_path.replace(output_path)
+        except Exception as exc:
+            print(f"Download cache store skipped: {type(exc).__name__}: {exc}", flush=True)
+            temp_path.unlink(missing_ok=True)
+            return
+
+    meta_path = output_dir / "download_meta.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(meta, dict):
+                meta["cache_key"] = cache_dir.name
+                meta["normalized_url"] = _normalize_download_cache_url(url)
+                (cache_dir / "download_meta.json").write_text(
+                    json.dumps(meta, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        except Exception:
+            pass
+
+
+def _download_cache_entry(url: str) -> Path | None:
+    cache_root = os.environ.get("LALADUB_DOWNLOAD_CACHE_DIR", "runs/cache/downloads").strip()
+    if not cache_root:
+        return None
+    root = Path(cache_root)
+    key = hashlib.sha256(_normalize_download_cache_url(url).encode("utf-8", errors="ignore")).hexdigest()
+    return root / key[:2] / key
+
+
+def _normalize_download_cache_url(url: str) -> str:
+    parsed = urlparse(url.strip())
+    scheme = parsed.scheme.lower() or "https"
+    netloc = parsed.netloc.lower()
+    path = parsed.path.rstrip("/") or parsed.path
+    query_items = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=False)
+        if key.lower() not in {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "si", "feature"}
+    ]
+
+    if netloc in {"youtu.be", "www.youtu.be"}:
+        video_id = path.strip("/").split("/", 1)[0]
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+
+    if netloc.endswith("youtube.com"):
+        parts = [part for part in path.split("/") if part]
+        if len(parts) >= 2 and parts[0] in {"shorts", "embed", "live"}:
+            return f"https://www.youtube.com/watch?v={parts[1]}"
+        video_id = next((value for key, value in query_items if key == "v" and value), "")
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+
+    query = urlencode(sorted(query_items))
+    return urlunparse((scheme, netloc, path, "", query, ""))
 
 
 def _find_downloaded_video(output_dir: Path) -> Path | None:
