@@ -23,6 +23,8 @@ _F5_CACHE: dict[tuple[str, str, str, str], object] = {}
 _F5_PRONUNCIATION_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     ("Ghiền Mì Gõ", "гиен ми го"),
     ("Ghien Mi Go", "гиен ми го"),
+    ("GIGI Type Channels", "ла ла скул"),
+    ("GIGI-каналы", "ла ла скул"),
     ("Amara.org", "амара орг"),
     ("YouTube", "ютуб"),
     ("TikTok", "тикток"),

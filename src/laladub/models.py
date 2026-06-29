@@ -45,7 +45,7 @@ class DubConfig:
     asr_fallback_on_sparse: bool = False
     artifact_source_lang: str | None = None
     input_pivot_lang: str | None = None
-    artifact_whisper_model: str = "large-v3"
+    artifact_whisper_model: str = "turbo"
     artifact_whisper_device: str = "cpu"
     artifact_chaos_mode: bool = False
     inject_artifacts: bool = True
@@ -83,6 +83,7 @@ class DubConfig:
     f5_ckpt_file: Path | None = None
     f5_vocab_file: Path | None = None
     f5_cache_dir: Path = Path("models/f5tts")
+    media_cache_dir: Path = Path("runs/cache/media")
     f5_device: str = "auto"
     f5_speed: float = 1.0
     f5_nfe_step: int = 32

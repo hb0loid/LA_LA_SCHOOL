@@ -310,7 +310,7 @@ def _remote_update_available(client: CoordinatorClient) -> bool:
     if not remote_build:
         return False
     local_build = _local_build_id()
-    return bool(local_build and remote_build != local_build)
+    return remote_build != local_build
 
 
 def _local_build_id() -> str:

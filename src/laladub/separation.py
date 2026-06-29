@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .ffmpeg import require_tool, run
 from .models import DubConfig
 
 
@@ -53,18 +55,64 @@ def _separate_demucs(audio_path: Path, output_dir: Path, config: DubConfig) -> S
             env=_python_subprocess_env(),
         )
     except FileNotFoundError as exc:
-        raise SeparationError("Demucs is not installed. Run: python -m pip install -e .[separation]") from exc
+        print(f"      Demucs is not installed; using fallback separation: {exc}")
+        return _fallback_separation(audio_path, output_dir, config, "demucs missing")
     except subprocess.CalledProcessError as exc:
         detail = _short_subprocess_output(exc.stdout, exc.stderr)
         suffix = f": {detail}" if detail else ""
-        raise SeparationError(f"Demucs failed for {audio_path}{suffix}") from exc
+        print(f"      Demucs failed for {audio_path}{suffix}")
+        return _fallback_separation(audio_path, output_dir, config, "demucs failed")
 
     stem_dir = output_dir / config.demucs_model / audio_path.stem
     vocals_path = stem_dir / "vocals.wav"
     instrumental_path = stem_dir / "no_vocals.wav"
     if not vocals_path.exists() or not instrumental_path.exists():
-        raise SeparationError(f"Demucs output not found in {stem_dir}")
+        print(f"      Demucs output not found in {stem_dir}; using fallback separation")
+        return _fallback_separation(audio_path, output_dir, config, "demucs output missing")
     return SeparationResult(vocals_path=vocals_path, instrumental_path=instrumental_path)
+
+
+def _fallback_separation(
+    audio_path: Path,
+    output_dir: Path,
+    config: DubConfig,
+    reason: str,
+) -> SeparationResult:
+    stem_dir = output_dir / config.demucs_model / audio_path.stem
+    stem_dir.mkdir(parents=True, exist_ok=True)
+    vocals_path = stem_dir / "vocals.wav"
+    instrumental_path = stem_dir / "no_vocals.wav"
+
+    try:
+        shutil.copy2(audio_path, vocals_path)
+        _make_attenuated_bed(audio_path, instrumental_path, volume=0.20)
+    except Exception as exc:
+        raise SeparationError(f"Fallback separation failed for {audio_path}: {reason}: {exc}") from exc
+
+    print(f"      Fallback separation ready ({reason}): {stem_dir}")
+    return SeparationResult(vocals_path=vocals_path, instrumental_path=instrumental_path)
+
+
+def _make_attenuated_bed(input_path: Path, output_path: Path, volume: float) -> None:
+    ffmpeg = require_tool("ffmpeg")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    run(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(input_path),
+            "-af",
+            f"volume={volume:.3f}",
+            "-ac",
+            "2",
+            "-ar",
+            "44100",
+            "-c:a",
+            "pcm_s16le",
+            str(output_path),
+        ]
+    )
 
 
 def _python_subprocess_env() -> dict[str, str]:

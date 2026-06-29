@@ -10,6 +10,7 @@ __pycache__/
 .mypy_cache/
 dist/
 build/
+backup_before_codex_sync_*/
 *.egg-info/
 runs/
 models/

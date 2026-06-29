@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
 from .ffmpeg import require_tool, run
@@ -12,10 +13,26 @@ def add_watermark(
     text: str,
     image_path: Path | None = None,
 ) -> None:
-    if image_path and image_path.exists():
-        add_image_watermark(input_path, output_path, image_path)
+    selected_image = _select_watermark_image(image_path)
+    if selected_image is not None:
+        add_image_watermark(input_path, output_path, selected_image)
         return
     add_text_watermark(input_path, output_path, text)
+
+
+def _select_watermark_image(image_path: Path | None) -> Path | None:
+    if image_path is None or not image_path.exists():
+        return None
+    if image_path.is_file():
+        return image_path if image_path.suffix.casefold() == ".png" else None
+
+    candidates = sorted(
+        path for path in image_path.iterdir()
+        if path.is_file() and path.suffix.casefold() == ".png"
+    )
+    if not candidates:
+        return None
+    return random.choice(candidates)
 
 
 def add_image_watermark(
@@ -32,35 +49,40 @@ def add_image_watermark(
     alpha = max(0.0, min(1.0, opacity))
     filter_value = (
         f"[1:v]format=rgba,scale={width}:-1,colorchannelmixer=aa={alpha:.2f}[wm];"
-        f"[0:v][wm]overlay=W-w-{margin}:H-h-{margin}:format=auto,format=yuv420p[v]"
+        f"[0:v][wm]overlay="
+        f"x=W-w-{margin}:y=H-h-{margin}:"
+        "eval=init:format=auto,"
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2,"
+        "format=yuv420p[v]"
     )
-    run(
-        [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(input_path),
-            "-i",
-            str(image_path),
-            "-filter_complex",
-            filter_value,
-            "-map",
-            "[v]",
-            "-map",
-            "0:a?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "22",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "copy",
-            str(output_path),
-        ]
-    )
+    command = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(input_path),
+        "-i",
+        str(image_path),
+        "-filter_complex",
+        filter_value,
+        "-map",
+        "[v]",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "22",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+    ]
+    command.append(str(output_path))
+    run(command)
 
 
 def add_text_watermark(

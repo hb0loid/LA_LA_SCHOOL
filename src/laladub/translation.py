@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
 import urllib.parse
 import urllib.request
 
@@ -78,17 +79,31 @@ def _translate_hybrid(segments: list[Segment], config: DubConfig) -> list[Segmen
     if not config.source_lang:
         raise TranslationError("Hybrid translator needs --source-lang, for example: --source-lang vi")
 
-    for segment in segments:
+    meta_variants = _meta_variant_plan(segments)
+    for index, segment in enumerate(segments):
         text = segment.text.strip()
         segment.translated_text = _postprocess_translated_text(
-            _translate_hybrid_text(text, config.source_lang, config.target_lang, config),
+            _translate_hybrid_text(
+                text,
+                config.source_lang,
+                config.target_lang,
+                config,
+                meta_variant_seed=_segment_meta_variant_seed(index, segment, meta_variants),
+            ),
             config.target_lang,
         )
     return segments
 
 
-def _translate_hybrid_text(text: str, source_lang: str, target_lang: str, config: DubConfig) -> str:
-    known = _translate_known_meta_text(text, source_lang, target_lang)
+def _translate_hybrid_text(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    config: DubConfig,
+    *,
+    meta_variant_seed: str | None = None,
+) -> str:
+    known = _translate_known_meta_text(text, source_lang, target_lang, meta_variant_seed=meta_variant_seed)
     if known is not None:
         return known
 
@@ -124,9 +139,15 @@ def _translate_googleweb(segments: list[Segment], config: DubConfig) -> list[Seg
     if not config.source_lang:
         raise TranslationError("GoogleWeb translator needs --source-lang, for example: --source-lang vi")
 
-    for segment in segments:
+    meta_variants = _meta_variant_plan(segments)
+    for index, segment in enumerate(segments):
         text = segment.text.strip()
-        known = _translate_known_meta_text(text, config.source_lang, config.target_lang)
+        known = _translate_known_meta_text(
+            text,
+            config.source_lang,
+            config.target_lang,
+            meta_variant_seed=_segment_meta_variant_seed(index, segment, meta_variants),
+        )
         segment.translated_text = _postprocess_translated_text(
             known
             if known is not None
@@ -173,9 +194,15 @@ def _translate_mymemory(segments: list[Segment], config: DubConfig) -> list[Segm
     if not config.source_lang:
         raise TranslationError("MyMemory translator needs --source-lang, for example: --source-lang vi")
 
-    for segment in segments:
+    meta_variants = _meta_variant_plan(segments)
+    for index, segment in enumerate(segments):
         text = segment.text.strip()
-        known = _translate_known_meta_text(text, config.source_lang, config.target_lang)
+        known = _translate_known_meta_text(
+            text,
+            config.source_lang,
+            config.target_lang,
+            meta_variant_seed=_segment_meta_variant_seed(index, segment, meta_variants),
+        )
         segment.translated_text = _postprocess_translated_text(
             known
             if known is not None
@@ -239,9 +266,15 @@ def _translate_argos(segments: list[Segment], config: DubConfig) -> list[Segment
 
     _ensure_argos_route(config.source_lang, config.target_lang, argostranslate.translate)
 
-    for segment in segments:
+    meta_variants = _meta_variant_plan(segments)
+    for index, segment in enumerate(segments):
         text = segment.text.strip()
-        known = _translate_known_meta_text(text, config.source_lang, config.target_lang)
+        known = _translate_known_meta_text(
+            text,
+            config.source_lang,
+            config.target_lang,
+            meta_variant_seed=_segment_meta_variant_seed(index, segment, meta_variants),
+        )
         segment.translated_text = _postprocess_translated_text(
             known
             if known is not None
@@ -361,14 +394,23 @@ def _translate_libretranslate(segments: list[Segment], config: DubConfig) -> lis
     if not config.source_lang:
         raise TranslationError("LibreTranslate needs --source-lang, for example: --source-lang vi")
 
-    for segment in segments:
+    meta_variants = _meta_variant_plan(segments)
+    for index, segment in enumerate(segments):
         text = segment.text.strip()
         if not text:
             segment.translated_text = ""
             continue
 
+        known = _translate_known_meta_text(
+            text,
+            config.source_lang,
+            config.target_lang,
+            meta_variant_seed=_segment_meta_variant_seed(index, segment, meta_variants),
+        )
         segment.translated_text = _postprocess_translated_text(
-            _translate_libretranslate_text(
+            known
+            if known is not None
+            else _translate_libretranslate_text(
                 text,
                 config.source_lang,
                 config.target_lang,
@@ -415,9 +457,23 @@ def _translate_libretranslate_text(
 
 _VI_SUBSCRIBE_RE = re.compile(
     r"(?:^|\b)(?:các\s+bạn\s+)?hãy\s+"
-    r"(?:subscribe|đăng\s*k[íy])\s+cho\s+kênh\s+"
+    r"(?:subscribe|đăng\s*k[íiyý])\s+cho\s+kênh\s+"
     r"(?P<channel>.+?)"
     r"(?:\s+để\s+không\s+bỏ\s+lỡ\b|$)",
+    re.IGNORECASE,
+)
+
+_VI_LALASCHOOL_CHANNEL_RE = re.compile(
+    r"\b(?:la\s*la\s*school|lalaschool|la\s*la\s*skul)\b",
+    re.IGNORECASE,
+)
+
+_VI_COMMON_WRONG_CHANNEL_RE = re.compile(
+    r"\b(?:"
+    r"ghi[eề]n\s*m[ìi]\s*g[oõ]|"
+    r"ghien\s*mi\s*go|"
+    r"gigi(?:\s+type)?(?:\s+channels?)?"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -431,14 +487,29 @@ _RU_BAD_SUBTITLE_CREDIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_RU_COMMON_WRONG_VI_CHANNEL_RE = re.compile(
+    r"\b(?:"
+    r"GIGI(?:\s+Type)?(?:[\s-]+(?:Channels|каналы|каналов|канал))?"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 def _postprocess_translated_text(text: str, target_lang: str) -> str:
     if target_lang != "ru" or not text:
         return text
-    return _RU_BAD_SUBTITLE_CREDIT_RE.sub("Субтитры М.К.", text)
+    text = _RU_BAD_SUBTITLE_CREDIT_RE.sub("Субтитры М.К.", text)
+    text = _RU_COMMON_WRONG_VI_CHANNEL_RE.sub("La La School", text)
+    return text
 
 
-def _translate_known_meta_text(text: str, source_lang: str, target_lang: str) -> str | None:
+def _translate_known_meta_text(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    *,
+    meta_variant_seed: str | None = None,
+) -> str | None:
     if source_lang == "tr" and target_lang == "ru":
         compact = re.sub(r"\s+", " ", text).strip()
         if _TURKISH_SUBTITLES_CREDIT_RE.match(compact):
@@ -454,11 +525,65 @@ def _translate_known_meta_text(text: str, source_lang: str, target_lang: str) ->
 
     channel = match.group("channel").strip(" .,:;!?-")
     channel = re.sub(r"\s+", " ", channel)
+    channel = _normalize_vi_meta_channel(channel, compact, meta_variant_seed)
     if not channel:
-        channel = "канал"
+        return "Подпишитесь на канал, чтобы не пропустить новые видео."
     if len(channel) > 80:
         channel = channel[:80].rsplit(" ", 1)[0].strip() or channel[:80].strip()
     return f"Подпишитесь на канал {channel}, чтобы не пропустить новые видео."
+
+
+def _normalize_vi_meta_channel(channel: str, source_text: str, meta_variant_seed: str | None) -> str:
+    channel = re.sub(r"\s+", " ", channel).strip()
+    if not channel:
+        return channel
+    if _VI_COMMON_WRONG_CHANNEL_RE.search(channel):
+        return _choose_vi_meta_channel_variant(source_text, meta_variant_seed)
+    if _VI_LALASCHOOL_CHANNEL_RE.search(channel):
+        return "La La School"
+    return channel
+
+
+def _choose_vi_meta_channel_variant(source_text: str, meta_variant_seed: str | None) -> str:
+    variant = _meta_variant_from_segment_seed(meta_variant_seed)
+    if variant is None:
+        seed = f"{source_text.casefold()}|{meta_variant_seed or ''}"
+        digest = hashlib.sha256(seed.encode("utf-8", errors="ignore")).digest()
+        variant = digest[0] % 3
+    if variant == 0:
+        return "La La School"
+    if variant == 1:
+        return "Ghiền Mì Gõ"
+    return ""
+
+
+def _meta_variant_from_segment_seed(meta_variant_seed: str | None) -> int | None:
+    if not meta_variant_seed:
+        return None
+    match = re.match(r"\s*v([0-2])\b", meta_variant_seed)
+    if not match:
+        return None
+    return int(match.group(1)) % 3
+
+
+def _segment_meta_variant_seed(index: int, segment: Segment, variants: dict[int, int]) -> str:
+    variant = variants.get(id(segment))
+    prefix = f"v{variant}:" if variant is not None else ""
+    return f"{prefix}{index}:{segment.start:.2f}:{segment.end:.2f}"
+
+
+def _meta_variant_plan(segments: list[Segment]) -> dict[int, int]:
+    plan: dict[int, int] = {}
+    previous: int | None = None
+    for index, segment in enumerate(segments):
+        seed = f"{index}:{segment.start:.2f}:{segment.end:.2f}:{segment.text.casefold()}"
+        digest = hashlib.sha256(seed.encode("utf-8", errors="ignore")).digest()
+        variant = digest[0] % 3
+        if previous is not None and variant == previous:
+            variant = (variant + 1 + digest[1] % 2) % 3
+        plan[id(segment)] = variant
+        previous = variant
+    return plan
 
 
 def _looks_bad_machine_translation(text: str) -> bool:

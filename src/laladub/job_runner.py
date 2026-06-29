@@ -17,15 +17,15 @@ ProgressCallback = Callable[[str, int | None, int | None, str | None], None]
 
 
 ASR_METHOD_CONFIGS = {
-    "ow-large-v3-hunt": ("openai-whisper", "large-v3", False),
-    "ow-large-v3-chaos-backbone": ("openai-whisper", "large-v3", False),
-    "ow-large-v3-raw-dub": ("openai-whisper", "large-v3", True),
-    "ow-large-v3-chaos": ("openai-whisper", "large-v3", True),
-    "ow-large-v3-soft": ("openai-whisper", "large-v3", False),
-    "ow-large-v3-forced": ("openai-whisper", "large-v3", True),
+    "ow-large-v3-hunt": ("openai-whisper", "turbo", False),
+    "ow-large-v3-chaos-backbone": ("openai-whisper", "turbo", False),
+    "ow-large-v3-raw-dub": ("openai-whisper", "turbo", True),
+    "ow-large-v3-chaos": ("openai-whisper", "turbo", True),
+    "ow-large-v3-soft": ("openai-whisper", "turbo", False),
+    "ow-large-v3-forced": ("openai-whisper", "turbo", True),
     "fw-large-v3-soft": ("faster-whisper", "large-v3", False),
     "fw-large-v3-forced": ("faster-whisper", "large-v3", True),
-    "ow-large-v3-turbo-soft": ("openai-whisper", "large-v3-turbo", False),
+    "ow-large-v3-turbo-soft": ("openai-whisper", "turbo", False),
     "ow-large-v2-soft": ("openai-whisper", "large-v2", False),
     "ow-large-v2-forced": ("openai-whisper", "large-v2", True),
     "ow-large-v1-soft": ("openai-whisper", "large-v1", False),
@@ -76,19 +76,16 @@ def execute_job(
     result = run_dub(input_path, config)
     send_path = result
 
-    user_id = _coerce_int(job.get("user_id"))
-    is_paid = bool(job.get("is_paid")) or settings.is_paid(user_id)
-    if not is_paid:
-        watermarked_path = job_dir / "dubbed_watermarked.mp4"
-        if progress_callback:
-            progress_callback("Adding watermark", 98, 100, None)
-        add_watermark(
-            result,
-            watermarked_path,
-            text=settings.watermark_text,
-            image_path=settings.watermark_image,
-        )
-        send_path = watermarked_path
+    watermarked_path = job_dir / "dubbed_watermarked.mp4"
+    if progress_callback:
+        progress_callback("Adding watermark", 98, 100, None)
+    add_watermark(
+        result,
+        watermarked_path,
+        text=settings.watermark_text,
+        image_path=settings.watermark_image,
+    )
+    send_path = watermarked_path
 
     transcript_text = _read_transcript_text(job_dir / "work" / "translated.srt")
     transcript_path: Path | None = None
@@ -222,6 +219,7 @@ def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: P
         f5_ckpt_file=settings.f5_ckpt_file,
         f5_vocab_file=settings.f5_vocab_file,
         f5_cache_dir=settings.f5_cache_dir,
+        media_cache_dir=settings.media_cache_dir,
         f5_device=settings.f5_device,
         f5_speed=settings.f5_speed,
         f5_nfe_step=settings.f5_nfe_step,
@@ -277,7 +275,9 @@ def speaker_count_value(value: Any) -> int | None:
 
 def target_lang_value(value: Any) -> str:
     text = str(value or "").strip().lower()
-    return "uk" if text == "uk" else "ru"
+    if text == "ua":
+        text = "uk"
+    return text if text in {"ru", "uk", "en"} else "ru"
 
 
 def apply_speaker_count(config: DubConfig, job: dict[str, Any]) -> None:
@@ -361,7 +361,7 @@ def apply_text_extraction_method(config: DubConfig, job: dict[str, Any], setting
         config.artifact_source_lang = selected_source
         config.inject_artifacts = bool(settings.inject_artifacts and selected_source)
         config.artifact_chaos_mode = True
-        config.artifact_max_segments = max(settings.artifact_max_segments, 48)
+        config.artifact_max_segments = max(0, settings.artifact_max_segments)
         config.glitch_profile = "clean"
         config.distort_main_translation = True
     elif hunt_artifacts:
