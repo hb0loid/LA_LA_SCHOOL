@@ -59,6 +59,10 @@ class BotSettings:
     f5_cross_fade_duration: float
     f5_remove_silence: bool
     f5_timeout_seconds: int
+    qwen3_python: Path | None
+    qwen3_model: str
+    qwen3_cache_dir: Path
+    qwen3_timeout_seconds: int
     multi_speaker: bool
     speaker_reference_seconds: float
     speaker_clustering: bool
@@ -162,6 +166,10 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         f5_cross_fade_duration=float(os.environ.get("LALADUB_F5_CROSS_FADE_DURATION", "0.15")),
         f5_remove_silence=_parse_bool(os.environ.get("LALADUB_F5_REMOVE_SILENCE", "0")),
         f5_timeout_seconds=int(os.environ.get("LALADUB_F5_TIMEOUT_SECONDS", "1800")),
+        qwen3_python=_optional_path(os.environ.get("LALADUB_QWEN3_PYTHON", ".venv-qwen3tts\\Scripts\\python.exe")),
+        qwen3_model=os.environ.get("LALADUB_QWEN3_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
+        qwen3_cache_dir=Path(os.environ.get("LALADUB_QWEN3_CACHE_DIR", "models/qwen3tts")),
+        qwen3_timeout_seconds=int(os.environ.get("LALADUB_QWEN3_TIMEOUT_SECONDS", "1800")),
         multi_speaker=_parse_bool(os.environ.get("LALADUB_MULTI_SPEAKER", "1")),
         speaker_reference_seconds=float(os.environ.get("LALADUB_SPEAKER_REFERENCE_SECONDS", "5.0")),
         speaker_clustering=_parse_bool(os.environ.get("LALADUB_SPEAKER_CLUSTERING", "1")),

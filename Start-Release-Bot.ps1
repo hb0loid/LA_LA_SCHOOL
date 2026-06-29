@@ -178,6 +178,20 @@ $env:LALADUB_F5_TARGET_RMS = "0.1"
 $env:LALADUB_F5_CROSS_FADE_DURATION = "0.15"
 $env:LALADUB_F5_REMOVE_SILENCE = "0"
 $env:LALADUB_F5_TIMEOUT_SECONDS = "1800"
+$qwenRoot = $Root
+$qwenPython = Join-Path $qwenRoot ".venv-qwen3tts\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $qwenPython)) {
+  $siblingQwenRoot = Join-Path (Split-Path -Parent $Root) "La La School Release"
+  $siblingQwenPython = Join-Path $siblingQwenRoot ".venv-qwen3tts\Scripts\python.exe"
+  if (Test-Path -LiteralPath $siblingQwenPython) {
+    $qwenRoot = $siblingQwenRoot
+    $qwenPython = $siblingQwenPython
+  }
+}
+$env:LALADUB_QWEN3_PYTHON = $qwenPython
+$env:LALADUB_QWEN3_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+$env:LALADUB_QWEN3_CACHE_DIR = (Join-Path $qwenRoot "models\qwen3tts")
+$env:LALADUB_QWEN3_TIMEOUT_SECONDS = "1800"
 $env:LALADUB_MULTI_SPEAKER = "1"
 $env:LALADUB_SPEAKER_REFERENCE_SECONDS = "5.0"
 $env:LALADUB_SPEAKER_CLUSTERING = "0"
