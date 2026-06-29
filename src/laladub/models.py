@@ -95,6 +95,10 @@ class DubConfig:
     separation: str = "none"
     separation_device: str = "cpu"
     demucs_model: str = "htdemucs"
+    audio_separator_python: Path | None = None
+    audio_separator_model: str = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+    audio_separator_model_dir: Path = Path("models/audio-separator")
+    audio_separator_timeout_seconds: int = 900
     audio_bed: str = "original"
     glitch_profile: str = "faithful"
     ghost_gap_seconds: float = 2.7

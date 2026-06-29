@@ -185,8 +185,13 @@ $env:LALADUB_SPEAKER_REFERENCE_SECONDS = "5.0"
 $env:LALADUB_SPEAKER_CLUSTERING = "0"
 $env:LALADUB_MAX_SPEAKER_CLUSTERS = "6"
 $env:LALADUB_SPEAKER_CLUSTER_THRESHOLD = "0.08"
-$env:LALADUB_SEPARATION = "demucs"
-$env:LALADUB_SEPARATION_DEVICE = "cpu"
+$env:LALADUB_SEPARATION = "roformer"
+$env:LALADUB_SEPARATION_DEVICE = "cuda"
+$env:LALADUB_DEMUCS_MODEL = "htdemucs"
+$env:LALADUB_AUDIO_SEPARATOR_PYTHON = (Join-Path $Root ".venv-separator\Scripts\python.exe")
+$env:LALADUB_AUDIO_SEPARATOR_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+$env:LALADUB_AUDIO_SEPARATOR_MODEL_DIR = (Join-Path $Root "models\audio-separator")
+$env:LALADUB_AUDIO_SEPARATOR_TIMEOUT_SECONDS = "900"
 $env:LALADUB_AUDIO_BED = "instrumental"
 $env:LALADUB_ORIGINAL_VOLUME = "0.35"
 $env:LALADUB_COLLAPSE_REPETITIONS = "1"
@@ -212,6 +217,10 @@ $python = Join-Path $Root ".venv-f5tts\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) {
   Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) F5/CUDA Python is missing: $python" -ErrorAction SilentlyContinue
   exit 1
+}
+$separatorPython = $env:LALADUB_AUDIO_SEPARATOR_PYTHON
+if (-not (Test-Path -LiteralPath $separatorPython)) {
+  Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) BS-RoFormer Python is missing; jobs will fall back to Demucs: $separatorPython" -ErrorAction SilentlyContinue
 }
 $python = (Resolve-Path -LiteralPath $python).Path
 Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Starting La La Dub Release Watchdog..." -ErrorAction SilentlyContinue

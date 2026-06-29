@@ -1,5 +1,7 @@
 .venv/
 .venv-f5tts/
+.venv-qwen3tts/
+.venv-separator/
 .secrets/
 worker_config.json
 .worker_state.json

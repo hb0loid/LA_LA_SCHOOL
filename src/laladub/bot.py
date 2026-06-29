@@ -128,7 +128,7 @@ def main() -> None:
         f"f5={settings.f5_model}/{settings.f5_device} "
         f"multi_speaker={settings.multi_speaker} "
         f"speaker_clustering={settings.speaker_clustering}/{settings.max_speaker_clusters} "
-        f"separation={settings.separation} "
+        f"separation={settings.separation}/{settings.audio_separator_model} "
         f"audio_bed={settings.audio_bed} "
         f"watermark={settings.watermark_image} "
         f"audio_visual={settings.audio_visual_source_dir or settings.workdir}/"
@@ -1871,6 +1871,10 @@ async def _process_job(
         separation=settings.separation,
         separation_device=settings.separation_device,
         demucs_model=settings.demucs_model,
+        audio_separator_python=settings.audio_separator_python,
+        audio_separator_model=settings.audio_separator_model,
+        audio_separator_model_dir=settings.audio_separator_model_dir,
+        audio_separator_timeout_seconds=settings.audio_separator_timeout_seconds,
         audio_bed=settings.audio_bed,
         glitch_profile=job.get("glitch_profile", "clean"),
         original_volume=settings.original_volume,

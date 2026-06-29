@@ -65,6 +65,10 @@ def main(argv: list[str] | None = None) -> None:
             separation=args.separation,
             separation_device=args.separation_device,
             demucs_model=args.demucs_model,
+            audio_separator_python=args.audio_separator_python,
+            audio_separator_model=args.audio_separator_model,
+            audio_separator_model_dir=args.audio_separator_model_dir,
+            audio_separator_timeout_seconds=args.audio_separator_timeout_seconds,
             audio_bed=args.audio_bed,
             glitch_profile=args.glitch_profile,
             ghost_gap_seconds=args.ghost_gap_seconds,
@@ -160,9 +164,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=3.5,
         help="Seconds of source vocals to use as per-segment XTTS speaker reference.",
     )
-    dub.add_argument("--separation", default="none", choices=["none", "demucs"], help="Vocal separation provider.")
+    dub.add_argument(
+        "--separation",
+        default="none",
+        choices=["none", "demucs", "roformer"],
+        help="Vocal separation provider.",
+    )
     dub.add_argument("--separation-device", default="cpu", choices=["cpu", "cuda"], help="Separation device.")
     dub.add_argument("--demucs-model", default="htdemucs", help="Demucs model name.")
+    dub.add_argument(
+        "--audio-separator-python",
+        type=Path,
+        default=Path(".venv-separator") / "Scripts" / "python.exe",
+    )
+    dub.add_argument("--audio-separator-model", default="model_bs_roformer_ep_317_sdr_12.9755.ckpt")
+    dub.add_argument("--audio-separator-model-dir", type=Path, default=Path("models/audio-separator"))
+    dub.add_argument("--audio-separator-timeout-seconds", type=int, default=900)
     dub.add_argument(
         "--audio-bed",
         default="original",

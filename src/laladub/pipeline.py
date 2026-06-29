@@ -30,7 +30,7 @@ from .ffmpeg import (
 from .glitch import apply_glitch_profile, clean_segments
 from .models import DubConfig, Segment
 from .quality import collapse_repetitions, collapse_repetitions_in_segments, is_repetitive_loop
-from .separation import SeparationResult, separate_audio
+from .separation import SeparationResult, separate_audio, separation_model_label
 from .srt import read_srt, write_srt, write_txt
 from .translation import translate_segments, translate_text_chain
 from .tts import synthesize_segment
@@ -468,13 +468,14 @@ def _restore_cached_separation(
 ) -> SeparationResult | None:
     if cache_entry is None:
         return None
-    cache_dir = cache_entry / "separation" / _safe_label(config.demucs_model, fallback="demucs")
+    model_label = separation_model_label(config)
+    cache_dir = cache_entry / "separation" / model_label
     vocals_cache = cache_dir / "vocals.wav"
     no_vocals_cache = cache_dir / "no_vocals.wav"
     if not (_file_ready(vocals_cache) and _file_ready(no_vocals_cache)):
         return None
 
-    stem_dir = config.workdir / "separated" / config.demucs_model / mix_audio.stem
+    stem_dir = config.workdir / "separated" / model_label / mix_audio.stem
     stem_dir.mkdir(parents=True, exist_ok=True)
     try:
         shutil.copy2(vocals_cache, stem_dir / "vocals.wav")
@@ -488,7 +489,7 @@ def _restore_cached_separation(
 def _store_cached_separation(cache_entry: Path | None, result: SeparationResult | None, config: DubConfig) -> None:
     if cache_entry is None or result is None:
         return
-    cache_dir = cache_entry / "separation" / _safe_label(config.demucs_model, fallback="demucs")
+    cache_dir = cache_entry / "separation" / separation_model_label(config)
     _store_cached_file(cache_dir, result.vocals_path, "vocals.wav")
     _store_cached_file(cache_dir, result.instrumental_path, "no_vocals.wav")
 
@@ -558,7 +559,7 @@ def _seed_media_cache_from_legacy_jobs(video_path: Path, cache_entry: Path | Non
 def _restore_cached_separation_ready(cache_entry: Path | None, config: DubConfig) -> bool:
     if cache_entry is None:
         return False
-    cache_dir = cache_entry / "separation" / _safe_label(config.demucs_model, fallback="demucs")
+    cache_dir = cache_entry / "separation" / separation_model_label(config)
     return _file_ready(cache_dir / "vocals.wav") and _file_ready(cache_dir / "no_vocals.wav")
 
 
@@ -574,7 +575,7 @@ def _store_legacy_media_cache(cache_entry: Path, legacy_workdir: Path, config: D
         _store_cached_file(cache_entry, mix_audio, "source_mix.wav")
         stored = True
 
-    stem_dir = legacy_workdir / "separated" / config.demucs_model / "source_mix"
+    stem_dir = legacy_workdir / "separated" / separation_model_label(config) / "source_mix"
     separation_result = SeparationResult(
         vocals_path=stem_dir / "vocals.wav",
         instrumental_path=stem_dir / "no_vocals.wav",
@@ -590,7 +591,7 @@ def _srt_ready(path: Path) -> bool:
 
 
 def _existing_separation_result(mix_audio: Path, config: DubConfig) -> SeparationResult | None:
-    stem_dir = config.workdir / "separated" / config.demucs_model / mix_audio.stem
+    stem_dir = config.workdir / "separated" / separation_model_label(config) / mix_audio.stem
     vocals_path = stem_dir / "vocals.wav"
     instrumental_path = stem_dir / "no_vocals.wav"
     if _file_ready(vocals_path) and _file_ready(instrumental_path):
@@ -649,7 +650,7 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         if separation_result and config.audio_bed == "instrumental":
             bed_path = separation_result.instrumental_path
         elif config.audio_bed == "instrumental":
-            raise RuntimeError("audio_bed=instrumental needs --separation demucs")
+            raise RuntimeError("audio_bed=instrumental needs an enabled separation provider")
     _save_resume_state(config, audio=True, separation=separation_result is not None)
     source_duration = probe_duration(source_audio)
     _report_progress(config, "Аудио подготовлено", 20, 100, None)

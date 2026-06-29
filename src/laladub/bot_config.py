@@ -67,6 +67,10 @@ class BotSettings:
     separation: str
     separation_device: str
     demucs_model: str
+    audio_separator_python: Path | None
+    audio_separator_model: str
+    audio_separator_model_dir: Path
+    audio_separator_timeout_seconds: int
     audio_bed: str
     asr_backend: str
     default_asr_method: str
@@ -169,6 +173,17 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         separation=os.environ.get("LALADUB_SEPARATION", "demucs"),
         separation_device=os.environ.get("LALADUB_SEPARATION_DEVICE", "cpu"),
         demucs_model=os.environ.get("LALADUB_DEMUCS_MODEL", "htdemucs"),
+        audio_separator_python=_optional_path(
+            os.environ.get("LALADUB_AUDIO_SEPARATOR_PYTHON", ".venv-separator\\Scripts\\python.exe")
+        ),
+        audio_separator_model=os.environ.get(
+            "LALADUB_AUDIO_SEPARATOR_MODEL",
+            "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+        ),
+        audio_separator_model_dir=Path(
+            os.environ.get("LALADUB_AUDIO_SEPARATOR_MODEL_DIR", "models/audio-separator")
+        ),
+        audio_separator_timeout_seconds=int(os.environ.get("LALADUB_AUDIO_SEPARATOR_TIMEOUT_SECONDS", "900")),
         audio_bed=os.environ.get("LALADUB_AUDIO_BED", "instrumental"),
         asr_backend=os.environ.get("LALADUB_ASR_BACKEND", "faster-whisper"),
         default_asr_method=os.environ.get("LALADUB_DEFAULT_ASR_METHOD", "ow-large-v3-chaos-backbone").strip().lower(),
