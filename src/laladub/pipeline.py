@@ -33,7 +33,7 @@ from .quality import collapse_repetitions, collapse_repetitions_in_segments, is_
 from .separation import SeparationResult, separate_audio, separation_model_label
 from .srt import read_srt, write_srt, write_txt
 from .translation import translate_segments, translate_text_chain
-from .tts import synthesize_segment
+from .tts import synthesize_qwen3_batch, synthesize_segment
 
 
 _DEFAULT_META_HALLUCINATION_TERMS = [
@@ -820,6 +820,24 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     raw_dir.mkdir(parents=True, exist_ok=True)
     fit_dir.mkdir(parents=True, exist_ok=True)
 
+    qwen3_provider = config.tts.lower() in {"qwen3", "qwen3-tts", "qwen3tts"}
+    qwen3_items: list[tuple[int, Segment, Path]] = []
+    if qwen3_provider:
+        for index, segment in enumerate(segments, start=1):
+            fitted_path = fit_dir / f"{index:05d}.wav"
+            if segment.spoken_text and not (config.resume and _file_ready(fitted_path)):
+                qwen3_items.append((index, segment, raw_dir / f"{index:05d}.wav"))
+        if qwen3_items:
+            try:
+                synthesize_qwen3_batch(qwen3_items, config)
+            except Exception as exc:
+                print(f"      Qwen3-TTS batch fallback to F5: {type(exc).__name__}: {exc}")
+                fallback_config = copy(config)
+                fallback_config.tts = "f5"
+                for _index, segment, raw_path in qwen3_items:
+                    raw_path.unlink(missing_ok=True)
+                    synthesize_segment(segment, raw_path, fallback_config)
+
     mix_items: list[tuple[Path, int]] = []
     for index, segment in enumerate(segments, start=1):
         if not segment.spoken_text:
@@ -829,7 +847,8 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         if config.resume and _file_ready(fitted_path):
             print(f"      Resume: using fitted TTS segment {index}/{len(segments)}")
         else:
-            synthesize_segment(segment, raw_path, config)
+            if not qwen3_provider:
+                synthesize_segment(segment, raw_path, config)
             if config.fit_to_segments:
                 fit_wav_to_duration(raw_path, fitted_path, max(0.1, segment.duration))
             else:
@@ -2463,7 +2482,7 @@ def _tts_fit_complete(segments: list[Segment], config: DubConfig) -> bool:
 
 
 def _needs_speaker_references(config: DubConfig) -> bool:
-    return config.tts.lower() in {"xtts", "f5", "f5tts"}
+    return config.tts.lower() in {"xtts", "f5", "f5tts", "qwen3", "qwen3-tts", "qwen3tts"}
 
 
 def _assign_segment_speaker_refs(segments: list[Segment], reference_audio: Path, config: DubConfig) -> None:

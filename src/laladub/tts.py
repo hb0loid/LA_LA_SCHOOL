@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import base64
+from collections import deque
 import contextlib
+import json
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
+import time
 import unicodedata
 from pathlib import Path
 from typing import Iterator
@@ -87,7 +92,120 @@ def synthesize_segment(segment: Segment, output_path: Path, config: DubConfig) -
                     make_silence(output_path, max(0.15, segment.duration))
         return
 
+    if provider in {"qwen3", "qwen3-tts", "qwen3tts"}:
+        synthesize_qwen3_batch([(1, segment, output_path)], config)
+        return
+
     raise TTSError(f"Unknown TTS provider: {config.tts}")
+
+
+def synthesize_qwen3_batch(
+    items: list[tuple[int, Segment, Path]],
+    config: DubConfig,
+) -> None:
+    if not items:
+        return
+
+    python_path = _resolve_qwen3_python(config)
+    runner_path = _repo_root() / "tools" / "qwen3_tts_batch_runner.py"
+    if not runner_path.is_file():
+        raise TTSError(f"Qwen3-TTS runner does not exist: {runner_path}")
+
+    manifest_items: list[dict[str, object]] = []
+    for _index, segment, output_path in items:
+        text = _sanitize_text_for_xtts(segment.spoken_text)
+        if config.target_lang == "ru":
+            text = _apply_f5_pronunciation_dictionary(text)
+        speaker_wav = segment.speaker_wav or config.speaker_wav
+        if not speaker_wav or not speaker_wav.is_file():
+            raise TTSError(f"Qwen3-TTS speaker reference does not exist: {speaker_wav}")
+
+        exact_segment_reference = bool(
+            segment.speaker_wav is not None
+            and not (segment.speaker_id or "").startswith("speaker_")
+        )
+        reference_text = _sanitize_text_for_xtts(segment.text) if exact_segment_reference else ""
+        manifest_items.append(
+            {
+                "output": str(output_path.resolve()),
+                "text": text,
+                "reference": str(speaker_wav.resolve()),
+                "reference_text": reference_text,
+                "x_vector_only": not bool(reference_text),
+            }
+        )
+
+    manifest_path = config.workdir / "qwen3_batch_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "model": config.qwen3_model,
+        "cache_dir": str(_resolve_repo_relative_path(config.qwen3_cache_dir)),
+        "language": _qwen3_language(config.target_lang),
+        "seed": 42,
+        "items": manifest_items,
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    command = [str(python_path), str(runner_path), "--manifest", str(manifest_path.resolve())]
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    process = subprocess.Popen(
+        command,
+        cwd=str(_repo_root()),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+    output_queue: queue.Queue[str | None] = queue.Queue()
+
+    def read_output() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            output_queue.put(line.rstrip())
+        output_queue.put(None)
+
+    reader = threading.Thread(target=read_output, name="qwen3-tts-output", daemon=True)
+    reader.start()
+    recent_output: deque[str] = deque(maxlen=30)
+    deadline = time.monotonic() + max(30, config.qwen3_timeout_seconds)
+    reader_done = False
+    try:
+        while process.poll() is None or not reader_done:
+            if time.monotonic() >= deadline:
+                raise TTSError(f"Qwen3-TTS batch timed out after {config.qwen3_timeout_seconds} seconds.")
+            try:
+                line = output_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if line is None:
+                reader_done = True
+                continue
+            if line:
+                recent_output.append(line)
+            if line.startswith("QWEN3_PROGRESS\t"):
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    done = int(parts[1])
+                    total = max(1, int(parts[2]))
+                    if config.progress_callback is not None:
+                        percent = 70 + round(20 * done / total)
+                        config.progress_callback("Озвучиваю реплики", percent, 100, f"Qwen3 {done}/{total}")
+    except BaseException:
+        _terminate_process_tree(process)
+        raise
+
+    return_code = process.wait()
+    if return_code != 0:
+        details = " ".join(recent_output)
+        details = re.sub(r"\s+", " ", details).strip()
+        raise TTSError(f"Qwen3-TTS batch failed ({return_code}): {details[-1500:]}")
+
+    missing = [str(path) for _index, _segment, path in items if not path.is_file() or path.stat().st_size < 1024]
+    if missing:
+        raise TTSError(f"Qwen3-TTS did not create valid WAV files: {', '.join(missing[:3])}")
 
 
 def list_sapi_voices() -> str:
@@ -370,6 +488,43 @@ def _resolve_f5_python(config: DubConfig) -> Path:
             "Create it with: python -m venv --system-site-packages .venv-f5tts"
         )
     return python_path
+
+
+def _resolve_qwen3_python(config: DubConfig) -> Path:
+    python_path = config.qwen3_python or Path(".venv-qwen3tts") / "Scripts" / "python.exe"
+    python_path = _resolve_repo_relative_path(python_path)
+    if not python_path.is_file():
+        raise TTSError(
+            "Qwen3-TTS Python was not found. Expected .venv-qwen3tts\\Scripts\\python.exe."
+        )
+    return python_path
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        process.terminate()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=5)
+    if process.poll() is None:
+        process.kill()
+        process.wait()
+
+
+def _qwen3_language(target_lang: str) -> str:
+    return {
+        "ru": "Russian",
+        "en": "English",
+        "uk": "Russian",
+    }.get((target_lang or "ru").lower(), "Russian")
 
 
 def _resolve_f5_model_file(local_path: Path | None, repo: str, repo_path: str, cache_dir: Path) -> Path:

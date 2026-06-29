@@ -60,6 +60,10 @@ def main(argv: list[str] | None = None) -> None:
             f5_cross_fade_duration=args.f5_cross_fade_duration,
             f5_remove_silence=args.f5_remove_silence,
             f5_timeout_seconds=args.f5_timeout_seconds,
+            qwen3_python=args.qwen3_python,
+            qwen3_model=args.qwen3_model,
+            qwen3_cache_dir=args.qwen3_cache_dir,
+            qwen3_timeout_seconds=args.qwen3_timeout_seconds,
             multi_speaker=not args.no_multi_speaker,
             speaker_reference_seconds=args.speaker_reference_seconds,
             separation=args.separation,
@@ -131,7 +135,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dub.add_argument("--libretranslate-url", default="http://127.0.0.1:5000/translate")
     dub.add_argument("--libretranslate-api-key", default=None)
-    dub.add_argument("--tts", default="sapi", choices=["sapi", "piper", "xtts", "f5", "none"], help="TTS provider.")
+    dub.add_argument(
+        "--tts",
+        default="sapi",
+        choices=["sapi", "piper", "xtts", "f5", "qwen3", "none"],
+        help="TTS provider.",
+    )
     dub.add_argument("--voice", default=None, help="SAPI voice name.")
     dub.add_argument("--sapi-rate", type=int, default=0, help="SAPI rate from -10 to 10.")
     dub.add_argument("--sapi-volume", type=int, default=100, help="SAPI volume from 0 to 100.")
@@ -157,6 +166,10 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument("--f5-cross-fade-duration", type=float, default=0.15)
     dub.add_argument("--f5-remove-silence", action="store_true")
     dub.add_argument("--f5-timeout-seconds", type=int, default=1800)
+    dub.add_argument("--qwen3-python", type=Path, default=Path(".venv-qwen3tts") / "Scripts" / "python.exe")
+    dub.add_argument("--qwen3-model", default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+    dub.add_argument("--qwen3-cache-dir", type=Path, default=Path("models/qwen3tts"))
+    dub.add_argument("--qwen3-timeout-seconds", type=int, default=1800)
     dub.add_argument("--no-multi-speaker", action="store_true", help="Use one speaker reference for all segments.")
     dub.add_argument(
         "--speaker-reference-seconds",

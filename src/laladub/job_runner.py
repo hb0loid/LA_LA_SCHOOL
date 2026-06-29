@@ -195,17 +195,21 @@ def _execute_raw_text_job(
 
 def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: Path) -> DubConfig:
     job_dir = Path(str(job["job_dir"]))
+    target_lang = target_lang_value(job.get("target_lang"))
+    tts_provider = settings.tts
+    if target_lang == "uk" and tts_provider.lower() in {"qwen3", "qwen3-tts", "qwen3tts"}:
+        tts_provider = "f5"
     config = DubConfig(
         output=output_path,
         workdir=job_dir / "work",
         source_lang=None,
-        target_lang=target_lang_value(job.get("target_lang")),
+        target_lang=target_lang,
         asr_backend=settings.asr_backend,
         whisper_model=settings.whisper_model,
         whisper_device=settings.whisper_device,
         whisper_compute_type=settings.whisper_compute_type,
         translator=settings.translator,
-        tts=settings.tts,
+        tts=tts_provider,
         voice=settings.voice,
         speaker_wav=settings.speaker_wav,
         xtts_model=settings.xtts_model,
@@ -228,6 +232,10 @@ def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: P
         f5_cross_fade_duration=settings.f5_cross_fade_duration,
         f5_remove_silence=settings.f5_remove_silence,
         f5_timeout_seconds=settings.f5_timeout_seconds,
+        qwen3_python=settings.qwen3_python,
+        qwen3_model=settings.qwen3_model,
+        qwen3_cache_dir=settings.qwen3_cache_dir,
+        qwen3_timeout_seconds=settings.qwen3_timeout_seconds,
         multi_speaker=settings.multi_speaker,
         speaker_reference_seconds=settings.speaker_reference_seconds,
         speaker_clustering=settings.speaker_clustering,

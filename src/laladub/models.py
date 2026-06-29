@@ -92,6 +92,10 @@ class DubConfig:
     f5_cross_fade_duration: float = 0.15
     f5_remove_silence: bool = False
     f5_timeout_seconds: int = 1800
+    qwen3_python: Path | None = None
+    qwen3_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    qwen3_cache_dir: Path = Path("models/qwen3tts")
+    qwen3_timeout_seconds: int = 1800
     separation: str = "none"
     separation_device: str = "cpu"
     demucs_model: str = "htdemucs"

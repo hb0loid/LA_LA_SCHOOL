@@ -8,7 +8,7 @@
 
 - Локальный ASR и поиск артефактов через OpenAI Whisper `turbo`.
 - Перевод через hybrid-цепочку с онлайн-провайдерами и локальными fallback.
-- Клонирование голоса через F5-TTS; XTTS, SAPI и Piper остаются доступными через CLI.
+- Клонирование русского и английского голоса через Qwen3-TTS; для украинского и при ошибке Qwen автоматически используется F5-TTS.
 - Вырезание оригинального голоса через Demucs: финальный микс может быть "инструментал + новый голос".
 - Сборка финального видео через `ffmpeg`.
 - Telegram-бот: пользователь отправляет видео, аудио или ссылку, выбирает видеоряд, input-язык, число голосов и язык озвучки.
@@ -24,6 +24,15 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e .[asr,translate,bot,clone,separation]
 ```
+
+Qwen3-TTS устанавливается отдельно, чтобы его версии PyTorch и Transformers не конфликтовали с основным окружением:
+
+```powershell
+python -m venv .venv-qwen3tts
+.\.venv-qwen3tts\Scripts\python.exe -m pip install qwen-tts==0.1.1
+```
+
+Для Qwen3-TTS требуется CUDA. Модель `Qwen/Qwen3-TTS-12Hz-1.7B-Base` загрузится в `models/qwen3tts` при первом запуске.
 
 Проверить окружение:
 
@@ -107,7 +116,7 @@ laladub dub ".\input\episode.mp4" `
 ```powershell
 $env:LALADUB_BOT_TOKEN="123456:telegram-token"
 $env:LALADUB_TRANSLATOR="hybrid"
-$env:LALADUB_TTS="f5"
+$env:LALADUB_TTS="qwen3"
 $env:LALADUB_VOICE="Microsoft Irina Desktop"
 $env:LALADUB_SEPARATION="demucs"
 $env:LALADUB_AUDIO_BED="instrumental"
@@ -161,7 +170,7 @@ laladub-bot
 - `LALADUB_JOB_RETENTION_SECONDS` - сколько хранить завершённые задачи (`done`, `failed`, `rejected`) перед автоочисткой, по умолчанию `2592000` секунд (30 дней). `0` отключает очистку.
 - `LALADUB_CLEANUP_INTERVAL_SECONDS` - как часто запускать автоочистку, по умолчанию `3600` секунд.
 - `LALADUB_TRANSLATOR` - `hybrid`, `googleweb`, `mymemory`, `argos`, `libretranslate` или `identity`.
-- `LALADUB_TTS` - `xtts`, `f5`, `sapi`, `piper` или `none`; `Start-Bot.ps1` по умолчанию ставит `f5`.
+- `LALADUB_TTS` - `qwen3`, `f5`, `xtts`, `sapi`, `piper` или `none`; release-лаунчер использует `qwen3` для русского и английского, F5 остаётся fallback и движком для украинского.
 - `LALADUB_VOICE` - имя SAPI-голоса.
 - `LALADUB_SPEAKER_WAV` - чистый WAV-референс голоса для XTTS. Если не задан, берётся вокальная дорожка после Demucs.
 - `LALADUB_MULTI_SPEAKER` - `1` по умолчанию: для каждого сегмента нарезается свой speaker reference из оригинального вокала.
@@ -177,6 +186,10 @@ laladub-bot
 - `LALADUB_F5_HF_VOCAB_PATH` - vocab внутри repo, по умолчанию `F5TTS_v1_Base/vocab.txt`.
 - `LALADUB_F5_DEVICE` - `auto`, `cpu` или `cuda`; по умолчанию `auto`.
 - `LALADUB_F5_SPEED` - скорость F5-TTS, по умолчанию `1.0`.
+- `LALADUB_QWEN3_PYTHON` - Python отдельного окружения Qwen3-TTS, по умолчанию `.venv-qwen3tts\Scripts\python.exe`.
+- `LALADUB_QWEN3_MODEL` - модель Qwen3-TTS, по умолчанию `Qwen/Qwen3-TTS-12Hz-1.7B-Base`.
+- `LALADUB_QWEN3_CACHE_DIR` - каталог модели Qwen3-TTS, по умолчанию `models/qwen3tts`.
+- `LALADUB_QWEN3_TIMEOUT_SECONDS` - общий лимит времени генерации одной задачи, по умолчанию `1800` секунд.
 - `LALADUB_SEPARATION` - `demucs` или `none`.
 - `LALADUB_AUDIO_BED` - `instrumental`, `original` или `dub-only`.
 - `LALADUB_WHISPER_MODEL` - модель faster-whisper, по умолчанию `small`.

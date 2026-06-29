@@ -151,6 +151,7 @@ def main() -> None:
         f"default_asr_method={settings.default_asr_method} "
         f"whisper={settings.whisper_model}/{settings.whisper_device}/{settings.whisper_compute_type} "
         f"whisper_only={settings.whisper_only_model}/{settings.whisper_only_device} "
+        f"tts={settings.tts} qwen3={settings.qwen3_model} "
         f"suppress_ascii={settings.suppress_plain_ascii_tokens}",
         flush=True,
     )
@@ -1826,6 +1827,9 @@ async def _process_job(
     output_path = job_dir / "dubbed.mp4"
     target_lang = _target_lang_value(job.get("target_lang"))
     job["target_lang"] = target_lang
+    tts_provider = settings.tts
+    if target_lang == "uk" and tts_provider.lower() in {"qwen3", "qwen3-tts", "qwen3tts"}:
+        tts_provider = "f5"
     _save_job_snapshot(job_dir, job, status="running")
     progress: _ProgressState | None = None
     progress_task: asyncio.Task[Any] | None = None
@@ -1840,7 +1844,7 @@ async def _process_job(
         whisper_device=settings.whisper_device,
         whisper_compute_type=settings.whisper_compute_type,
         translator=settings.translator,
-        tts=settings.tts,
+        tts=tts_provider,
         voice=settings.voice,
         speaker_wav=settings.speaker_wav,
         xtts_model=settings.xtts_model,
@@ -1863,6 +1867,10 @@ async def _process_job(
         f5_cross_fade_duration=settings.f5_cross_fade_duration,
         f5_remove_silence=settings.f5_remove_silence,
         f5_timeout_seconds=settings.f5_timeout_seconds,
+        qwen3_python=settings.qwen3_python,
+        qwen3_model=settings.qwen3_model,
+        qwen3_cache_dir=settings.qwen3_cache_dir,
+        qwen3_timeout_seconds=settings.qwen3_timeout_seconds,
         multi_speaker=settings.multi_speaker,
         speaker_reference_seconds=settings.speaker_reference_seconds,
         speaker_clustering=settings.speaker_clustering,

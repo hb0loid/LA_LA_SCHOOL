@@ -180,6 +180,10 @@ $env:LALADUB_F5_TARGET_RMS = "0.1"
 $env:LALADUB_F5_CROSS_FADE_DURATION = "0.15"
 $env:LALADUB_F5_REMOVE_SILENCE = "0"
 $env:LALADUB_F5_TIMEOUT_SECONDS = "1800"
+$env:LALADUB_QWEN3_PYTHON = (Join-Path $Root ".venv-qwen3tts\Scripts\python.exe")
+$env:LALADUB_QWEN3_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+$env:LALADUB_QWEN3_CACHE_DIR = (Join-Path $Root "models\qwen3tts")
+$env:LALADUB_QWEN3_TIMEOUT_SECONDS = "1800"
 $env:LALADUB_MULTI_SPEAKER = "1"
 $env:LALADUB_SPEAKER_REFERENCE_SECONDS = "5.0"
 $env:LALADUB_SPEAKER_CLUSTERING = "0"
@@ -217,6 +221,10 @@ $python = Join-Path $Root ".venv-f5tts\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) {
   Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) F5/CUDA Python is missing: $python" -ErrorAction SilentlyContinue
   exit 1
+}
+$qwenPython = $env:LALADUB_QWEN3_PYTHON
+if (-not (Test-Path -LiteralPath $qwenPython)) {
+  Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) Qwen3-TTS Python is missing; jobs will fall back to F5: $qwenPython" -ErrorAction SilentlyContinue
 }
 $separatorPython = $env:LALADUB_AUDIO_SEPARATOR_PYTHON
 if (-not (Test-Path -LiteralPath $separatorPython)) {
