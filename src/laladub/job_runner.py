@@ -196,7 +196,7 @@ def _execute_raw_text_job(
 def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: Path) -> DubConfig:
     job_dir = Path(str(job["job_dir"]))
     target_lang = target_lang_value(job.get("target_lang"))
-    tts_provider = settings.tts
+    tts_provider = str(job.get("tts_provider") or settings.tts)
     if target_lang == "uk" and tts_provider.lower() in {"qwen3", "qwen3-tts", "qwen3tts"}:
         tts_provider = "f5"
     config = DubConfig(

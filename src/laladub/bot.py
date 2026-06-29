@@ -90,6 +90,10 @@ TARGET_LANGS = [
     ("uk", "Украинский"),
     ("en", "Английский"),
 ]
+TTS_METHODS = [
+    ("f5", "F5 (быстрее)"),
+    ("qwen3", "Qwen3 (медленнее)"),
+]
 
 TELEGRAM_SAFE_VIDEO_BYTES = 45 * 1024 * 1024
 TELEGRAM_DIRECT_DOWNLOAD_SAFE_BYTES = 20 * 1024 * 1024
@@ -172,6 +176,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(select_asr_method, pattern=r"^asr:"))
     application.add_handler(CallbackQueryHandler(select_speaker_count, pattern=r"^spk:"))
     application.add_handler(CallbackQueryHandler(select_target_lang, pattern=r"^tgt:"))
+    application.add_handler(CallbackQueryHandler(select_tts_method, pattern=r"^tts:"))
     application.add_handler(CallbackQueryHandler(resume_callback, pattern=r"^resume:"))
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
@@ -862,10 +867,38 @@ async def select_target_lang(update: Any, context: Any) -> None:
         return
 
     job["target_lang"] = target_lang
+    _save_job_snapshot(Path(job["job_dir"]), job, status="select_tts")
+    await query.edit_message_text(
+        "Выбери метод озвучки.",
+        reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2),
+    )
+
+
+async def select_tts_method(update: Any, context: Any) -> None:
+    query = update.callback_query
+    await query.answer()
+    job = context.user_data.get("job")
+    if not job:
+        await query.edit_message_text("Нет активной задачи. Сначала пришли видео.")
+        return
+
+    tts_provider = _tts_provider_value(query.data.split(":", 1)[1])
+    if tts_provider is None:
+        await query.edit_message_text("Неизвестный метод озвучки. Пришли видео ещё раз.")
+        return
+    if _target_lang_value(job.get("target_lang")) == "uk" and tts_provider == "qwen3":
+        await query.edit_message_text(
+            "Qwen3 не поддерживает украинскую озвучку. Выбери F5.",
+            reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2),
+        )
+        return
+
+    job["tts_provider"] = tts_provider
     _save_job_snapshot(Path(job["job_dir"]), job, status="queued")
     await query.edit_message_text(
         f"Ставлю задачу в очередь. Голоса: {_speaker_count_label(job.get('speaker_count'))}. "
-        f"Язык озвучки: {_target_lang_label(target_lang)}."
+        f"Язык озвучки: {_target_lang_label(job.get('target_lang'))}. "
+        f"Движок: {_tts_method_label(tts_provider)}."
     )
     context.user_data.pop("job", None)
     await _enqueue_job(update, context, job, query.message)
@@ -1656,6 +1689,20 @@ def _target_lang_label(value: Any) -> str:
     return next((label for code, label in TARGET_LANGS if code == target_lang), target_lang)
 
 
+def _tts_provider_value(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    if text in {"qwen3", "qwen3-tts", "qwen3tts"}:
+        return "qwen3"
+    if text in {"f5", "f5-tts", "f5tts"}:
+        return "f5"
+    return None
+
+
+def _tts_method_label(value: Any) -> str:
+    provider = _tts_provider_value(value)
+    return next((label for code, label in TTS_METHODS if code == provider), str(value or "Авто"))
+
+
 def _speaker_count_value(value: Any) -> int | None:
     text = str(value or "").strip().lower()
     if not text or text in {"auto", "none", "null"}:
@@ -1827,7 +1874,7 @@ async def _process_job(
     output_path = job_dir / "dubbed.mp4"
     target_lang = _target_lang_value(job.get("target_lang"))
     job["target_lang"] = target_lang
-    tts_provider = settings.tts
+    tts_provider = _tts_provider_value(job.get("tts_provider")) or settings.tts
     if target_lang == "uk" and tts_provider.lower() in {"qwen3", "qwen3-tts", "qwen3tts"}:
         tts_provider = "f5"
     _save_job_snapshot(job_dir, job, status="running")
@@ -1996,6 +2043,7 @@ async def _process_job(
                 f"цель={target_lang}, "
                 f"метод={_asr_method_label(job.get('asr_method') or settings.default_asr_method)}, "
                 f"голоса={_speaker_count_label(job.get('speaker_count'))}, "
+                f"TTS={_tts_method_label(tts_provider)}, "
                 f"ASR={config.asr_backend} {config.whisper_model}, "
                 f"pivot={config.input_pivot_lang or '-'}"
             ),
