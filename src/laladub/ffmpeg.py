@@ -232,16 +232,10 @@ def _find_visual_source_videos(
 
     random.shuffle(raw_candidates)
     raw_candidates.sort(key=_visual_source_priority)
-    candidates: list[Path] = []
-    for path in raw_candidates:
-        if len(candidates) >= max_candidates:
-            break
-        try:
-            if has_video_stream(path):
-                candidates.append(path)
-        except Exception:
-            continue
-    return candidates
+    # The actual segment extraction below already rejects unreadable inputs.
+    # Avoid launching ffprobe once per candidate here; trusted libraries can
+    # contain thousands of clips and the old pre-scan delayed every audio job.
+    return raw_candidates[:max_candidates]
 
 
 def _visual_source_priority(path: Path) -> int:

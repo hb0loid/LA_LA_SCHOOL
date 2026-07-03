@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from collections import deque
 import contextlib
+import gc
 import json
 import os
 import queue
@@ -41,6 +42,21 @@ _F5_PRONUNCIATION_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     ("Altyazi M.K.", "субтитры эм ка"),
     ("Субтитры М.К.", "субтитры эм ка"),
 )
+
+
+def clear_tts_model_caches() -> None:
+    _XTTS_CACHE.clear()
+    _F5_CACHE.clear()
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            with contextlib.suppress(Exception):
+                torch.cuda.ipc_collect()
+    except Exception:
+        pass
 
 
 def synthesize_segment(segment: Segment, output_path: Path, config: DubConfig) -> None:

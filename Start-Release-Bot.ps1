@@ -162,6 +162,13 @@ $env:LALADUB_MAX_ACTIVE_JOBS_PER_USER = "1"
 $env:LALADUB_FREE_MAX_DURATION_SECONDS = "60"
 $env:LALADUB_PAID_MAX_DURATION_SECONDS = "0"
 $env:LALADUB_WATERMARK_IMAGE = (Join-Path $Root "assets")
+$trustedVisualSource = "F:\FFOutput\La La School\video_files"
+if (-not (Test-Path -LiteralPath $trustedVisualSource -PathType Container)) {
+  Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) Trusted visual source is missing: $trustedVisualSource" -ErrorAction SilentlyContinue
+  exit 1
+}
+$env:LALADUB_AUDIO_VISUAL_SOURCE_DIR = $trustedVisualSource
+$env:LALADUB_AUDIO_VISUAL_SAFETY_ENABLED = "0"
 $env:LALADUB_VOICE = "Microsoft Irina Desktop"
 $env:LALADUB_XTTS_DEVICE = "cpu"
 $env:LALADUB_F5_PYTHON = (Join-Path $Root ".venv-f5tts\Scripts\python.exe")

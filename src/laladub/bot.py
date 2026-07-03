@@ -18,8 +18,10 @@ from typing import Any
 from .bot_config import BotSettings, load_bot_settings
 from .download import download_video_url, extract_url, has_video_and_audio
 from .ffmpeg import compress_video_for_telegram, make_audio_visual_video, probe_duration, trim_video
+from .asr import clear_openai_whisper_cache
 from .models import DubConfig
 from .pipeline import run_dub, run_transcript
+from .tts import clear_tts_model_caches
 from .watermark import add_watermark
 
 
@@ -602,10 +604,7 @@ async def _prepare_input_audio_as_video(
     else:
         await status.edit_text("Собираю случайный видеоряд для аудио...")
 
-    visual_source = settings.audio_visual_source_dir or settings.workdir
-    source_roots = [visual_source]
-    if visual_source.resolve() != settings.workdir.resolve():
-        source_roots.append(settings.workdir)
+    source_roots = _trusted_visual_source_roots(settings)
     output_path = job_dir / "input_audio_visual.mp4"
     await asyncio.to_thread(
         make_audio_visual_video,
@@ -649,10 +648,7 @@ async def _prepare_random_visual_video(
         await _safe_edit_status(status, f"Не смог определить длительность видео:\n{type(exc).__name__}: {exc}")
         return None
 
-    visual_source = settings.audio_visual_source_dir or settings.workdir
-    source_roots = [visual_source]
-    if visual_source.resolve() != settings.workdir.resolve():
-        source_roots.append(settings.workdir)
+    source_roots = _trusted_visual_source_roots(settings)
     output_path = job_dir / f"{input_path.stem}_fun_visual.mp4"
     await asyncio.to_thread(
         make_audio_visual_video,
@@ -723,6 +719,16 @@ async def _prepare_input_video_duration(
         f"Видео длиннее лимита. Взял первые {_format_duration(limit)} и продолжаю."
     )
     return trimmed_path
+
+
+def _trusted_visual_source_roots(settings: BotSettings) -> list[Path]:
+    source = settings.audio_visual_source_dir
+    if source is None:
+        raise RuntimeError("LALADUB_AUDIO_VISUAL_SOURCE_DIR is required for generated video mode.")
+    source = source.resolve()
+    if not source.is_dir():
+        raise RuntimeError(f"Trusted visual source directory does not exist: {source}")
+    return [source]
 
 
 async def _ensure_job_input_video(
@@ -1130,6 +1136,30 @@ async def _recover_interrupted_jobs(application: Any) -> None:
             _save_job_snapshot(job_dir, job, status="failed", error=f"startup_recovery_send_failed: {exc}")
             print(f"Startup recovery send failed for {job_dir}: {type(exc).__name__}: {exc}", flush=True)
             continue
+
+        input_path = Path(str(job.get("input_path") or ""))
+        if job.get("input_source") == "telegram_audio" and not job.get("audio_visual"):
+            prepared_path = await _prepare_input_audio_as_video(
+                status_message,
+                settings,
+                user_id,
+                job_dir,
+                input_path,
+            )
+            if prepared_path is None:
+                skipped += 1
+                _save_job_snapshot(job_dir, job, status="rejected", error="audio_visual_recovery_failed")
+                continue
+            job["input_path"] = str(prepared_path)
+            _save_job_snapshot(job_dir, job, status="queued", audio_visual=True)
+        elif job.get("visual_mode") == "random" and not job.get("random_visual"):
+            prepared_path = await _prepare_random_visual_video(status_message, settings, job_dir, input_path)
+            if prepared_path is None:
+                skipped += 1
+                _save_job_snapshot(job_dir, job, status="rejected", error="random_visual_recovery_failed")
+                continue
+            job["input_path"] = str(prepared_path)
+            _save_job_snapshot(job_dir, job, status="queued", random_visual=True)
 
         await scheduler.enqueue(
             context,
@@ -2233,6 +2263,13 @@ async def _process_job(
             text=f"Задача упала:\n{details}",
             reply_markup=_resume_keyboard(job_dir),
         )
+    finally:
+        await asyncio.to_thread(_clear_runtime_model_caches)
+
+
+def _clear_runtime_model_caches() -> None:
+    clear_openai_whisper_cache()
+    clear_tts_model_caches()
 
 
 async def _send_remote_worker_result(context: Any, item: _QueuedJob, manifest: dict[str, Any]) -> None:
@@ -2341,8 +2378,16 @@ def _job_snapshot_path(job_dir: Path) -> Path:
     return job_dir / "job.json"
 
 
-def _save_job_snapshot(job_dir: Path, job: dict[str, Any], *, status: str, error: str | None = None) -> None:
+def _save_job_snapshot(
+    job_dir: Path,
+    job: dict[str, Any],
+    *,
+    status: str,
+    error: str | None = None,
+    **updates: Any,
+) -> None:
     job_dir.mkdir(parents=True, exist_ok=True)
+    job.update(updates)
     data = dict(job)
     now = time.time()
     data["status"] = status

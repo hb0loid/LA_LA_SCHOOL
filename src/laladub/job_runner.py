@@ -7,9 +7,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from .asr import clear_openai_whisper_cache
 from .bot_config import BotSettings
 from .models import DubConfig
 from .pipeline import run_dub, run_transcript
+from .tts import clear_tts_model_caches
 from .watermark import add_watermark
 
 
@@ -58,6 +60,19 @@ class JobExecutionResult:
 
 
 def execute_job(
+    job: dict[str, Any],
+    settings: BotSettings,
+    *,
+    progress_callback: ProgressCallback | None = None,
+) -> JobExecutionResult:
+    try:
+        return _execute_job(job, settings, progress_callback=progress_callback)
+    finally:
+        clear_openai_whisper_cache()
+        clear_tts_model_caches()
+
+
+def _execute_job(
     job: dict[str, Any],
     settings: BotSettings,
     *,
