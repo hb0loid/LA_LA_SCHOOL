@@ -79,6 +79,7 @@ class BotSettings:
     whisper_model: str
     whisper_only_model: str
     whisper_only_device: str
+    artifact_whisper_device: str
     whisper_device: str
     whisper_compute_type: str
     suppress_plain_ascii_tokens: bool
@@ -196,6 +197,7 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         whisper_model=os.environ.get("LALADUB_WHISPER_MODEL", "small"),
         whisper_only_model=os.environ.get("LALADUB_WHISPER_ONLY_MODEL", "turbo"),
         whisper_only_device=os.environ.get("LALADUB_WHISPER_ONLY_DEVICE", "cpu"),
+        artifact_whisper_device=os.environ.get("LALADUB_ARTIFACT_WHISPER_DEVICE", "cpu"),
         whisper_device=os.environ.get("LALADUB_WHISPER_DEVICE", "cpu"),
         whisper_compute_type=os.environ.get("LALADUB_WHISPER_COMPUTE_TYPE", "int8"),
         suppress_plain_ascii_tokens=_parse_bool(os.environ.get("LALADUB_SUPPRESS_PLAIN_ASCII_TOKENS", "0")),

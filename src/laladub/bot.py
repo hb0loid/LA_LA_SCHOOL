@@ -106,8 +106,8 @@ RECOVERABLE_JOB_STATUSES = {"starting", "running", "queued", "ready"}
 CLEANUP_JOB_STATUSES = {"done", "failed", "rejected"}
 _LAST_STATUS_TEXT: dict[tuple[int | None, int | None], str] = {}
 MAINTENANCE_MESSAGE = (
-    "?????? ??????? ??????????? ?????? ??? ?????. "
-    "?????? ????? ??????? ?????."
+    "Сейчас ведутся технические работы над ботом. "
+    "Попробуй снова немного позже."
 )
 
 
@@ -167,6 +167,7 @@ def main() -> None:
         f"default_asr_method={settings.default_asr_method} "
         f"whisper={settings.whisper_model}/{settings.whisper_device}/{settings.whisper_compute_type} "
         f"whisper_only={settings.whisper_only_model}/{settings.whisper_only_device} "
+        f"artifact_whisper={settings.whisper_only_model}/{settings.artifact_whisper_device} "
         f"maintenance={_maintenance_enabled(settings)} "
         f"suppress_ascii={settings.suppress_plain_ascii_tokens}",
         flush=True,
@@ -2077,7 +2078,7 @@ async def _process_job(
         asr_retry_on_repetition=True,
         artifact_source_lang=job.get("source_lang") or None,
         artifact_whisper_model=settings.whisper_only_model,
-        artifact_whisper_device=settings.whisper_only_device,
+        artifact_whisper_device=settings.artifact_whisper_device,
         inject_artifacts=settings.inject_artifacts,
         artifact_max_segments=settings.artifact_max_segments,
         artifact_min_gap_seconds=settings.artifact_min_gap_seconds,

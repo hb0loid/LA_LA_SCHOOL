@@ -268,7 +268,7 @@ def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: P
         asr_retry_on_repetition=True,
         artifact_source_lang=job.get("source_lang") or None,
         artifact_whisper_model=settings.whisper_only_model,
-        artifact_whisper_device=settings.whisper_only_device,
+        artifact_whisper_device=settings.artifact_whisper_device,
         inject_artifacts=settings.inject_artifacts,
         artifact_max_segments=settings.artifact_max_segments,
         artifact_min_gap_seconds=settings.artifact_min_gap_seconds,
