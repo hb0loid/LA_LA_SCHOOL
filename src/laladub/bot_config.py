@@ -20,6 +20,8 @@ class BotSettings:
     job_retention_seconds: float
     cleanup_interval_seconds: float
     paid_users: frozenset[int]
+    admin_users: frozenset[int]
+    admin_users_file: Path
     max_active_jobs: int
     max_active_jobs_per_user: int
     watermark_text: str
@@ -95,11 +97,19 @@ class BotSettings:
     def is_paid(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.paid_users
 
+    def is_admin(self, user_id: int | None) -> bool:
+        return user_id is not None and user_id in self.admin_users
+
 
 def load_bot_settings(*, require_token: bool = True) -> BotSettings:
     token = os.environ.get("LALADUB_BOT_TOKEN", "").strip()
     if require_token and not token:
         raise RuntimeError("Set LALADUB_BOT_TOKEN to your Telegram bot token.")
+
+    admin_users_file = Path(os.environ.get("LALADUB_ADMIN_USERS_FILE", "admins.txt"))
+    admin_users = _parse_user_ids(os.environ.get("LALADUB_ADMIN_USERS", ""))
+    if admin_users_file.is_file():
+        admin_users.update(_parse_user_ids_file(admin_users_file))
 
     return BotSettings(
         token=token,
@@ -117,6 +127,8 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         job_retention_seconds=max(0.0, float(os.environ.get("LALADUB_JOB_RETENTION_SECONDS", "2592000"))),
         cleanup_interval_seconds=max(60.0, float(os.environ.get("LALADUB_CLEANUP_INTERVAL_SECONDS", "3600"))),
         paid_users=frozenset(_parse_user_ids(os.environ.get("LALADUB_PAID_USERS", ""))),
+        admin_users=frozenset(admin_users),
+        admin_users_file=admin_users_file,
         max_active_jobs=max(1, int(os.environ.get("LALADUB_MAX_ACTIVE_JOBS", "2"))),
         max_active_jobs_per_user=max(1, int(os.environ.get("LALADUB_MAX_ACTIVE_JOBS_PER_USER", "1"))),
         watermark_text=os.environ.get("LALADUB_WATERMARK_TEXT", "La La Local Dub"),
@@ -215,6 +227,15 @@ def _parse_user_ids(raw: str) -> set[int]:
             continue
         result.add(int(chunk))
     return result
+
+
+def _parse_user_ids_file(path: Path) -> set[int]:
+    values: list[str] = []
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        value = line.split("#", 1)[0].strip()
+        if value:
+            values.append(value)
+    return _parse_user_ids(",".join(values))
 
 
 def _empty_to_none(value: str | None) -> str | None:

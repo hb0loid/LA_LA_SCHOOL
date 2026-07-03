@@ -4,6 +4,7 @@
 .venv-separator/
 .secrets/
 paid_users.txt
+admins.txt
 local_archive/
 worker_config.json
 .worker_state.json

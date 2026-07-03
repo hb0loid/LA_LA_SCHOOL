@@ -154,6 +154,7 @@ def main() -> None:
         f"{settings.audio_visual_safety_frames}/"
         f"{settings.audio_visual_safety_device} "
         f"paid_users={len(settings.paid_users)} "
+        f"admin_users={len(settings.admin_users)}/{settings.admin_users_file} "
         f"duration_limits=free:{settings.free_max_duration_seconds}/paid:{settings.paid_max_duration_seconds} "
         f"collapse_repetitions={settings.collapse_repetitions}/"
         f"{settings.max_phrase_repeats}/{settings.max_word_repeats} "
@@ -227,7 +228,7 @@ def _set_maintenance_enabled(settings: BotSettings, enabled: bool, *, user_id: i
 
 
 def _maintenance_blocks_user(settings: BotSettings, user_id: int | None) -> bool:
-    return _maintenance_enabled(settings) and not settings.is_paid(user_id)
+    return _maintenance_enabled(settings) and not settings.is_admin(user_id)
 
 
 async def _setup_bot_commands(application: Any) -> None:
@@ -314,7 +315,7 @@ async def maintenance_callback_gate(update: Any, context: Any) -> None:
 async def maintenance(update: Any, context: Any) -> None:
     settings: BotSettings = context.application.bot_data["settings"]
     user = update.effective_user
-    if user is None or not settings.is_paid(user.id):
+    if user is None or not settings.is_admin(user.id):
         await update.effective_message.reply_text("Команда доступна только администратору.")
         return
 
@@ -1565,7 +1566,7 @@ class _JobScheduler:
     def _can_start(self, item: _QueuedJob, *, execution_kind: str) -> bool:
         if self._active_total >= self._settings.max_active_jobs:
             return False
-        if _maintenance_enabled(self._settings) and not item.premium:
+        if _maintenance_enabled(self._settings) and not self._settings.is_admin(item.user_id):
             return False
         if execution_kind == "remote" and _target_lang_value(item.job.get("target_lang")) != "ru":
             return False
@@ -1588,7 +1589,7 @@ class _JobScheduler:
 
     def _queue_text(self, item: _QueuedJob, position: int) -> str:
         title = "Сырой Whisper" if item.job.get("mode") == "raw_text" else "Полноценный дубляж"
-        if _maintenance_enabled(self._settings) and not item.premium:
+        if _maintenance_enabled(self._settings) and not self._settings.is_admin(item.user_id):
             return "\n".join(
                 [
                     f"{title}: Приостановлен",
