@@ -230,6 +230,19 @@ def _report_progress(
         print(f"      Progress callback skipped: {type(exc).__name__}: {exc}")
 
 
+def _format_video_position(position: float, duration: float) -> str:
+    def stamp(seconds: float) -> str:
+        total = max(0, round(seconds))
+        minutes, secs = divmod(total, 60)
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+    ratio = max(0.0, min(1.0, position / max(0.001, duration)))
+    filled = round(12 * ratio)
+    bar = "[" + "#" * filled + "-" * (12 - filled) + "]"
+    return f"видео {bar} {stamp(position)} / {stamp(duration)}"
+
+
 def _prepare_workdir_outputs(config: DubConfig) -> None:
     for filename in _ROOT_DEBUG_SRT_FILES:
         (config.workdir / filename).unlink(missing_ok=True)
@@ -857,7 +870,14 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         mix_items.append((fitted_path, int(segment.start * 1000)))
         if index == len(segments) or index % 5 == 0:
             percent = 70 + round(20 * index / max(1, len(segments)))
-            _report_progress(config, "Озвучиваю реплики", percent, 100, f"сегмент {index}/{len(segments)}")
+            position = _format_video_position(segment.end, source_duration)
+            _report_progress(
+                config,
+                "Озвучиваю реплики",
+                percent,
+                100,
+                f"сегмент {index}/{len(segments)} · {position}",
+            )
         if index % 25 == 0:
             print(f"      synthesized {index}/{len(segments)}")
     _save_resume_state(config, tts_fit=True)

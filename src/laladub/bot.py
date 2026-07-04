@@ -1073,6 +1073,9 @@ async def _enqueue_job(update: Any, context: Any, job: dict[str, Any], status_me
         job["user_id"] = user.id
         job["is_paid"] = settings.is_paid(user.id)
 
+    if await scheduler.reattach_if_known(context, job, status_message):
+        return
+
     input_path = Path(str(job.get("input_path") or ""))
     if input_path.exists():
         job_dir = Path(job["job_dir"])
@@ -1372,10 +1375,48 @@ class _JobScheduler:
         self._active_local = 0
         self._active_by_user: dict[int, int] = {}
         self._known_jobs: set[str] = set()
+        self._items_by_key: dict[str, _QueuedJob] = {}
         self._leased: dict[str, _QueuedJob] = {}
         self._remote_workers: dict[str, dict[str, Any]] = {}
         self._remote_worker_ttl = 30.0
         self._sequence = 0
+
+    async def reattach_if_known(self, context: Any, job: dict[str, Any], status_message: Any) -> bool:
+        key = _job_queue_key(job)
+        async with self._lock:
+            if key not in self._known_jobs:
+                return False
+            await self._reattach_locked(context, key, job, status_message)
+            return True
+
+    async def _reattach_locked(
+        self,
+        context: Any,
+        key: str,
+        job: dict[str, Any],
+        status_message: Any,
+    ) -> None:
+        existing = self._items_by_key.get(key)
+        if existing is not None:
+            existing.status_message = status_message
+            if existing.progress is not None:
+                existing.progress_task = context.application.create_task(
+                    _progress_updater(status_message, existing.progress)
+                )
+                await _safe_edit_status(status_message, existing.progress.render())
+            else:
+                position = self._pending_position(existing)
+                await _safe_edit_status(
+                    status_message,
+                    self._queue_text(existing, position) if position else (
+                        f"Работа №{_job_number(job)} восстанавливает текущий этап."
+                    ),
+                )
+        else:
+            await _safe_edit_status(
+                status_message,
+                f"Работа №{_job_number(job)} уже выполняется. Статус скоро обновится.",
+            )
 
     async def enqueue(
         self,
@@ -1389,10 +1430,7 @@ class _JobScheduler:
         key = _job_queue_key(job)
         async with self._lock:
             if key in self._known_jobs:
-                await _safe_edit_status(
-                    status_message,
-                    f"Работа №{_job_number(job)} уже находится в очереди или выполняется.",
-                )
+                await self._reattach_locked(context, key, job, status_message)
                 return
 
             self._sequence += 1
@@ -1411,6 +1449,7 @@ class _JobScheduler:
             job["queued_at"] = item.enqueued_at
             job["queue_priority"] = "premium" if premium else "normal"
             self._known_jobs.add(key)
+            self._items_by_key[key] = item
             heapq.heappush(self._pending, (item.priority, item.sequence, item))
             _save_job_snapshot(Path(job["job_dir"]), job, status="queued")
             await self._dispatch_locked(context)
@@ -1428,6 +1467,7 @@ class _JobScheduler:
                 else:
                     self._active_by_user.pop(item.user_id, None)
             self._known_jobs.discard(item.key)
+            self._items_by_key.pop(item.key, None)
             await self._dispatch_locked(context)
             await self._refresh_pending_locked()
 
@@ -1566,6 +1606,8 @@ class _JobScheduler:
             item.execution_kind = "local"
             item.job["started_at"] = time.time()
             _save_job_snapshot(Path(item.job["job_dir"]), item.job, status="starting")
+            title = "Сырой Whisper" if item.job.get("mode") == "raw_text" else "Полноценный дубляж"
+            item.progress = _ProgressState(title, _job_number(item.job))
             context.application.create_task(self._run_item(context, item))
 
     def _can_start_local_worker(self) -> bool:
@@ -1605,7 +1647,17 @@ class _JobScheduler:
 
     async def _run_item(self, context: Any, item: _QueuedJob) -> None:
         try:
-            await _process_job(context, item.chat_id, item.user_id, item.job, item.status_message)
+            if item.progress is None:
+                title = "Сырой Whisper" if item.job.get("mode") == "raw_text" else "Полноценный дубляж"
+                item.progress = _ProgressState(title, _job_number(item.job))
+            await _process_job(
+                context,
+                item.chat_id,
+                item.user_id,
+                item.job,
+                item.status_message,
+                progress_state=item.progress,
+            )
         finally:
             await self.finish(context, item)
 
@@ -1613,6 +1665,13 @@ class _JobScheduler:
         pending = sorted((priority, sequence, item) for priority, sequence, item in self._pending)
         for position, (_, _, item) in enumerate(pending, start=1):
             await _safe_edit_status(item.status_message, self._queue_text(item, position))
+
+    def _pending_position(self, target: _QueuedJob) -> int | None:
+        pending = sorted((priority, sequence, item) for priority, sequence, item in self._pending)
+        for position, (_, _, item) in enumerate(pending, start=1):
+            if item is target:
+                return position
+        return None
 
     def _queue_text(self, item: _QueuedJob, position: int) -> str:
         title = "Сырой Whisper" if item.job.get("mode") == "raw_text" else "Полноценный дубляж"
@@ -2042,6 +2101,7 @@ async def _process_job(
     user_id: int | None,
     job: dict[str, Any],
     status_message: Any | None = None,
+    progress_state: _ProgressState | None = None,
 ) -> None:
     settings: BotSettings = context.application.bot_data["settings"]
     job_dir = Path(job["job_dir"])
@@ -2052,7 +2112,7 @@ async def _process_job(
     if target_lang == "uk" and tts_provider.lower() in {"qwen3", "qwen3-tts", "qwen3tts"}:
         tts_provider = "f5"
     _save_job_snapshot(job_dir, job, status="running")
-    progress: _ProgressState | None = None
+    progress: _ProgressState | None = progress_state
     progress_task: asyncio.Task[Any] | None = None
 
     config = DubConfig(
@@ -2147,7 +2207,7 @@ async def _process_job(
                 artifact_chaos_mode=True,
                 collapse_repetitions=False,
             )
-            progress = _ProgressState("Сырой Whisper", _job_number(job))
+            progress = progress_state or _ProgressState("Сырой Whisper", _job_number(job))
             progress.update(
                 "В очереди",
                 1,
@@ -2204,7 +2264,7 @@ async def _process_job(
             await _finish_progress(progress, progress_task, status_message, "Готово", detail="SRT, TXT и meta JSON отправлены")
             return
 
-        progress = _ProgressState("Полноценный дубляж", _job_number(job))
+        progress = progress_state or _ProgressState("Полноценный дубляж", _job_number(job))
         progress.update(
             "В очереди",
             1,
@@ -2253,6 +2313,12 @@ async def _process_job(
             send_path,
             output_filename,
         )
+        fun_visual_sent = await _send_fun_visual_if_present(
+            context.bot,
+            chat_id,
+            job,
+            progress,
+        )
         if transcript_text:
             progress.update("Отправляю транскрипт", 99, 100, None)
             transcript_path = _write_transcript_text(
@@ -2280,7 +2346,12 @@ async def _process_job(
                 connect_timeout=60,
                 pool_timeout=60,
             )
-        final_detail = "Видео и транскрипт отправлены" if transcript_text else "Видео отправлено, транскрипт не найден"
+        sent_items = ["дубляж"]
+        if fun_visual_sent:
+            sent_items.append("исходный прикольный видеоряд")
+        if transcript_text:
+            sent_items.append("транскрипт")
+        final_detail = "Отправлены: " + ", ".join(sent_items)
         _save_job_snapshot(job_dir, job, status="done")
         await _finish_progress(progress, progress_task, status_message, "Готово", detail=final_detail)
     except Exception as exc:
@@ -2351,6 +2422,12 @@ async def _send_remote_worker_result(context: Any, item: _QueuedJob, manifest: d
         )
         _save_job_snapshot(job_dir, job, status="ready")
         await _send_video_file(context.bot, item.chat_id, video_path, output_filename)
+        fun_visual_sent = await _send_fun_visual_if_present(
+            context.bot,
+            item.chat_id,
+            job,
+            progress,
+        )
 
         transcript_sent = False
         transcript_info = manifest.get("transcript")
@@ -2380,7 +2457,12 @@ async def _send_remote_worker_result(context: Any, item: _QueuedJob, manifest: d
                 pool_timeout=60,
             )
         _save_job_snapshot(job_dir, job, status="done")
-        detail = "Worker video and transcript sent" if transcript_sent else "Worker video sent, transcript not found"
+        sent_items = ["дубляж"]
+        if fun_visual_sent:
+            sent_items.append("исходный прикольный видеоряд")
+        if transcript_sent:
+            sent_items.append("транскрипт")
+        detail = "Отправлены: " + ", ".join(sent_items)
         await _finish_progress(progress, progress_task, status_message, "Done", detail=detail)
     except Exception as exc:
         traceback_text = traceback.format_exc()
@@ -2640,6 +2722,45 @@ async def _telegram_sendable_video_path(
 def _is_request_entity_too_large(exc: Exception) -> bool:
     text = f"{type(exc).__name__}: {exc}".casefold()
     return "request entity too large" in text or "entity too large" in text or "413" in text
+
+
+def _find_fun_visual(job: dict[str, Any]) -> Path | None:
+    job_dir = Path(str(job.get("job_dir") or ""))
+    input_path = Path(str(job.get("input_path") or ""))
+    candidates = [input_path]
+    if job_dir.is_dir():
+        candidates.extend(sorted(job_dir.glob("*_fun_visual.mp4")))
+    for path in candidates:
+        if path.is_file() and path.stem.endswith("_fun_visual") and path.stat().st_size >= 1024:
+            return path
+    return None
+
+
+async def _send_fun_visual_if_present(
+    bot: Any,
+    chat_id: int | str,
+    job: dict[str, Any],
+    progress: _ProgressState | None,
+) -> bool:
+    fun_visual = _find_fun_visual(job)
+    if fun_visual is None:
+        return False
+    if progress is not None:
+        progress.update("Отправляю прикольный видеоряд", 99, 100, fun_visual.name)
+    source_title = job.get("source_title") or fun_visual.stem.removesuffix("_fun_visual")
+    filename = _lalaschool_filename(f"{source_title}_fun_visual", fun_visual.suffix)
+    try:
+        await _send_video_file(
+            bot,
+            chat_id,
+            fun_visual,
+            filename,
+            caption="Исходный прикольный видеоряд без дубляжа",
+        )
+        return True
+    except Exception as exc:
+        print(f"Fun visual send skipped: {type(exc).__name__}: {exc}", flush=True)
+        return False
 
 
 async def _send_video_file(

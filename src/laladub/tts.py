@@ -24,6 +24,25 @@ class TTSError(RuntimeError):
     pass
 
 
+def _format_video_position(items: list[tuple[int, Segment, Path]], completed: int) -> str:
+    if not items:
+        return ""
+    index = max(0, min(completed, len(items) - 1))
+    position = max(0.0, float(items[index][1].end))
+    duration = max(position, max(float(item[1].end) for item in items))
+
+    def stamp(seconds: float) -> str:
+        total = max(0, round(seconds))
+        minutes, secs = divmod(total, 60)
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+    ratio = max(0.0, min(1.0, position / max(0.001, duration)))
+    filled = round(12 * ratio)
+    bar = "[" + "#" * filled + "-" * (12 - filled) + "]"
+    return f"видео {bar} {stamp(position)} / {stamp(duration)}"
+
+
 _XTTS_CACHE: dict[tuple[str, str], object] = {}
 _F5_CACHE: dict[tuple[str, str, str, str], object] = {}
 _F5_PRONUNCIATION_REPLACEMENTS: tuple[tuple[str, str], ...] = (
@@ -210,7 +229,13 @@ def synthesize_qwen3_batch(
                     current = int(parts[1])
                     total = max(1, int(parts[2]))
                     percent = 70 + round(20 * max(0, current - 1) / total)
-                    config.progress_callback("Озвучиваю реплики", percent, 100, f"Qwen3 {current}/{total}")
+                    position = _format_video_position(items, current - 1)
+                    config.progress_callback(
+                        "Озвучиваю реплики",
+                        percent,
+                        100,
+                        f"Qwen3 {current}/{total} · {position}",
+                    )
             if line.startswith("QWEN3_PROGRESS\t"):
                 segment_deadline = None
                 parts = line.split("\t")
@@ -219,7 +244,13 @@ def synthesize_qwen3_batch(
                     total = max(1, int(parts[2]))
                     if config.progress_callback is not None:
                         percent = 70 + round(20 * done / total)
-                        config.progress_callback("Озвучиваю реплики", percent, 100, f"Qwen3 {done}/{total}")
+                        position = _format_video_position(items, max(0, done - 1))
+                        config.progress_callback(
+                            "Озвучиваю реплики",
+                            percent,
+                            100,
+                            f"Qwen3 {done}/{total} · {position}",
+                        )
     except BaseException:
         _terminate_process_tree(process)
         raise
