@@ -246,7 +246,7 @@ async def _setup_bot_commands(application: Any) -> None:
     commands = [
         ("start", "Инструкция"),
         ("queue", "Показать очередь задач"),
-        ("resume", "Продолжить последнюю задачу"),
+        ("resume", "Продолжить задачу по номеру"),
         ("me", "Показать Telegram ID"),
         ("cancel", "Сбросить текущую задачу"),
     ]
@@ -351,6 +351,7 @@ async def start(update: Any, context: Any) -> None:
     await update.effective_message.reply_text(
         "Пришли видео или аудио. Я попрошу выбрать видеоряд, input-язык, количество голосов и язык озвучки.\n\n"
         "Input-язык используется как промежуточный язык перевода и источник Whisper-артефактов.\n"
+        "Номер работы будет указан в статусе. Для принудительного восстановления: /resume НОМЕР.\n"
         f"У бесплатных пользователей лимит: {limit_text}. На итоговом видео будет водяной знак.",
         reply_markup=_remove_reply_keyboard(),
     )
@@ -422,13 +423,32 @@ async def resume(update: Any, context: Any) -> None:
     user = update.effective_user
     if user is None:
         return
-    job = _find_latest_resumable_job(settings, user.id)
-    if not job:
-        await update.effective_message.reply_text("Не нашёл незавершённую задачу для продолжения.")
+    requested_number = str(context.args[0]).strip() if context.args else ""
+    if len(context.args) > 1 or (requested_number and not requested_number.isdigit()):
+        await update.effective_message.reply_text("Использование: /resume НОМЕР_РАБОТЫ")
         return
 
-    job["resume"] = "1"
-    status_message = await update.effective_message.reply_text("Ставлю задачу в очередь.")
+    job = (
+        _find_resumable_job_by_number(settings, user.id, requested_number)
+        if requested_number
+        else _find_latest_resumable_job(settings, user.id)
+    )
+    if not job:
+        if requested_number:
+            await update.effective_message.reply_text(
+                f"Не нашёл твою работу №{requested_number} или её исходный файл уже удалён."
+            )
+        else:
+            await update.effective_message.reply_text(
+                "Не нашёл незавершённую задачу. Укажи номер явно: /resume НОМЕР_РАБОТЫ"
+            )
+        return
+
+    _prepare_job_for_resume(job)
+    job_number = _job_number(job)
+    status_message = await update.effective_message.reply_text(
+        f"Принудительно восстанавливаю работу №{job_number} и ставлю её в очередь."
+    )
     await _enqueue_job(update, context, job, status_message)
 
 
@@ -447,8 +467,8 @@ async def resume_callback(update: Any, context: Any) -> None:
     if not job:
         await query.edit_message_text("Не нашёл данные задачи для продолжения.")
         return
-    job["resume"] = "1"
-    await query.edit_message_text("Ставлю задачу в очередь.")
+    _prepare_job_for_resume(job)
+    await query.edit_message_text(f"Восстанавливаю работу №{_job_number(job)} и ставлю её в очередь.")
     await _enqueue_job(update, context, job, query.message)
 
 
@@ -1369,7 +1389,10 @@ class _JobScheduler:
         key = _job_queue_key(job)
         async with self._lock:
             if key in self._known_jobs:
-                await _safe_edit_status(status_message, "Эта задача уже в очереди или выполняется.")
+                await _safe_edit_status(
+                    status_message,
+                    f"Работа №{_job_number(job)} уже находится в очереди или выполняется.",
+                )
                 return
 
             self._sequence += 1
@@ -1432,7 +1455,10 @@ class _JobScheduler:
             item.job["worker_id"] = worker_id
             item.job["is_paid"] = self._settings.is_paid(item.user_id)
             _save_job_snapshot(Path(item.job["job_dir"]), item.job, status="running")
-            item.progress = _ProgressState("Raw Whisper" if item.job.get("mode") == "raw_text" else "Full dubbing")
+            item.progress = _ProgressState(
+                "Raw Whisper" if item.job.get("mode") == "raw_text" else "Full dubbing",
+                _job_number(item.job),
+            )
             item.progress.update("Remote worker leased", 1, 100, worker_id)
             item.progress_task = context.application.create_task(_progress_updater(item.status_message, item.progress))
             self._leased[item.job_id] = item
@@ -1590,10 +1616,12 @@ class _JobScheduler:
 
     def _queue_text(self, item: _QueuedJob, position: int) -> str:
         title = "Сырой Whisper" if item.job.get("mode") == "raw_text" else "Полноценный дубляж"
+        job_number = _job_number(item.job)
         if _maintenance_enabled(self._settings) and not self._settings.is_admin(item.user_id):
             return "\n".join(
                 [
                     f"{title}: Приостановлен",
+                    f"Работа №{job_number}",
                     MAINTENANCE_MESSAGE,
                     "Задача сохранена и продолжится после завершения работ.",
                 ]
@@ -1605,6 +1633,7 @@ class _JobScheduler:
         return "\n".join(
             [
                 f"{title}: В очереди",
+                f"Работа №{job_number}",
                 f"Позиция: {position}",
                 f"Сейчас выполняется: {self._active_total}/{self._settings.max_active_jobs}",
                 f"У тебя выполняется: {active_for_user}/{self._settings.max_active_jobs_per_user}",
@@ -1729,10 +1758,11 @@ def _format_status_counts(counts: dict[str, int]) -> str:
 
 
 class _ProgressState:
-    def __init__(self, title: str) -> None:
+    def __init__(self, title: str, job_number: str = "") -> None:
         self._lock = threading.Lock()
         self._started_at = time.monotonic()
         self._title = title
+        self._job_number = job_number
         self._stage = "В очереди"
         self._detail = ""
         self._current = 0
@@ -1785,6 +1815,7 @@ class _ProgressState:
         status = "Ошибка" if failed else "Готово" if done else "В работе"
         lines = [
             f"{title}: {status}",
+            *([f"Работа №{self._job_number}"] if self._job_number else []),
             f"{_progress_bar(percent)} {percent}%",
             f"Этап: {stage}",
             f"Прошло: {_format_elapsed(elapsed)}",
@@ -2116,7 +2147,7 @@ async def _process_job(
                 artifact_chaos_mode=True,
                 collapse_repetitions=False,
             )
-            progress = _ProgressState("Сырой Whisper")
+            progress = _ProgressState("Сырой Whisper", _job_number(job))
             progress.update(
                 "В очереди",
                 1,
@@ -2173,7 +2204,7 @@ async def _process_job(
             await _finish_progress(progress, progress_task, status_message, "Готово", detail="SRT, TXT и meta JSON отправлены")
             return
 
-        progress = _ProgressState("Полноценный дубляж")
+        progress = _ProgressState("Полноценный дубляж", _job_number(job))
         progress.update(
             "В очереди",
             1,
@@ -2440,6 +2471,28 @@ def _find_latest_resumable_job(settings: BotSettings, user_id: int) -> dict[str,
     if not candidates:
         return None
     return max(candidates, key=lambda item: item[0])[1]
+
+
+def _find_resumable_job_by_number(
+    settings: BotSettings,
+    user_id: int,
+    job_number: str,
+) -> dict[str, Any] | None:
+    if not job_number.isdigit():
+        return None
+    return _load_job_snapshot(settings.workdir / str(user_id) / job_number)
+
+
+def _prepare_job_for_resume(job: dict[str, Any]) -> None:
+    job["resume"] = "1"
+    job["force_resume_requested_at"] = time.time()
+    for key in ("error", "finished_at", "worker_id"):
+        job.pop(key, None)
+
+
+def _job_number(job: dict[str, Any]) -> str:
+    job_dir = str(job.get("job_dir") or "").strip()
+    return Path(job_dir).name if job_dir else "?"
 
 
 def _resume_keyboard(job_dir: Path) -> Any:
