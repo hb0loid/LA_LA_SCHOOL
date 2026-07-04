@@ -187,6 +187,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_video))
     application.add_handler(MessageHandler(filters.AUDIO | filters.VOICE | filters.Document.AUDIO, receive_audio))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_link))
+    application.add_handler(CallbackQueryHandler(selection_back, pattern=r"^back:"))
     application.add_handler(CallbackQueryHandler(select_visual_mode, pattern=r"^vis:"))
     application.add_handler(CallbackQueryHandler(select_source, pattern=r"^src:"))
     application.add_handler(CallbackQueryHandler(select_asr_method, pattern=r"^asr:"))
@@ -893,14 +894,14 @@ async def _remember_job_and_ask_source(
     try:
         await status.edit_text(
             "Выбери видеоряд.",
-            reply_markup=_language_keyboard("vis", VISUAL_MODE_OPTIONS, columns=1),
+            reply_markup=_language_keyboard("vis", VISUAL_MODE_OPTIONS, columns=1, back_callback="back:cancel"),
         )
     except Exception as exc:
         if "Message can't be edited" not in f"{type(exc).__name__}: {exc}":
             raise
         await status.reply_text(
             "Выбери видеоряд.",
-            reply_markup=_language_keyboard("vis", VISUAL_MODE_OPTIONS, columns=1),
+            reply_markup=_language_keyboard("vis", VISUAL_MODE_OPTIONS, columns=1, back_callback="back:cancel"),
         )
 
 
@@ -910,13 +911,72 @@ async def _ask_source_language(status: Any, job: dict[str, Any]) -> None:
         "Выбери input-язык. Он будет использоваться как промежуточный язык перевода "
         "и источник Whisper-артефактов."
     )
-    reply_markup = _language_keyboard("src", SOURCE_LANGS)
+    back_callback = "back:cancel" if job.get("input_source") == "telegram_audio" else "back:visual"
+    reply_markup = _language_keyboard("src", SOURCE_LANGS, back_callback=back_callback)
     try:
         await status.edit_text(text, reply_markup=reply_markup)
     except Exception as exc:
         if "Message can't be edited" not in f"{type(exc).__name__}: {exc}":
             raise
         await status.reply_text(text, reply_markup=reply_markup)
+
+
+async def selection_back(update: Any, context: Any) -> None:
+    query = update.callback_query
+    await query.answer()
+    job = context.user_data.get("job")
+    if not job:
+        await query.edit_message_text("Нет активной задачи. Пришли видео или аудио ещё раз.")
+        return
+
+    destination = query.data.split(":", 1)[1]
+    job_dir = Path(str(job["job_dir"]))
+    if destination == "cancel":
+        context.user_data.pop("job", None)
+        _save_job_snapshot(job_dir, job, status="rejected", error="selection_cancelled")
+        await query.edit_message_text("Выбор отменён. Пришли видео или аудио, когда захочешь начать заново.")
+        return
+    if destination == "visual" and job.get("input_source") != "telegram_audio":
+        _save_job_snapshot(job_dir, job, status="select_visual")
+        await query.edit_message_text(
+            "Выбери видеоряд.",
+            reply_markup=_language_keyboard(
+                "vis",
+                VISUAL_MODE_OPTIONS,
+                columns=1,
+                back_callback="back:cancel",
+            ),
+        )
+        return
+    if destination == "source":
+        await _ask_source_language(query.message, job)
+        return
+    if destination == "speakers":
+        _save_job_snapshot(job_dir, job, status="select_speakers")
+        await query.edit_message_text(
+            "Выбери количество голосов.",
+            reply_markup=_language_keyboard(
+                "spk",
+                SPEAKER_COUNT_OPTIONS,
+                columns=5,
+                back_callback="back:source",
+            ),
+        )
+        return
+    if destination == "target":
+        _save_job_snapshot(job_dir, job, status="select_target")
+        await query.edit_message_text(
+            "Выбери язык озвучки.",
+            reply_markup=_language_keyboard(
+                "tgt",
+                TARGET_LANGS,
+                columns=2,
+                back_callback="back:speakers",
+            ),
+        )
+        return
+
+    await query.edit_message_text("Не удалось вернуться назад. Пришли файл ещё раз.")
 
 
 async def select_visual_mode(update: Any, context: Any) -> None:
@@ -955,7 +1015,7 @@ async def select_source(update: Any, context: Any) -> None:
     _save_job_snapshot(Path(job["job_dir"]), job, status="select_speakers")
     await query.edit_message_text(
         "Выбери количество голосов.",
-        reply_markup=_language_keyboard("spk", SPEAKER_COUNT_OPTIONS, columns=5),
+        reply_markup=_language_keyboard("spk", SPEAKER_COUNT_OPTIONS, columns=5, back_callback="back:source"),
     )
 
 
@@ -982,7 +1042,7 @@ async def select_asr_method(update: Any, context: Any) -> None:
     _save_job_snapshot(Path(job["job_dir"]), job, status="select_speakers")
     await query.edit_message_text(
         "Выбери количество голосов.",
-        reply_markup=_language_keyboard("spk", SPEAKER_COUNT_OPTIONS, columns=5),
+        reply_markup=_language_keyboard("spk", SPEAKER_COUNT_OPTIONS, columns=5, back_callback="back:source"),
     )
 
 
@@ -1004,7 +1064,7 @@ async def select_speaker_count(update: Any, context: Any) -> None:
     _save_job_snapshot(Path(job["job_dir"]), job, status="select_target")
     await query.edit_message_text(
         "Выбери язык озвучки.",
-        reply_markup=_language_keyboard("tgt", TARGET_LANGS, columns=2),
+        reply_markup=_language_keyboard("tgt", TARGET_LANGS, columns=2, back_callback="back:speakers"),
     )
 
 
@@ -1025,7 +1085,7 @@ async def select_target_lang(update: Any, context: Any) -> None:
     _save_job_snapshot(Path(job["job_dir"]), job, status="select_tts")
     await query.edit_message_text(
         "Выбери метод озвучки.",
-        reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2),
+        reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2, back_callback="back:target"),
     )
 
 
@@ -1044,7 +1104,7 @@ async def select_tts_method(update: Any, context: Any) -> None:
     if _target_lang_value(job.get("target_lang")) == "uk" and tts_provider == "qwen3":
         await query.edit_message_text(
             "Qwen3 не поддерживает украинскую озвучку. Выбери F5.",
-            reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2),
+            reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2, back_callback="back:target"),
         )
         return
 
@@ -2591,13 +2651,21 @@ def _remove_reply_keyboard() -> Any:
     return ReplyKeyboardRemove()
 
 
-def _language_keyboard(prefix: str, items: list[tuple[str, str]], columns: int = 2) -> Any:
+def _language_keyboard(
+    prefix: str,
+    items: list[tuple[str, str]],
+    columns: int = 2,
+    *,
+    back_callback: str | None = None,
+) -> Any:
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
     rows = []
     for index in range(0, len(items), columns):
         row_items = items[index : index + columns]
         rows.append([InlineKeyboardButton(label, callback_data=f"{prefix}:{code}") for code, label in row_items])
+    if back_callback:
+        rows.append([InlineKeyboardButton("◀️ Назад", callback_data=back_callback)])
     return InlineKeyboardMarkup(rows)
 
 
