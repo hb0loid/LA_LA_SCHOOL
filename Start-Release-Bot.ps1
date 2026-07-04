@@ -121,8 +121,7 @@ function Set-LaLaDubModelCaches {
 Set-LaLaDubModelCaches
 
 $env:LALADUB_BOT_TOKEN = $ReleaseBotToken
-$paidUsers = [Environment]::GetEnvironmentVariable("LALADUB_PAID_USERS", "User")
-if ($paidUsers) { $env:LALADUB_PAID_USERS = $paidUsers }
+$env:LALADUB_PAID_USERS_FILE = (Join-Path $Root "paid_users.txt")
 $env:LALADUB_ADMIN_USERS_FILE = (Join-Path $Root "admins.txt")
 $env:LALADUB_BOT_WORKDIR = $WorkDir
 $env:LALADUB_EXECUTOR_MODE = "hybrid"

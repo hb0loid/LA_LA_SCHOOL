@@ -153,7 +153,7 @@ def main() -> None:
         f"{settings.audio_visual_safety_threshold}/"
         f"{settings.audio_visual_safety_frames}/"
         f"{settings.audio_visual_safety_device} "
-        f"paid_users={len(settings.paid_users)} "
+        f"paid_users={len(settings.paid_users)}/{settings.paid_users_file} "
         f"admin_users={len(settings.admin_users)}/{settings.admin_users_file} "
         f"duration_limits=free:{settings.free_max_duration_seconds}/paid:{settings.paid_max_duration_seconds} "
         f"collapse_repetitions={settings.collapse_repetitions}/"

@@ -20,6 +20,7 @@ class BotSettings:
     job_retention_seconds: float
     cleanup_interval_seconds: float
     paid_users: frozenset[int]
+    paid_users_file: Path
     admin_users: frozenset[int]
     admin_users_file: Path
     max_active_jobs: int
@@ -107,6 +108,12 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
     if require_token and not token:
         raise RuntimeError("Set LALADUB_BOT_TOKEN to your Telegram bot token.")
 
+    paid_users_file = Path(os.environ.get("LALADUB_PAID_USERS_FILE", "paid_users.txt"))
+    if paid_users_file.is_file():
+        paid_users = _parse_user_ids_file(paid_users_file)
+    else:
+        paid_users = _parse_user_ids(os.environ.get("LALADUB_PAID_USERS", ""))
+
     admin_users_file = Path(os.environ.get("LALADUB_ADMIN_USERS_FILE", "admins.txt"))
     admin_users = _parse_user_ids(os.environ.get("LALADUB_ADMIN_USERS", ""))
     if admin_users_file.is_file():
@@ -127,7 +134,8 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         worker_version=os.environ.get("LALADUB_WORKER_VERSION", "0.1.0").strip() or "0.1.0",
         job_retention_seconds=max(0.0, float(os.environ.get("LALADUB_JOB_RETENTION_SECONDS", "2592000"))),
         cleanup_interval_seconds=max(60.0, float(os.environ.get("LALADUB_CLEANUP_INTERVAL_SECONDS", "3600"))),
-        paid_users=frozenset(_parse_user_ids(os.environ.get("LALADUB_PAID_USERS", ""))),
+        paid_users=frozenset(paid_users),
+        paid_users_file=paid_users_file,
         admin_users=frozenset(admin_users),
         admin_users_file=admin_users_file,
         max_active_jobs=max(1, int(os.environ.get("LALADUB_MAX_ACTIVE_JOBS", "2"))),
