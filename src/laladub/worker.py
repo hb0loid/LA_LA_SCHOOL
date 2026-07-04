@@ -320,17 +320,38 @@ def _rotate_worker_token(
     except Exception as exc:
         print(f"Worker token sync skipped: {type(exc).__name__}: {exc}", flush=True)
         return client.token
-    new_token = str((manifest or {}).get("worker_token") or "").strip()
-    if not new_token or new_token == client.token:
+    new_token = str((manifest or {}).get("worker_token") or "").strip() or client.token
+    canonical_server = str((manifest or {}).get("worker_server") or "").strip().rstrip("/")
+    saved_server = canonical_server if _server_health_available(canonical_server) else server
+    token_changed = new_token != client.token
+    server_changed = saved_server.rstrip("/") != server.rstrip("/")
+    if not token_changed and not server_changed:
         return client.token
 
     client.token = new_token
     if save_config:
         updated = dict(file_config)
-        updated.update({"server": server, "token": new_token, "worker_id": worker_id})
+        updated.update({"server": saved_server, "token": new_token, "worker_id": worker_id})
         _save_worker_config(config_path, updated)
-    print("Worker authentication token synchronized.", flush=True)
+    if token_changed:
+        print("Worker authentication token synchronized.", flush=True)
+    if server_changed:
+        print(f"Worker server switched to stable hostname: {saved_server}", flush=True)
     return new_token
+
+
+def _server_health_available(server: str) -> bool:
+    if not server:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(server)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return False
+        request = urllib.request.Request(f"{server.rstrip('/')}/health")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return 200 <= response.status < 300
+    except Exception:
+        return False
 
 
 def _remote_update_available(client: CoordinatorClient) -> bool:

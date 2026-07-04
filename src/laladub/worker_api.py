@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -169,6 +170,7 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
             "build_id": str(manifest.get("build_id") or ""),
             "package": "/api/v1/worker/package",
             "worker_token": self.server.token,
+            "worker_server": f"http://{socket.gethostname()}:{settings.worker_api_port}",
         }
         if package_path is None:
             return data
