@@ -168,6 +168,7 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
             "version": str(manifest.get("version") or settings.worker_version),
             "build_id": str(manifest.get("build_id") or ""),
             "package": "/api/v1/worker/package",
+            "worker_token": self.server.token,
         }
         if package_path is None:
             return data

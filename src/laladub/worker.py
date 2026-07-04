@@ -46,6 +46,14 @@ def main(argv: list[str] | None = None) -> None:
         _save_worker_config(config_path, {"server": server, "token": token, "worker_id": worker_id})
 
     client = CoordinatorClient(server, token)
+    token = _rotate_worker_token(
+        client,
+        config_path=config_path,
+        file_config=file_config,
+        server=server,
+        worker_id=worker_id,
+        save_config=not args.no_save_config,
+    )
     workdir.mkdir(parents=True, exist_ok=True)
     print(f"LaLaDub worker started: id={worker_id} server={server} workdir={workdir}", flush=True)
 
@@ -296,6 +304,33 @@ def _load_worker_config(path: Path) -> dict[str, str]:
 
 def _save_worker_config(path: Path, data: dict[str, str]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _rotate_worker_token(
+    client: CoordinatorClient,
+    *,
+    config_path: Path,
+    file_config: dict[str, str],
+    server: str,
+    worker_id: str,
+    save_config: bool,
+) -> str:
+    try:
+        manifest = client.worker_manifest()
+    except Exception as exc:
+        print(f"Worker token sync skipped: {type(exc).__name__}: {exc}", flush=True)
+        return client.token
+    new_token = str((manifest or {}).get("worker_token") or "").strip()
+    if not new_token or new_token == client.token:
+        return client.token
+
+    client.token = new_token
+    if save_config:
+        updated = dict(file_config)
+        updated.update({"server": server, "token": new_token, "worker_id": worker_id})
+        _save_worker_config(config_path, updated)
+    print("Worker authentication token synchronized.", flush=True)
+    return new_token
 
 
 def _remote_update_available(client: CoordinatorClient) -> bool:
