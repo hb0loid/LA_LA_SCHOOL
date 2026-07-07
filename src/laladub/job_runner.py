@@ -298,6 +298,8 @@ def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: P
         artifact_whisper_device=settings.artifact_whisper_device,
         inject_artifacts=settings.inject_artifacts,
         artifact_max_segments=settings.artifact_max_segments,
+        artifact_ratio=settings.artifact_ratio,
+        artifact_min_source_segments=settings.artifact_min_source_segments,
         artifact_min_gap_seconds=settings.artifact_min_gap_seconds,
         distort_translation=settings.distort_translation,
         translation_pivots=settings.translation_pivots,

@@ -163,7 +163,8 @@ def main() -> None:
         f"collapse_repetitions={settings.collapse_repetitions}/"
         f"{settings.max_phrase_repeats}/{settings.max_word_repeats} "
         f"inject_artifacts={settings.inject_artifacts}/"
-        f"{settings.artifact_max_segments}/{settings.artifact_min_gap_seconds} "
+        f"{settings.artifact_max_segments}/{settings.artifact_ratio}/"
+        f"{settings.artifact_min_source_segments}/{settings.artifact_min_gap_seconds} "
         f"distort={settings.distort_translation}/{settings.translation_pivots}/pass2={settings.translation_second_pass_ratio} "
         f"asr={settings.asr_backend} "
         f"queue={settings.max_active_jobs}/{settings.max_active_jobs_per_user} "
@@ -2268,6 +2269,8 @@ async def _process_job(
         artifact_whisper_device=settings.artifact_whisper_device,
         inject_artifacts=settings.inject_artifacts,
         artifact_max_segments=settings.artifact_max_segments,
+        artifact_ratio=settings.artifact_ratio,
+        artifact_min_source_segments=settings.artifact_min_source_segments,
         artifact_min_gap_seconds=settings.artifact_min_gap_seconds,
         distort_translation=settings.distort_translation,
         translation_pivots=settings.translation_pivots,

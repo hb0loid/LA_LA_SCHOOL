@@ -50,6 +50,8 @@ class DubConfig:
     artifact_chaos_mode: bool = False
     inject_artifacts: bool = True
     artifact_max_segments: int = 12
+    artifact_ratio: float = 0.2
+    artifact_min_source_segments: int = 5
     artifact_min_gap_seconds: float = 0.5
     distort_translation: bool = True
     distort_main_translation: bool = False

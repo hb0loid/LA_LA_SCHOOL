@@ -107,6 +107,8 @@ class BotSettings:
     max_word_repeats: int
     inject_artifacts: bool
     artifact_max_segments: int
+    artifact_ratio: float
+    artifact_min_source_segments: int
     artifact_min_gap_seconds: float
     distort_translation: bool
     translation_pivots: str
@@ -255,6 +257,8 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         max_word_repeats=int(os.environ.get("LALADUB_MAX_WORD_REPEATS", "3")),
         inject_artifacts=_parse_bool(os.environ.get("LALADUB_INJECT_ARTIFACTS", "1")),
         artifact_max_segments=int(os.environ.get("LALADUB_ARTIFACT_MAX_SEGMENTS", "12")),
+        artifact_ratio=max(0.0, min(1.0, float(os.environ.get("LALADUB_ARTIFACT_RATIO", "0.20")))),
+        artifact_min_source_segments=max(0, int(os.environ.get("LALADUB_ARTIFACT_MIN_SOURCE_SEGMENTS", "5"))),
         artifact_min_gap_seconds=float(os.environ.get("LALADUB_ARTIFACT_MIN_GAP_SECONDS", "0.5")),
         distort_translation=_parse_bool(os.environ.get("LALADUB_DISTORT_TRANSLATION", "1")),
         translation_pivots=os.environ.get(

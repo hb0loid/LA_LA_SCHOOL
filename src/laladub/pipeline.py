@@ -2058,6 +2058,38 @@ def _dedupe_artifact_segments(segments: list[Segment]) -> list[Segment]:
     return result
 
 
+def _artifact_injection_limit(
+    base_segments: list[Segment],
+    candidates: list[Segment],
+    config: DubConfig,
+) -> int:
+    if not base_segments or not candidates:
+        return 0
+    source_count = len(base_segments)
+    if source_count < max(0, config.artifact_min_source_segments):
+        print(
+            "      Artifact injection limited: "
+            f"source_segments={source_count} < min={config.artifact_min_source_segments}"
+        )
+        return 0
+
+    absolute_max = max(0, int(config.artifact_max_segments))
+    if absolute_max <= 0:
+        return 0
+
+    ratio = max(0.0, min(1.0, float(config.artifact_ratio)))
+    ratio_limit = round(source_count * ratio)
+    if ratio > 0.0 and ratio_limit <= 0:
+        ratio_limit = 1
+    limit = min(absolute_max, ratio_limit, len(candidates))
+    print(
+        "      Artifact injection limit: "
+        f"source_segments={source_count}, ratio={ratio:.2f}, "
+        f"ratio_limit={ratio_limit}, absolute_max={absolute_max}, candidates={len(candidates)}, limit={limit}"
+    )
+    return max(0, limit)
+
+
 def _inject_artifact_segments(
     segments: list[Segment],
     artifacts: list[Segment],
@@ -2072,7 +2104,9 @@ def _inject_artifact_segments(
     if not segments:
         return segments
 
-    max_count = min(max(0, config.artifact_max_segments), len(candidates))
+    max_count = _artifact_injection_limit(segments, candidates, config)
+    if max_count <= 0:
+        return segments
     replacements: list[Segment] = []
     used_segment_indices: set[int] = set()
     used_ranges: list[tuple[float, float]] = []
@@ -2130,7 +2164,9 @@ def _inject_chaos_artifact_segments(
     config: DubConfig,
     source_duration: float,
 ) -> list[Segment]:
-    max_count = min(max(0, config.artifact_max_segments), len(candidates))
+    max_count = _artifact_injection_limit(segments, candidates, config)
+    if max_count <= 0:
+        return segments
     ranked = sorted(candidates, key=_chaos_artifact_rank, reverse=True)
     replacements: list[Segment] = []
     used_ranges: list[tuple[float, float]] = []
