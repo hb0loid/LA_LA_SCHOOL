@@ -133,6 +133,10 @@ def synthesize_segment(segment: Segment, output_path: Path, config: DubConfig) -
         _synthesize_chatterbox(segment, text, output_path, config)
         return
 
+    if provider in {"cosyvoice", "cosyvoice-tts", "cosyvoicetts", "cosy"}:
+        _synthesize_cosyvoice(segment, text, output_path, config)
+        return
+
     raise TTSError(f"Unknown TTS provider: {config.tts}")
 
 
@@ -658,6 +662,110 @@ def _chatterbox_language_id(target_lang: str) -> str:
         "ru": "ru",
         "en": "en",
     }.get((target_lang or "ru").lower(), "ru")
+
+
+def _synthesize_cosyvoice(segment: Segment, text: str, output_path: Path, config: DubConfig) -> None:
+    text = _sanitize_text_for_xtts(text)
+    if config.target_lang == "ru":
+        text = _apply_f5_pronunciation_dictionary(text)
+    if not text:
+        make_silence(output_path, max(0.15, segment.duration))
+        return
+
+    speaker_wav = segment.speaker_wav or config.speaker_wav
+    if not speaker_wav:
+        raise TTSError("CosyVoice needs a speaker reference WAV.")
+    if not speaker_wav.exists():
+        raise TTSError(f"CosyVoice speaker reference does not exist: {speaker_wav}")
+
+    chunks = _split_text_for_xtts(text, max_chars=260, max_words=40)
+    if len(chunks) > 1:
+        print(f"      CosyVoice split long segment into {len(chunks)} chunks")
+        chunk_paths: list[Path] = []
+        chunk_dir = output_path.parent / f"{output_path.stem}_cosyvoice_chunks"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        for index, chunk in enumerate(chunks, start=1):
+            chunk_path = chunk_dir / f"{index:04d}.wav"
+            _cosyvoice_to_file(chunk, chunk_path, speaker_wav, segment, config)
+            chunk_paths.append(chunk_path)
+        concat_wavs(chunk_paths, output_path)
+    else:
+        _cosyvoice_to_file(text, output_path, speaker_wav, segment, config)
+
+    if not output_path.exists() or output_path.stat().st_size < 1024:
+        raise TTSError(f"CosyVoice produced an empty WAV file: {output_path}")
+
+
+def _cosyvoice_to_file(
+    text: str,
+    output_path: Path,
+    speaker_wav: Path,
+    segment: Segment,
+    config: DubConfig,
+) -> None:
+    python_path = _resolve_cosyvoice_python(config)
+    runner_path = _repo_root() / "tools" / "cosyvoice_tts_runner.py"
+    if not runner_path.exists():
+        raise TTSError(f"CosyVoice runner does not exist: {runner_path}")
+
+    prompt_text = _sanitize_text_for_xtts(segment.speaker_ref_text or "")
+    if config.target_lang == "ru":
+        prompt_text = _apply_f5_pronunciation_dictionary(prompt_text)
+
+    command = [
+        str(python_path),
+        str(runner_path),
+        "--repo-dir",
+        str(_resolve_repo_relative_path(config.cosyvoice_repo_dir)),
+        "--model-dir",
+        str(_resolve_repo_relative_path(config.cosyvoice_model_dir)),
+        "--model-id",
+        config.cosyvoice_model_id,
+        "--ref-audio",
+        str(speaker_wav),
+        "--text-base64",
+        base64.b64encode(text.encode("utf-8")).decode("ascii"),
+        "--prompt-text-base64",
+        base64.b64encode(prompt_text.encode("utf-8")).decode("ascii"),
+        "--output",
+        str(output_path),
+        "--mode",
+        config.cosyvoice_mode,
+        "--instruction",
+        config.cosyvoice_instruction,
+        "--device",
+        config.cosyvoice_device,
+        "--speed",
+        str(config.cosyvoice_speed),
+    ]
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=config.cosyvoice_timeout_seconds,
+    )
+    message = _short_subprocess_output(result.stdout, result.stderr)
+    if message:
+        print(f"      CosyVoice runner: {message}")
+
+    if not output_path.exists() or output_path.stat().st_size < 1024:
+        raise TTSError(f"CosyVoice produced an empty WAV file: {output_path}")
+
+
+def _resolve_cosyvoice_python(config: DubConfig) -> Path:
+    python_path = config.cosyvoice_python or Path(".venv-cosyvoice") / "Scripts" / "python.exe"
+    python_path = _resolve_repo_relative_path(python_path)
+    if not python_path.is_file():
+        raise TTSError(
+            "CosyVoice Python was not found. Expected .venv-cosyvoice\\Scripts\\python.exe. "
+            "Create it with: python -m venv .venv-cosyvoice"
+        )
+    return python_path
 
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:

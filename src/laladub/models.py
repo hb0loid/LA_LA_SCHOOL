@@ -104,6 +104,15 @@ class DubConfig:
     chatterbox_exaggeration: float = 0.5
     chatterbox_cfg_weight: float = 0.5
     chatterbox_timeout_seconds: int = 1800
+    cosyvoice_python: Path | None = None
+    cosyvoice_repo_dir: Path = Path("models/cosyvoice/CosyVoice")
+    cosyvoice_model_dir: Path = Path("models/cosyvoice/pretrained_models/Fun-CosyVoice3-0.5B")
+    cosyvoice_model_id: str = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
+    cosyvoice_mode: str = "cross_lingual"
+    cosyvoice_instruction: str = "You are a helpful assistant.<|endofprompt|>"
+    cosyvoice_device: str = "auto"
+    cosyvoice_speed: float = 1.0
+    cosyvoice_timeout_seconds: int = 1800
     separation: str = "none"
     separation_device: str = "cpu"
     demucs_model: str = "htdemucs"

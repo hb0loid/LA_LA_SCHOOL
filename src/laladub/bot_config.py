@@ -73,6 +73,15 @@ class BotSettings:
     chatterbox_exaggeration: float
     chatterbox_cfg_weight: float
     chatterbox_timeout_seconds: int
+    cosyvoice_python: Path | None
+    cosyvoice_repo_dir: Path
+    cosyvoice_model_dir: Path
+    cosyvoice_model_id: str
+    cosyvoice_mode: str
+    cosyvoice_instruction: str
+    cosyvoice_device: str
+    cosyvoice_speed: float
+    cosyvoice_timeout_seconds: int
     multi_speaker: bool
     speaker_reference_seconds: float
     speaker_clustering: bool
@@ -207,6 +216,20 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         chatterbox_exaggeration=float(os.environ.get("LALADUB_CHATTERBOX_EXAGGERATION", "0.5")),
         chatterbox_cfg_weight=float(os.environ.get("LALADUB_CHATTERBOX_CFG_WEIGHT", "0.5")),
         chatterbox_timeout_seconds=int(os.environ.get("LALADUB_CHATTERBOX_TIMEOUT_SECONDS", "1800")),
+        cosyvoice_python=_optional_path(os.environ.get("LALADUB_COSYVOICE_PYTHON", ".venv-cosyvoice\\Scripts\\python.exe")),
+        cosyvoice_repo_dir=Path(os.environ.get("LALADUB_COSYVOICE_REPO_DIR", "models/cosyvoice/CosyVoice")),
+        cosyvoice_model_dir=Path(
+            os.environ.get("LALADUB_COSYVOICE_MODEL_DIR", "models/cosyvoice/pretrained_models/Fun-CosyVoice3-0.5B")
+        ),
+        cosyvoice_model_id=os.environ.get("LALADUB_COSYVOICE_MODEL_ID", "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"),
+        cosyvoice_mode=os.environ.get("LALADUB_COSYVOICE_MODE", "cross_lingual"),
+        cosyvoice_instruction=os.environ.get(
+            "LALADUB_COSYVOICE_INSTRUCTION",
+            "You are a helpful assistant.<|endofprompt|>",
+        ),
+        cosyvoice_device=os.environ.get("LALADUB_COSYVOICE_DEVICE", "auto"),
+        cosyvoice_speed=float(os.environ.get("LALADUB_COSYVOICE_SPEED", "1.0")),
+        cosyvoice_timeout_seconds=int(os.environ.get("LALADUB_COSYVOICE_TIMEOUT_SECONDS", "1800")),
         multi_speaker=_parse_bool(os.environ.get("LALADUB_MULTI_SPEAKER", "1")),
         speaker_reference_seconds=float(os.environ.get("LALADUB_SPEAKER_REFERENCE_SECONDS", "5.0")),
         speaker_clustering=_parse_bool(os.environ.get("LALADUB_SPEAKER_CLUSTERING", "1")),

@@ -2495,6 +2495,10 @@ def _needs_speaker_references(config: DubConfig) -> bool:
         "chatterbox",
         "chatterbox-tts",
         "chatterboxtts",
+        "cosyvoice",
+        "cosyvoice-tts",
+        "cosyvoicetts",
+        "cosy",
     }
 
 

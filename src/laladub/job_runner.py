@@ -219,6 +219,10 @@ def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: P
         "chatterbox",
         "chatterbox-tts",
         "chatterboxtts",
+        "cosyvoice",
+        "cosyvoice-tts",
+        "cosyvoicetts",
+        "cosy",
     }:
         tts_provider = "f5"
     config = DubConfig(
@@ -265,6 +269,15 @@ def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: P
         chatterbox_exaggeration=settings.chatterbox_exaggeration,
         chatterbox_cfg_weight=settings.chatterbox_cfg_weight,
         chatterbox_timeout_seconds=settings.chatterbox_timeout_seconds,
+        cosyvoice_python=settings.cosyvoice_python,
+        cosyvoice_repo_dir=settings.cosyvoice_repo_dir,
+        cosyvoice_model_dir=settings.cosyvoice_model_dir,
+        cosyvoice_model_id=settings.cosyvoice_model_id,
+        cosyvoice_mode=settings.cosyvoice_mode,
+        cosyvoice_instruction=settings.cosyvoice_instruction,
+        cosyvoice_device=settings.cosyvoice_device,
+        cosyvoice_speed=settings.cosyvoice_speed,
+        cosyvoice_timeout_seconds=settings.cosyvoice_timeout_seconds,
         multi_speaker=settings.multi_speaker,
         speaker_reference_seconds=settings.speaker_reference_seconds,
         speaker_clustering=settings.speaker_clustering,

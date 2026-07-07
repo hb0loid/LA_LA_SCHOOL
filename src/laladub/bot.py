@@ -99,6 +99,7 @@ TTS_METHODS = [
     ("f5", "F5 (быстрее)"),
     ("qwen3", "Qwen3 (медленнее)"),
     ("chatterbox", "Chatterbox"),
+    ("cosyvoice", "CosyVoice"),
 ]
 
 TELEGRAM_SAFE_VIDEO_BYTES = 45 * 1024 * 1024
@@ -143,6 +144,7 @@ def main() -> None:
         f"f5={settings.f5_model}/{settings.f5_device} "
         f"qwen3={settings.qwen3_model} "
         f"chatterbox={settings.chatterbox_model}/{settings.chatterbox_device} "
+        f"cosyvoice={settings.cosyvoice_model_id}/{settings.cosyvoice_device}/{settings.cosyvoice_mode} "
         f"multi_speaker={settings.multi_speaker} "
         f"speaker_clustering={settings.speaker_clustering}/{settings.max_speaker_clusters} "
         f"separation={settings.separation} "
@@ -1103,7 +1105,7 @@ async def select_tts_method(update: Any, context: Any) -> None:
     if tts_provider is None:
         await query.edit_message_text("Неизвестный метод озвучки. Пришли видео ещё раз.")
         return
-    if _target_lang_value(job.get("target_lang")) == "uk" and tts_provider in {"qwen3", "chatterbox"}:
+    if _target_lang_value(job.get("target_lang")) == "uk" and tts_provider in {"qwen3", "chatterbox", "cosyvoice"}:
         provider_label = _tts_method_label(tts_provider)
         await query.edit_message_text(
             f"{provider_label} не поддерживает украинскую озвучку. Выбери F5.",
@@ -1702,7 +1704,7 @@ class _JobScheduler:
             return False
         if execution_kind == "remote" and _target_lang_value(item.job.get("target_lang")) != "ru":
             return False
-        if execution_kind == "remote" and _tts_provider_value(item.job.get("tts_provider")) == "qwen3":
+        if execution_kind == "remote" and _tts_provider_value(item.job.get("tts_provider")) in {"qwen3", "cosyvoice"}:
             return False
         if item.user_id is None:
             return True
@@ -1993,6 +1995,8 @@ def _tts_provider_value(value: Any) -> str | None:
         return "f5"
     if text in {"chatterbox", "chatterbox-tts", "chatterboxtts"}:
         return "chatterbox"
+    if text in {"cosyvoice", "cosyvoice-tts", "cosyvoicetts", "cosy"}:
+        return "cosyvoice"
     return None
 
 
@@ -2181,6 +2185,10 @@ async def _process_job(
         "chatterbox",
         "chatterbox-tts",
         "chatterboxtts",
+        "cosyvoice",
+        "cosyvoice-tts",
+        "cosyvoicetts",
+        "cosy",
     }:
         tts_provider = "f5"
     _save_job_snapshot(job_dir, job, status="running")
@@ -2231,6 +2239,15 @@ async def _process_job(
         chatterbox_exaggeration=settings.chatterbox_exaggeration,
         chatterbox_cfg_weight=settings.chatterbox_cfg_weight,
         chatterbox_timeout_seconds=settings.chatterbox_timeout_seconds,
+        cosyvoice_python=settings.cosyvoice_python,
+        cosyvoice_repo_dir=settings.cosyvoice_repo_dir,
+        cosyvoice_model_dir=settings.cosyvoice_model_dir,
+        cosyvoice_model_id=settings.cosyvoice_model_id,
+        cosyvoice_mode=settings.cosyvoice_mode,
+        cosyvoice_instruction=settings.cosyvoice_instruction,
+        cosyvoice_device=settings.cosyvoice_device,
+        cosyvoice_speed=settings.cosyvoice_speed,
+        cosyvoice_timeout_seconds=settings.cosyvoice_timeout_seconds,
         multi_speaker=settings.multi_speaker,
         speaker_reference_seconds=settings.speaker_reference_seconds,
         speaker_clustering=settings.speaker_clustering,

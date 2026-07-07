@@ -68,6 +68,15 @@ def main(argv: list[str] | None = None) -> None:
             chatterbox_exaggeration=args.chatterbox_exaggeration,
             chatterbox_cfg_weight=args.chatterbox_cfg_weight,
             chatterbox_timeout_seconds=args.chatterbox_timeout_seconds,
+            cosyvoice_python=args.cosyvoice_python,
+            cosyvoice_repo_dir=args.cosyvoice_repo_dir,
+            cosyvoice_model_dir=args.cosyvoice_model_dir,
+            cosyvoice_model_id=args.cosyvoice_model_id,
+            cosyvoice_mode=args.cosyvoice_mode,
+            cosyvoice_instruction=args.cosyvoice_instruction,
+            cosyvoice_device=args.cosyvoice_device,
+            cosyvoice_speed=args.cosyvoice_speed,
+            cosyvoice_timeout_seconds=args.cosyvoice_timeout_seconds,
             multi_speaker=not args.no_multi_speaker,
             speaker_reference_seconds=args.speaker_reference_seconds,
             separation=args.separation,
@@ -137,7 +146,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dub.add_argument("--libretranslate-url", default="http://127.0.0.1:5000/translate")
     dub.add_argument("--libretranslate-api-key", default=None)
-    dub.add_argument("--tts", default="sapi", choices=["sapi", "piper", "xtts", "f5", "chatterbox", "none"], help="TTS provider.")
+    dub.add_argument(
+        "--tts",
+        default="sapi",
+        choices=["sapi", "piper", "xtts", "f5", "chatterbox", "cosyvoice", "none"],
+        help="TTS provider.",
+    )
     dub.add_argument("--voice", default=None, help="SAPI voice name.")
     dub.add_argument("--sapi-rate", type=int, default=0, help="SAPI rate from -10 to 10.")
     dub.add_argument("--sapi-volume", type=int, default=100, help="SAPI volume from 0 to 100.")
@@ -171,6 +185,19 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument("--chatterbox-exaggeration", type=float, default=0.5)
     dub.add_argument("--chatterbox-cfg-weight", type=float, default=0.5)
     dub.add_argument("--chatterbox-timeout-seconds", type=int, default=1800)
+    dub.add_argument("--cosyvoice-python", type=Path, default=Path(".venv-cosyvoice") / "Scripts" / "python.exe")
+    dub.add_argument("--cosyvoice-repo-dir", type=Path, default=Path("models/cosyvoice/CosyVoice"))
+    dub.add_argument(
+        "--cosyvoice-model-dir",
+        type=Path,
+        default=Path("models/cosyvoice/pretrained_models/Fun-CosyVoice3-0.5B"),
+    )
+    dub.add_argument("--cosyvoice-model-id", default="FunAudioLLM/Fun-CosyVoice3-0.5B-2512")
+    dub.add_argument("--cosyvoice-mode", default="cross_lingual", choices=["cross_lingual", "zero_shot"])
+    dub.add_argument("--cosyvoice-instruction", default="You are a helpful assistant.<|endofprompt|>")
+    dub.add_argument("--cosyvoice-device", default="auto", choices=["auto", "cpu", "cuda"])
+    dub.add_argument("--cosyvoice-speed", type=float, default=1.0)
+    dub.add_argument("--cosyvoice-timeout-seconds", type=int, default=1800)
     dub.add_argument("--no-multi-speaker", action="store_true", help="Use one speaker reference for all segments.")
     dub.add_argument(
         "--speaker-reference-seconds",
