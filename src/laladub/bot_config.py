@@ -66,6 +66,13 @@ class BotSettings:
     qwen3_model: str
     qwen3_cache_dir: Path
     qwen3_timeout_seconds: int
+    chatterbox_python: Path | None
+    chatterbox_model: str
+    chatterbox_device: str
+    chatterbox_cache_dir: Path
+    chatterbox_exaggeration: float
+    chatterbox_cfg_weight: float
+    chatterbox_timeout_seconds: int
     multi_speaker: bool
     speaker_reference_seconds: float
     speaker_clustering: bool
@@ -191,6 +198,15 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         qwen3_model=os.environ.get("LALADUB_QWEN3_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
         qwen3_cache_dir=Path(os.environ.get("LALADUB_QWEN3_CACHE_DIR", "models/qwen3tts")),
         qwen3_timeout_seconds=int(os.environ.get("LALADUB_QWEN3_TIMEOUT_SECONDS", "1800")),
+        chatterbox_python=_optional_path(
+            os.environ.get("LALADUB_CHATTERBOX_PYTHON", ".venv-chatterbox\\Scripts\\python.exe")
+        ),
+        chatterbox_model=os.environ.get("LALADUB_CHATTERBOX_MODEL", "v3"),
+        chatterbox_device=os.environ.get("LALADUB_CHATTERBOX_DEVICE", "auto"),
+        chatterbox_cache_dir=Path(os.environ.get("LALADUB_CHATTERBOX_CACHE_DIR", "models/chatterbox")),
+        chatterbox_exaggeration=float(os.environ.get("LALADUB_CHATTERBOX_EXAGGERATION", "0.5")),
+        chatterbox_cfg_weight=float(os.environ.get("LALADUB_CHATTERBOX_CFG_WEIGHT", "0.5")),
+        chatterbox_timeout_seconds=int(os.environ.get("LALADUB_CHATTERBOX_TIMEOUT_SECONDS", "1800")),
         multi_speaker=_parse_bool(os.environ.get("LALADUB_MULTI_SPEAKER", "1")),
         speaker_reference_seconds=float(os.environ.get("LALADUB_SPEAKER_REFERENCE_SECONDS", "5.0")),
         speaker_clustering=_parse_bool(os.environ.get("LALADUB_SPEAKER_CLUSTERING", "1")),

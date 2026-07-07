@@ -212,7 +212,14 @@ def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: P
     job_dir = Path(str(job["job_dir"]))
     target_lang = target_lang_value(job.get("target_lang"))
     tts_provider = str(job.get("tts_provider") or settings.tts)
-    if target_lang == "uk" and tts_provider.lower() in {"qwen3", "qwen3-tts", "qwen3tts"}:
+    if target_lang == "uk" and tts_provider.lower() in {
+        "qwen3",
+        "qwen3-tts",
+        "qwen3tts",
+        "chatterbox",
+        "chatterbox-tts",
+        "chatterboxtts",
+    }:
         tts_provider = "f5"
     config = DubConfig(
         output=output_path,
@@ -251,6 +258,13 @@ def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: P
         qwen3_model=settings.qwen3_model,
         qwen3_cache_dir=settings.qwen3_cache_dir,
         qwen3_timeout_seconds=settings.qwen3_timeout_seconds,
+        chatterbox_python=settings.chatterbox_python,
+        chatterbox_model=settings.chatterbox_model,
+        chatterbox_device=settings.chatterbox_device,
+        chatterbox_cache_dir=settings.chatterbox_cache_dir,
+        chatterbox_exaggeration=settings.chatterbox_exaggeration,
+        chatterbox_cfg_weight=settings.chatterbox_cfg_weight,
+        chatterbox_timeout_seconds=settings.chatterbox_timeout_seconds,
         multi_speaker=settings.multi_speaker,
         speaker_reference_seconds=settings.speaker_reference_seconds,
         speaker_clustering=settings.speaker_clustering,

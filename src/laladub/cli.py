@@ -61,6 +61,13 @@ def main(argv: list[str] | None = None) -> None:
             f5_cross_fade_duration=args.f5_cross_fade_duration,
             f5_remove_silence=args.f5_remove_silence,
             f5_timeout_seconds=args.f5_timeout_seconds,
+            chatterbox_python=args.chatterbox_python,
+            chatterbox_model=args.chatterbox_model,
+            chatterbox_device=args.chatterbox_device,
+            chatterbox_cache_dir=args.chatterbox_cache_dir,
+            chatterbox_exaggeration=args.chatterbox_exaggeration,
+            chatterbox_cfg_weight=args.chatterbox_cfg_weight,
+            chatterbox_timeout_seconds=args.chatterbox_timeout_seconds,
             multi_speaker=not args.no_multi_speaker,
             speaker_reference_seconds=args.speaker_reference_seconds,
             separation=args.separation,
@@ -130,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dub.add_argument("--libretranslate-url", default="http://127.0.0.1:5000/translate")
     dub.add_argument("--libretranslate-api-key", default=None)
-    dub.add_argument("--tts", default="sapi", choices=["sapi", "piper", "xtts", "f5", "none"], help="TTS provider.")
+    dub.add_argument("--tts", default="sapi", choices=["sapi", "piper", "xtts", "f5", "chatterbox", "none"], help="TTS provider.")
     dub.add_argument("--voice", default=None, help="SAPI voice name.")
     dub.add_argument("--sapi-rate", type=int, default=0, help="SAPI rate from -10 to 10.")
     dub.add_argument("--sapi-volume", type=int, default=100, help="SAPI volume from 0 to 100.")
@@ -157,6 +164,13 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument("--f5-cross-fade-duration", type=float, default=0.15)
     dub.add_argument("--f5-remove-silence", action="store_true")
     dub.add_argument("--f5-timeout-seconds", type=int, default=1800)
+    dub.add_argument("--chatterbox-python", type=Path, default=Path(".venv-chatterbox") / "Scripts" / "python.exe")
+    dub.add_argument("--chatterbox-model", default="v3")
+    dub.add_argument("--chatterbox-device", default="auto", choices=["auto", "cpu", "cuda"])
+    dub.add_argument("--chatterbox-cache-dir", type=Path, default=Path("models/chatterbox"))
+    dub.add_argument("--chatterbox-exaggeration", type=float, default=0.5)
+    dub.add_argument("--chatterbox-cfg-weight", type=float, default=0.5)
+    dub.add_argument("--chatterbox-timeout-seconds", type=int, default=1800)
     dub.add_argument("--no-multi-speaker", action="store_true", help="Use one speaker reference for all segments.")
     dub.add_argument(
         "--speaker-reference-seconds",

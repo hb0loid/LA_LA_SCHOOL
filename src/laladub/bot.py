@@ -98,6 +98,7 @@ TARGET_LANGS = [
 TTS_METHODS = [
     ("f5", "F5 (быстрее)"),
     ("qwen3", "Qwen3 (медленнее)"),
+    ("chatterbox", "Chatterbox"),
 ]
 
 TELEGRAM_SAFE_VIDEO_BYTES = 45 * 1024 * 1024
@@ -141,6 +142,7 @@ def main() -> None:
         f"tts={settings.tts} "
         f"f5={settings.f5_model}/{settings.f5_device} "
         f"qwen3={settings.qwen3_model} "
+        f"chatterbox={settings.chatterbox_model}/{settings.chatterbox_device} "
         f"multi_speaker={settings.multi_speaker} "
         f"speaker_clustering={settings.speaker_clustering}/{settings.max_speaker_clusters} "
         f"separation={settings.separation} "
@@ -1101,9 +1103,10 @@ async def select_tts_method(update: Any, context: Any) -> None:
     if tts_provider is None:
         await query.edit_message_text("Неизвестный метод озвучки. Пришли видео ещё раз.")
         return
-    if _target_lang_value(job.get("target_lang")) == "uk" and tts_provider == "qwen3":
+    if _target_lang_value(job.get("target_lang")) == "uk" and tts_provider in {"qwen3", "chatterbox"}:
+        provider_label = _tts_method_label(tts_provider)
         await query.edit_message_text(
-            "Qwen3 не поддерживает украинскую озвучку. Выбери F5.",
+            f"{provider_label} не поддерживает украинскую озвучку. Выбери F5.",
             reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2, back_callback="back:target"),
         )
         return
@@ -1988,6 +1991,8 @@ def _tts_provider_value(value: Any) -> str | None:
         return "qwen3"
     if text in {"f5", "f5-tts", "f5tts"}:
         return "f5"
+    if text in {"chatterbox", "chatterbox-tts", "chatterboxtts"}:
+        return "chatterbox"
     return None
 
 
@@ -2169,7 +2174,14 @@ async def _process_job(
     target_lang = _target_lang_value(job.get("target_lang"))
     job["target_lang"] = target_lang
     tts_provider = _tts_provider_value(job.get("tts_provider")) or settings.tts
-    if target_lang == "uk" and tts_provider.lower() in {"qwen3", "qwen3-tts", "qwen3tts"}:
+    if target_lang == "uk" and tts_provider.lower() in {
+        "qwen3",
+        "qwen3-tts",
+        "qwen3tts",
+        "chatterbox",
+        "chatterbox-tts",
+        "chatterboxtts",
+    }:
         tts_provider = "f5"
     _save_job_snapshot(job_dir, job, status="running")
     progress: _ProgressState | None = progress_state
@@ -2212,6 +2224,13 @@ async def _process_job(
         qwen3_model=settings.qwen3_model,
         qwen3_cache_dir=settings.qwen3_cache_dir,
         qwen3_timeout_seconds=settings.qwen3_timeout_seconds,
+        chatterbox_python=settings.chatterbox_python,
+        chatterbox_model=settings.chatterbox_model,
+        chatterbox_device=settings.chatterbox_device,
+        chatterbox_cache_dir=settings.chatterbox_cache_dir,
+        chatterbox_exaggeration=settings.chatterbox_exaggeration,
+        chatterbox_cfg_weight=settings.chatterbox_cfg_weight,
+        chatterbox_timeout_seconds=settings.chatterbox_timeout_seconds,
         multi_speaker=settings.multi_speaker,
         speaker_reference_seconds=settings.speaker_reference_seconds,
         speaker_clustering=settings.speaker_clustering,

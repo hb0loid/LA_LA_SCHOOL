@@ -1,6 +1,7 @@
 .venv/
 .venv-f5tts/
 .venv-qwen3tts/
+.venv-chatterbox/
 .venv-separator/
 .secrets/
 paid_users.txt

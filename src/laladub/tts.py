@@ -129,6 +129,10 @@ def synthesize_segment(segment: Segment, output_path: Path, config: DubConfig) -
         synthesize_qwen3_batch([(1, segment, output_path)], config)
         return
 
+    if provider in {"chatterbox", "chatterbox-tts", "chatterboxtts"}:
+        _synthesize_chatterbox(segment, text, output_path, config)
+        return
+
     raise TTSError(f"Unknown TTS provider: {config.tts}")
 
 
@@ -556,6 +560,104 @@ def _resolve_qwen3_python(config: DubConfig) -> Path:
             "Qwen3-TTS Python was not found. Expected .venv-qwen3tts\\Scripts\\python.exe."
         )
     return python_path
+
+
+def _synthesize_chatterbox(segment: Segment, text: str, output_path: Path, config: DubConfig) -> None:
+    text = _sanitize_text_for_xtts(text)
+    if config.target_lang == "ru":
+        text = _apply_f5_pronunciation_dictionary(text)
+    if not text:
+        make_silence(output_path, max(0.15, segment.duration))
+        return
+
+    speaker_wav = segment.speaker_wav or config.speaker_wav
+    if not speaker_wav:
+        raise TTSError("Chatterbox needs a speaker reference WAV.")
+    if not speaker_wav.exists():
+        raise TTSError(f"Chatterbox speaker reference does not exist: {speaker_wav}")
+
+    chunks = _split_text_for_xtts(text, max_chars=260, max_words=40)
+    if len(chunks) > 1:
+        print(f"      Chatterbox split long segment into {len(chunks)} chunks")
+        chunk_paths: list[Path] = []
+        chunk_dir = output_path.parent / f"{output_path.stem}_chatterbox_chunks"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        for index, chunk in enumerate(chunks, start=1):
+            chunk_path = chunk_dir / f"{index:04d}.wav"
+            _chatterbox_to_file(chunk, chunk_path, speaker_wav, config)
+            chunk_paths.append(chunk_path)
+        concat_wavs(chunk_paths, output_path)
+    else:
+        _chatterbox_to_file(text, output_path, speaker_wav, config)
+
+    if not output_path.exists() or output_path.stat().st_size < 1024:
+        raise TTSError(f"Chatterbox produced an empty WAV file: {output_path}")
+
+
+def _chatterbox_to_file(text: str, output_path: Path, speaker_wav: Path, config: DubConfig) -> None:
+    python_path = _resolve_chatterbox_python(config)
+    runner_path = _repo_root() / "tools" / "chatterbox_tts_runner.py"
+    if not runner_path.exists():
+        raise TTSError(f"Chatterbox runner does not exist: {runner_path}")
+
+    command = [
+        str(python_path),
+        str(runner_path),
+        "--ref-audio",
+        str(speaker_wav),
+        "--text-base64",
+        base64.b64encode(text.encode("utf-8")).decode("ascii"),
+        "--output",
+        str(output_path),
+        "--language-id",
+        _chatterbox_language_id(config.target_lang),
+        "--model",
+        config.chatterbox_model,
+        "--device",
+        config.chatterbox_device,
+        "--cache-dir",
+        str(_resolve_repo_relative_path(config.chatterbox_cache_dir)),
+        "--exaggeration",
+        str(config.chatterbox_exaggeration),
+        "--cfg-weight",
+        str(config.chatterbox_cfg_weight),
+    ]
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("HF_HOME", str(_resolve_repo_relative_path(config.chatterbox_cache_dir)))
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=config.chatterbox_timeout_seconds,
+    )
+    message = _short_subprocess_output(result.stdout, result.stderr)
+    if message:
+        print(f"      Chatterbox runner: {message}")
+
+    if not output_path.exists() or output_path.stat().st_size < 1024:
+        raise TTSError(f"Chatterbox produced an empty WAV file: {output_path}")
+
+
+def _resolve_chatterbox_python(config: DubConfig) -> Path:
+    python_path = config.chatterbox_python or Path(".venv-chatterbox") / "Scripts" / "python.exe"
+    python_path = _resolve_repo_relative_path(python_path)
+    if not python_path.is_file():
+        raise TTSError(
+            "Chatterbox Python was not found. Expected .venv-chatterbox\\Scripts\\python.exe. "
+            "Create it with: python -m venv .venv-chatterbox"
+        )
+    return python_path
+
+
+def _chatterbox_language_id(target_lang: str) -> str:
+    return {
+        "ru": "ru",
+        "en": "en",
+    }.get((target_lang or "ru").lower(), "ru")
 
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:

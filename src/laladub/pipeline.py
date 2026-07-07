@@ -2485,7 +2485,17 @@ def _tts_fit_complete(segments: list[Segment], config: DubConfig) -> bool:
 
 
 def _needs_speaker_references(config: DubConfig) -> bool:
-    return config.tts.lower() in {"xtts", "f5", "f5tts", "qwen3", "qwen3-tts", "qwen3tts"}
+    return config.tts.lower() in {
+        "xtts",
+        "f5",
+        "f5tts",
+        "qwen3",
+        "qwen3-tts",
+        "qwen3tts",
+        "chatterbox",
+        "chatterbox-tts",
+        "chatterboxtts",
+    }
 
 
 def _assign_segment_speaker_refs(segments: list[Segment], reference_audio: Path, config: DubConfig) -> None:
