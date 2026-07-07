@@ -951,7 +951,7 @@ def _build_artifact_segments(
     artifact_config.initial_prompt = _artifact_initial_prompt(
         artifact_lang,
         same_language=ru_same_language_hunt,
-        seed_material=f"{config.workdir}|artifact|full",
+        seed_material=f"{_translation_seed_base(config)}|artifact|full",
     )
     artifact_config.hallucination_silence_threshold = None
     artifact_config.collapse_repetitions = True
@@ -1740,7 +1740,7 @@ def _harvest_chunked_forced_artifacts(
         chunk_config.initial_prompt = _artifact_initial_prompt(
             artifact_config.source_lang,
             same_language=same_language_ru,
-            seed_material=f"{config.workdir}|artifact|chunk|{index}",
+            seed_material=f"{_translation_seed_base(config)}|artifact|chunk|{index}",
         ) or artifact_config.initial_prompt
         chunk_path = chunk_dir / f"{index:04d}_{start:.2f}_{duration:.2f}.wav"
         try:
@@ -2018,6 +2018,10 @@ def _normalize_pivot_token(token: str, config: DubConfig) -> str | None:
     return token
 
 
+def _translation_seed_base(config: DubConfig) -> str:
+    return str(config.translation_seed or config.workdir)
+
+
 def _select_translation_distortion_chain(
     config: DubConfig,
     chains: list[list[str]],
@@ -2028,7 +2032,10 @@ def _select_translation_distortion_chain(
 ) -> list[str]:
     if len(chains) == 1:
         return chains[0]
-    seed_material = f"{config.workdir}|{segment_index}|{pass_index}|{text[:96]}|{config.translation_pivots}"
+    seed_material = (
+        f"{_translation_seed_base(config)}|{config.translation_chaos}|"
+        f"{segment_index}|{pass_index}|{text[:96]}|{config.translation_pivots}"
+    )
     seed = int.from_bytes(hashlib.sha256(seed_material.encode("utf-8", errors="ignore")).digest()[:8], "big")
     return random.Random(seed).choice(chains)
 
@@ -2037,7 +2044,10 @@ def _should_apply_translation_second_pass(config: DubConfig, segment_index: int,
     ratio = max(0.0, min(1.0, config.translation_second_pass_ratio))
     if ratio <= 0.0:
         return False
-    seed_material = f"{config.workdir}|second-pass|{segment_index}|{text[:96]}|{config.translation_pivots}"
+    seed_material = (
+        f"{_translation_seed_base(config)}|{config.translation_chaos}|"
+        f"second-pass|{segment_index}|{text[:96]}|{config.translation_pivots}"
+    )
     bucket = int.from_bytes(hashlib.sha256(seed_material.encode("utf-8", errors="ignore")).digest()[:8], "big")
     return (bucket / float(1 << 64)) < ratio
 

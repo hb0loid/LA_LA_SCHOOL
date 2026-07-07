@@ -95,6 +95,12 @@ TARGET_LANGS = [
     ("uk", "Украинский"),
     ("en", "Английский"),
 ]
+TRANSLATION_CHAOS_OPTIONS = [
+    ("normal", "Нормально"),
+    ("crooked", "Криво"),
+    ("nightmare", "Кошмарно"),
+    ("destroy", "Уничтожить"),
+]
 TTS_METHODS = [
     ("f5", "F5 (быстрее)"),
     ("qwen3", "Qwen3 (медленнее)"),
@@ -198,6 +204,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(select_asr_method, pattern=r"^asr:"))
     application.add_handler(CallbackQueryHandler(select_speaker_count, pattern=r"^spk:"))
     application.add_handler(CallbackQueryHandler(select_target_lang, pattern=r"^tgt:"))
+    application.add_handler(CallbackQueryHandler(select_translation_chaos, pattern=r"^chaos:"))
     application.add_handler(CallbackQueryHandler(select_tts_method, pattern=r"^tts:"))
     application.add_handler(CallbackQueryHandler(resume_callback, pattern=r"^resume:"))
     application.run_polling(allowed_updates=Update.ALL_TYPES)
@@ -885,6 +892,7 @@ async def _remember_job_and_ask_source(
         "input_path": str(input_path),
         "source_title": source_title,
         "input_source": input_source,
+        "translation_seed": job_dir.name,
     }
     if source_url:
         context.user_data["job"]["source_url"] = source_url
@@ -977,6 +985,18 @@ async def selection_back(update: Any, context: Any) -> None:
                 TARGET_LANGS,
                 columns=2,
                 back_callback="back:speakers",
+            ),
+        )
+        return
+    if destination == "chaos":
+        _save_job_snapshot(job_dir, job, status="select_translation_chaos")
+        await query.edit_message_text(
+            "Насколько кошмарным сделать перевод?",
+            reply_markup=_language_keyboard(
+                "chaos",
+                TRANSLATION_CHAOS_OPTIONS,
+                columns=2,
+                back_callback="back:target",
             ),
         )
         return
@@ -1087,10 +1107,32 @@ async def select_target_lang(update: Any, context: Any) -> None:
         return
 
     job["target_lang"] = target_lang
+    _save_job_snapshot(Path(job["job_dir"]), job, status="select_translation_chaos")
+    await query.edit_message_text(
+        "Насколько кошмарным сделать перевод?",
+        reply_markup=_language_keyboard("chaos", TRANSLATION_CHAOS_OPTIONS, columns=2, back_callback="back:target"),
+    )
+
+
+async def select_translation_chaos(update: Any, context: Any) -> None:
+    query = update.callback_query
+    await query.answer()
+    job = context.user_data.get("job")
+    if not job:
+        await query.edit_message_text("Нет активной задачи. Сначала пришли видео.")
+        return
+
+    chaos = _translation_chaos_value(query.data.split(":", 1)[1])
+    if chaos is None:
+        await query.edit_message_text("Неизвестный уровень перевода. Пришли видео ещё раз.")
+        return
+
+    job["translation_chaos"] = chaos
+    _ensure_translation_seed(job)
     _save_job_snapshot(Path(job["job_dir"]), job, status="select_tts")
     await query.edit_message_text(
         "Выбери метод озвучки.",
-        reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2, back_callback="back:target"),
+        reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2, back_callback="back:chaos"),
     )
 
 
@@ -1110,15 +1152,18 @@ async def select_tts_method(update: Any, context: Any) -> None:
         provider_label = _tts_method_label(tts_provider)
         await query.edit_message_text(
             f"{provider_label} не поддерживает украинскую озвучку. Выбери F5.",
-            reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2, back_callback="back:target"),
+            reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2, back_callback="back:chaos"),
         )
         return
 
     job["tts_provider"] = tts_provider
+    job["translation_chaos"] = _translation_chaos_value(job.get("translation_chaos")) or "crooked"
+    _ensure_translation_seed(job)
     _save_job_snapshot(Path(job["job_dir"]), job, status="queued")
     await query.edit_message_text(
         f"Ставлю задачу в очередь. Голоса: {_speaker_count_label(job.get('speaker_count'))}. "
         f"Язык озвучки: {_target_lang_label(job.get('target_lang'))}. "
+        f"Перевод: {_translation_chaos_label(job.get('translation_chaos'))}. "
         f"Движок: {_tts_method_label(tts_provider)}."
     )
     context.user_data.pop("job", None)
@@ -1129,6 +1174,8 @@ async def _enqueue_job(update: Any, context: Any, job: dict[str, Any], status_me
     scheduler: _JobScheduler = context.application.bot_data["job_scheduler"]
     settings: BotSettings = context.application.bot_data["settings"]
     job["target_lang"] = _target_lang_value(job.get("target_lang"))
+    job["translation_chaos"] = _translation_chaos_value(job.get("translation_chaos")) or "crooked"
+    _ensure_translation_seed(job)
     chat = update.effective_chat
     user = update.effective_user
     if chat is None:
@@ -1988,6 +2035,42 @@ def _target_lang_label(value: Any) -> str:
     return next((label for code, label in TARGET_LANGS if code == target_lang), target_lang)
 
 
+def _translation_chaos_value(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    aliases = {
+        "normal": "normal",
+        "clean": "normal",
+        "аккуратно": "normal",
+        "нормально": "normal",
+        "crooked": "crooked",
+        "current": "crooked",
+        "криво": "crooked",
+        "nightmare": "nightmare",
+        "кошмар": "nightmare",
+        "кошмарно": "nightmare",
+        "destroy": "destroy",
+        "full": "destroy",
+        "garbage": "destroy",
+        "уничтожить": "destroy",
+        "распад": "destroy",
+    }
+    return aliases.get(text)
+
+
+def _translation_chaos_label(value: Any) -> str:
+    chaos = _translation_chaos_value(value) or "crooked"
+    return next((label for code, label in TRANSLATION_CHAOS_OPTIONS if code == chaos), chaos)
+
+
+def _ensure_translation_seed(job: dict[str, Any]) -> str:
+    seed = str(job.get("translation_seed") or "").strip()
+    if not seed:
+        job_dir = str(job.get("job_dir") or "").strip()
+        seed = Path(job_dir).name if job_dir else "unknown"
+        job["translation_seed"] = seed
+    return seed
+
+
 def _tts_provider_value(value: Any) -> str | None:
     text = str(value or "").strip().lower()
     if text in {"qwen3", "qwen3-tts", "qwen3tts"}:
@@ -2035,6 +2118,50 @@ def _apply_speaker_count(config: DubConfig, job: dict[str, Any]) -> None:
     else:
         config.multi_speaker = True
         config.speaker_clustering = True
+
+
+def _apply_translation_chaos(config: DubConfig, job: dict[str, Any], settings: BotSettings) -> None:
+    chaos = _translation_chaos_value(job.get("translation_chaos")) or "crooked"
+    job["translation_chaos"] = chaos
+    config.translation_chaos = chaos
+    config.translation_seed = _ensure_translation_seed(job)
+
+    if chaos == "normal":
+        config.translation_pivots = "input,en|en,de|en,fr|en,es"
+        config.translation_second_pass_ratio = 0.12
+        config.artifact_ratio = min(config.artifact_ratio, 0.10)
+        config.artifact_max_segments = min(config.artifact_max_segments, 16)
+        return
+
+    if chaos == "crooked":
+        config.translation_pivots = settings.translation_pivots
+        config.translation_second_pass_ratio = settings.translation_second_pass_ratio
+        return
+
+    if chaos == "nightmare":
+        config.translation_pivots = (
+            f"{settings.translation_pivots}|"
+            "input,ja,ko,en|input,tr,ar,he,en|input,zh,ja,en|"
+            "en,de,fr,es,en|en,ja,ko,tr,en|en,ms,he,ar,en|"
+            "input,en,ja,ko,tr,ar,en"
+        )
+        config.translation_second_pass_ratio = max(settings.translation_second_pass_ratio, 0.70)
+        config.artifact_ratio = max(config.artifact_ratio, 0.30)
+        config.artifact_max_segments = max(config.artifact_max_segments, 64)
+        return
+
+    if chaos == "destroy":
+        config.translation_pivots = (
+            f"{settings.translation_pivots}|"
+            "input,ja,ko,tr,ar,he,ms,de,fr,es,en|"
+            "input,zh,ja,ko,id,ms,he,ar,tr,de,en|"
+            "en,ja,ko,zh,tr,ar,he,ms,de,fr,es,en|"
+            "input,en,de,fr,es,pt,it,pl,az,tr,ar,he,en|"
+            "input,th,zh,ja,ko,en,tr,ar,he,ms,en"
+        )
+        config.translation_second_pass_ratio = max(settings.translation_second_pass_ratio, 0.90)
+        config.artifact_ratio = max(config.artifact_ratio, 0.45)
+        config.artifact_max_segments = max(config.artifact_max_segments, 96)
 
 
 async def _progress_updater(message: Any, progress: _ProgressState, interval_seconds: float = 2.5) -> None:
@@ -2192,6 +2319,8 @@ async def _process_job(
         "cosy",
     }:
         tts_provider = "f5"
+    job["translation_chaos"] = _translation_chaos_value(job.get("translation_chaos")) or "crooked"
+    _ensure_translation_seed(job)
     _save_job_snapshot(job_dir, job, status="running")
     progress: _ProgressState | None = progress_state
     progress_task: asyncio.Task[Any] | None = None
@@ -2273,6 +2402,8 @@ async def _process_job(
         artifact_min_source_segments=settings.artifact_min_source_segments,
         artifact_min_gap_seconds=settings.artifact_min_gap_seconds,
         distort_translation=settings.distort_translation,
+        translation_chaos=_translation_chaos_value(job.get("translation_chaos")) or "crooked",
+        translation_seed=_ensure_translation_seed(job),
         translation_pivots=settings.translation_pivots,
         translation_second_pass_ratio=settings.translation_second_pass_ratio,
         collapse_repetitions=settings.collapse_repetitions,
@@ -2280,6 +2411,7 @@ async def _process_job(
         max_word_repeats=settings.max_word_repeats,
     )
     _apply_text_extraction_method(config, job, settings)
+    _apply_translation_chaos(config, job, settings)
     _apply_speaker_count(config, job)
 
     try:
@@ -2373,6 +2505,7 @@ async def _process_job(
                 f"цель={target_lang}, "
                 f"метод={_asr_method_label(job.get('asr_method') or settings.default_asr_method)}, "
                 f"голоса={_speaker_count_label(job.get('speaker_count'))}, "
+                f"перевод={_translation_chaos_label(job.get('translation_chaos'))}, "
                 f"TTS={_tts_method_label(tts_provider)}, "
                 f"ASR={config.asr_backend} {config.whisper_model}, "
                 f"pivot={config.input_pivot_lang or '-'}"

@@ -302,6 +302,8 @@ def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: P
         artifact_min_source_segments=settings.artifact_min_source_segments,
         artifact_min_gap_seconds=settings.artifact_min_gap_seconds,
         distort_translation=settings.distort_translation,
+        translation_chaos=translation_chaos_value(job.get("translation_chaos")) or "crooked",
+        translation_seed=ensure_translation_seed(job),
         translation_pivots=settings.translation_pivots,
         translation_second_pass_ratio=settings.translation_second_pass_ratio,
         collapse_repetitions=settings.collapse_repetitions,
@@ -309,6 +311,7 @@ def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: P
         max_word_repeats=settings.max_word_repeats,
     )
     apply_text_extraction_method(config, job, settings)
+    apply_translation_chaos(config, job, settings)
     apply_speaker_count(config, job)
     return config
 
@@ -333,6 +336,37 @@ def target_lang_value(value: Any) -> str:
     return text if text in {"ru", "uk", "en"} else "ru"
 
 
+def translation_chaos_value(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    aliases = {
+        "normal": "normal",
+        "clean": "normal",
+        "аккуратно": "normal",
+        "нормально": "normal",
+        "crooked": "crooked",
+        "current": "crooked",
+        "криво": "crooked",
+        "nightmare": "nightmare",
+        "кошмар": "nightmare",
+        "кошмарно": "nightmare",
+        "destroy": "destroy",
+        "full": "destroy",
+        "garbage": "destroy",
+        "уничтожить": "destroy",
+        "распад": "destroy",
+    }
+    return aliases.get(text)
+
+
+def ensure_translation_seed(job: dict[str, Any]) -> str:
+    seed = str(job.get("translation_seed") or "").strip()
+    if not seed:
+        job_dir = str(job.get("job_dir") or "").strip()
+        seed = Path(job_dir).name if job_dir else "unknown"
+        job["translation_seed"] = seed
+    return seed
+
+
 def apply_speaker_count(config: DubConfig, job: dict[str, Any]) -> None:
     count = speaker_count_value(job.get("speaker_count"))
     if count is None:
@@ -344,6 +378,50 @@ def apply_speaker_count(config: DubConfig, job: dict[str, Any]) -> None:
     else:
         config.multi_speaker = True
         config.speaker_clustering = True
+
+
+def apply_translation_chaos(config: DubConfig, job: dict[str, Any], settings: BotSettings) -> None:
+    chaos = translation_chaos_value(job.get("translation_chaos")) or "crooked"
+    job["translation_chaos"] = chaos
+    config.translation_chaos = chaos
+    config.translation_seed = ensure_translation_seed(job)
+
+    if chaos == "normal":
+        config.translation_pivots = "input,en|en,de|en,fr|en,es"
+        config.translation_second_pass_ratio = 0.12
+        config.artifact_ratio = min(config.artifact_ratio, 0.10)
+        config.artifact_max_segments = min(config.artifact_max_segments, 16)
+        return
+
+    if chaos == "crooked":
+        config.translation_pivots = settings.translation_pivots
+        config.translation_second_pass_ratio = settings.translation_second_pass_ratio
+        return
+
+    if chaos == "nightmare":
+        config.translation_pivots = (
+            f"{settings.translation_pivots}|"
+            "input,ja,ko,en|input,tr,ar,he,en|input,zh,ja,en|"
+            "en,de,fr,es,en|en,ja,ko,tr,en|en,ms,he,ar,en|"
+            "input,en,ja,ko,tr,ar,en"
+        )
+        config.translation_second_pass_ratio = max(settings.translation_second_pass_ratio, 0.70)
+        config.artifact_ratio = max(config.artifact_ratio, 0.30)
+        config.artifact_max_segments = max(config.artifact_max_segments, 64)
+        return
+
+    if chaos == "destroy":
+        config.translation_pivots = (
+            f"{settings.translation_pivots}|"
+            "input,ja,ko,tr,ar,he,ms,de,fr,es,en|"
+            "input,zh,ja,ko,id,ms,he,ar,tr,de,en|"
+            "en,ja,ko,zh,tr,ar,he,ms,de,fr,es,en|"
+            "input,en,de,fr,es,pt,it,pl,az,tr,ar,he,en|"
+            "input,th,zh,ja,ko,en,tr,ar,he,ms,en"
+        )
+        config.translation_second_pass_ratio = max(settings.translation_second_pass_ratio, 0.90)
+        config.artifact_ratio = max(config.artifact_ratio, 0.45)
+        config.artifact_max_segments = max(config.artifact_max_segments, 96)
 
 
 def apply_text_extraction_method(config: DubConfig, job: dict[str, Any], settings: BotSettings) -> None:

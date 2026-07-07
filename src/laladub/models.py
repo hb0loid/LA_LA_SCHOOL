@@ -55,6 +55,8 @@ class DubConfig:
     artifact_min_gap_seconds: float = 0.5
     distort_translation: bool = True
     distort_main_translation: bool = False
+    translation_chaos: str = "crooked"
+    translation_seed: str | None = None
     translation_pivots: str = "en,de"
     translation_second_pass_ratio: float = 0.0
     collapse_repetitions: bool = True
