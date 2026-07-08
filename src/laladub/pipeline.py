@@ -29,7 +29,12 @@ from .ffmpeg import (
 )
 from .glitch import apply_glitch_profile, clean_segments
 from .models import DubConfig, Segment
-from .quality import collapse_repetitions, collapse_repetitions_in_segments, is_repetitive_loop
+from .quality import (
+    clamp_obvious_word_repeats_in_segments,
+    collapse_repetitions,
+    collapse_repetitions_in_segments,
+    is_repetitive_loop,
+)
 from .separation import SeparationResult, separate_audio
 from .srt import read_srt, write_srt, write_txt
 from .translation import translate_segments, translate_text_chain
@@ -764,6 +769,14 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     if config.resume and not source_asr_changed and _file_ready(translated_srt_path, min_size=16):
         segments = read_srt(translated_srt_path, translated=True)
         print(f"      Resume: loaded translated segments={len(segments)}")
+        segments, repeat_clamp_changed = clamp_obvious_word_repeats_in_segments(
+            segments,
+            max_word_repeats=3,
+        )
+        if repeat_clamp_changed:
+            write_srt(translated_srt_path, segments, translated=True)
+            _save_resume_state(config, translated=True, segment_count=len(segments), repeat_clamp=True)
+            translation_changed = True
     else:
         segments = _translate_dub_segments(segments, config)
         write_srt(_debug_path(config, "translated_clean.srt"), segments, translated=True)
@@ -795,12 +808,20 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
             )
         segments = _fill_sparse_dub_segments(segments, config, source_audio, source_duration)
         segments = _fit_segment_text_budgets(segments, config)
+        segments, repeat_clamp_changed = clamp_obvious_word_repeats_in_segments(
+            segments,
+            max_word_repeats=3,
+        )
         write_srt(translated_srt_path, segments, translated=True)
         _save_resume_state(config, translated=True, segment_count=len(segments))
         translation_changed = True
     filled_segments = _fill_sparse_dub_segments(segments, config, source_audio, source_duration)
     if filled_segments is not segments:
         segments = _fit_segment_text_budgets(filled_segments, config)
+        segments, repeat_clamp_changed = clamp_obvious_word_repeats_in_segments(
+            segments,
+            max_word_repeats=3,
+        )
         write_srt(translated_srt_path, segments, translated=True)
         _save_resume_state(config, translated=True, segment_count=len(segments), sparse_fill=True)
         translation_changed = True

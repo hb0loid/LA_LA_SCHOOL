@@ -61,6 +61,53 @@ def collapse_repetitions_in_segments(
     return result
 
 
+def clamp_obvious_word_repeats_in_segments(
+    segments: list[Segment],
+    *,
+    max_word_repeats: int = 3,
+) -> tuple[list[Segment], int]:
+    changed = 0
+    for segment in segments:
+        if segment.translated_text is not None:
+            clamped = clamp_obvious_word_repeats(segment.translated_text, max_word_repeats=max_word_repeats)
+            if clamped != segment.translated_text:
+                segment.translated_text = clamped
+                changed += 1
+        else:
+            clamped = clamp_obvious_word_repeats(segment.text, max_word_repeats=max_word_repeats)
+            if clamped != segment.text:
+                segment.text = clamped
+                changed += 1
+    if changed:
+        print(f"      Obvious word repeat clamp: changed={changed}/{len(segments)}, max={max_word_repeats}")
+    return segments, changed
+
+
+def clamp_obvious_word_repeats(text: str, *, max_word_repeats: int = 3) -> str:
+    max_word_repeats = max(1, int(max_word_repeats))
+    if not text:
+        return text
+
+    pattern = re.compile(
+        r"\b(?P<word>[^\W_]+(?:['вЂ™-][^\W_]+)*)\b"
+        r"(?P<tail>(?:[\s,.;:!?вЂ¦гЂ‚пјЃпјџ-]+(?P=word)\b){"
+        + str(max_word_repeats)
+        + r",})",
+        re.IGNORECASE | re.UNICODE,
+    )
+
+    def replace(match: re.Match[str]) -> str:
+        word = match.group("word")
+        return " ".join([word] * max_word_repeats)
+
+    previous = None
+    current = text
+    while previous != current:
+        previous = current
+        current = pattern.sub(replace, current)
+    return current
+
+
 def is_repetitive_loop(
     segments: list[Segment],
     *,
