@@ -630,14 +630,25 @@ def _chatterbox_to_file(text: str, output_path: Path, speaker_wav: Path, config:
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("HF_HOME", str(_resolve_repo_relative_path(config.chatterbox_cache_dir)))
-    result = subprocess.run(
-        command,
-        check=True,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=config.chatterbox_timeout_seconds,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=config.chatterbox_timeout_seconds,
+        )
+    except subprocess.CalledProcessError as exc:
+        if _tts_output_ready(output_path):
+            details = _short_subprocess_output(exc.stdout, exc.stderr)
+            suffix = f": {details}" if details else ""
+            print(f"      Chatterbox runner returned {exc.returncode}, but WAV is ready; keeping output{suffix}")
+            return
+        details = _short_subprocess_output(exc.stdout, exc.stderr)
+        if details:
+            raise TTSError(f"Chatterbox runner failed: {details}") from exc
+        raise TTSError(f"Chatterbox runner failed with exit code {exc.returncode}.") from exc
     message = _short_subprocess_output(result.stdout, result.stderr)
     if message:
         print(f"      Chatterbox runner: {message}")
@@ -741,14 +752,25 @@ def _cosyvoice_to_file(
 
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
-    result = subprocess.run(
-        command,
-        check=True,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=config.cosyvoice_timeout_seconds,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=config.cosyvoice_timeout_seconds,
+        )
+    except subprocess.CalledProcessError as exc:
+        if _tts_output_ready(output_path):
+            details = _short_subprocess_output(exc.stdout, exc.stderr)
+            suffix = f": {details}" if details else ""
+            print(f"      CosyVoice runner returned {exc.returncode}, but WAV is ready; keeping output{suffix}")
+            return
+        details = _short_subprocess_output(exc.stdout, exc.stderr)
+        if details:
+            raise TTSError(f"CosyVoice runner failed: {details}") from exc
+        raise TTSError(f"CosyVoice runner failed with exit code {exc.returncode}.") from exc
     message = _short_subprocess_output(result.stdout, result.stderr)
     if message:
         print(f"      CosyVoice runner: {message}")
@@ -837,8 +859,12 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _short_subprocess_output(stdout: str, stderr: str) -> str:
-    combined = " ".join(part.strip() for part in (stdout, stderr) if part.strip())
+def _tts_output_ready(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size >= 1024
+
+
+def _short_subprocess_output(stdout: str | None, stderr: str | None) -> str:
+    combined = " ".join(part.strip() for part in (stdout, stderr) if part and part.strip())
     combined = re.sub(r"\s+", " ", combined)
     if len(combined) > 500:
         return combined[:497] + "..."
