@@ -102,10 +102,10 @@ TRANSLATION_CHAOS_OPTIONS = [
     ("destroy", "Уничтожить"),
 ]
 TTS_METHODS = [
-    ("f5", "F5 (быстрее)"),
-    ("qwen3", "Qwen3 (медленнее)"),
-    ("chatterbox", "Chatterbox"),
-    ("cosyvoice", "CosyVoice"),
+    ("cosyvoice", "CosyVoice (основной)"),
+    ("f5", "F5 (устаревший)"),
+    ("qwen3", "Qwen3 (экспериментальный)"),
+    ("chatterbox", "Chatterbox (экспериментальный)"),
 ]
 
 TELEGRAM_SAFE_VIDEO_BYTES = 45 * 1024 * 1024

@@ -203,7 +203,7 @@ function Configure-ModelCaches {
 }
 
 if (-not $env:LALADUB_TRANSLATOR) { $env:LALADUB_TRANSLATOR = "hybrid" }
-if (-not $env:LALADUB_TTS) { $env:LALADUB_TTS = "f5" }
+if (-not $env:LALADUB_TTS) { $env:LALADUB_TTS = "cosyvoice" }
 if (-not $env:LALADUB_F5_PYTHON) { $env:LALADUB_F5_PYTHON = (Join-Path $Root ".venv-f5tts\Scripts\python.exe") }
 if (-not $env:LALADUB_F5_MODEL) { $env:LALADUB_F5_MODEL = "F5TTS_v1_Base" }
 if (-not $env:LALADUB_F5_HF_REPO) { $env:LALADUB_F5_HF_REPO = "Misha24-10/F5-TTS_RUSSIAN" }
