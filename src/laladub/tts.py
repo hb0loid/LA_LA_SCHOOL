@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from collections import deque
 import contextlib
+from copy import copy
 import gc
 import json
 import os
@@ -130,14 +131,43 @@ def synthesize_segment(segment: Segment, output_path: Path, config: DubConfig) -
         return
 
     if provider in {"chatterbox", "chatterbox-tts", "chatterboxtts"}:
-        _synthesize_chatterbox(segment, text, output_path, config)
+        try:
+            _synthesize_chatterbox(segment, text, output_path, config)
+        except Exception as exc:
+            _fallback_segment_to_f5(segment, text, output_path, config, "Chatterbox", exc)
         return
 
     if provider in {"cosyvoice", "cosyvoice-tts", "cosyvoicetts", "cosy"}:
-        _synthesize_cosyvoice(segment, text, output_path, config)
+        try:
+            _synthesize_cosyvoice(segment, text, output_path, config)
+        except Exception as exc:
+            _fallback_segment_to_f5(segment, text, output_path, config, "CosyVoice", exc)
         return
 
     raise TTSError(f"Unknown TTS provider: {config.tts}")
+
+
+def _fallback_segment_to_f5(
+    segment: Segment,
+    text: str,
+    output_path: Path,
+    config: DubConfig,
+    provider_label: str,
+    error: Exception,
+) -> None:
+    if _tts_output_ready(output_path):
+        print(f"      {provider_label} segment failed after WAV was created; keeping output: {type(error).__name__}: {error}")
+        return
+    print(f"      {provider_label} segment fallback to F5: {type(error).__name__}: {error}")
+    output_path.unlink(missing_ok=True)
+    fallback_config = copy(config)
+    fallback_config.tts = "f5"
+    try:
+        _synthesize_f5tts(segment, text, output_path, fallback_config)
+    except Exception as f5_exc:
+        print(f"      F5 fallback failed; using silence: {type(f5_exc).__name__}: {f5_exc}")
+        output_path.unlink(missing_ok=True)
+        make_silence(output_path, max(0.15, segment.duration))
 
 
 def synthesize_qwen3_batch(
@@ -527,6 +557,8 @@ def _f5_to_file_subprocess(
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
         timeout=config.f5_timeout_seconds,
     )
@@ -636,6 +668,8 @@ def _chatterbox_to_file(text: str, output_path: Path, speaker_wav: Path, config:
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=env,
             timeout=config.chatterbox_timeout_seconds,
         )
@@ -758,6 +792,8 @@ def _cosyvoice_to_file(
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=env,
             timeout=config.cosyvoice_timeout_seconds,
         )
@@ -867,8 +903,16 @@ def _short_subprocess_output(stdout: str | None, stderr: str | None) -> str:
     combined = " ".join(part.strip() for part in (stdout, stderr) if part and part.strip())
     combined = re.sub(r"\s+", " ", combined)
     if len(combined) > 500:
-        return combined[:497] + "..."
-    return combined
+        combined = "..." + combined[-497:]
+    return _console_safe_text(combined)
+
+
+def _console_safe_text(text: str) -> str:
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        return text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+    except Exception:
+        return text.encode("utf-8", errors="backslashreplace").decode("utf-8", errors="replace")
 
 
 def _synthesize_xtts(segment: Segment, text: str, output_path: Path, config: DubConfig) -> None:
