@@ -88,6 +88,8 @@ def clamp_obvious_word_repeats(text: str, *, max_word_repeats: int = 3) -> str:
     if not text:
         return text
 
+    text = _clamp_obvious_phrase_repeats(text, max_phrase_repeats=max_word_repeats)
+
     pattern = re.compile(
         r"\b(?P<word>[^\W_]+(?:['вЂ™-][^\W_]+)*)\b"
         r"(?P<tail>(?:[\s,.;:!?вЂ¦гЂ‚пјЃпјџ-]+(?P=word)\b){"
@@ -105,6 +107,30 @@ def clamp_obvious_word_repeats(text: str, *, max_word_repeats: int = 3) -> str:
     while previous != current:
         previous = current
         current = pattern.sub(replace, current)
+    return current
+
+
+def _clamp_obvious_phrase_repeats(text: str, *, max_phrase_repeats: int = 3) -> str:
+    max_phrase_repeats = max(1, int(max_phrase_repeats))
+    word = r"[^\W_]+(?:['вЂ™-][^\W_]+)*"
+    separator = r"[\s,.;:!?вЂ¦гЂ‚пјЃпјџ-]+"
+    current = text
+
+    for phrase_words in range(4, 1, -1):
+        phrase = rf"\b{word}\b" + (rf"(?:\s+\b{word}\b)" * (phrase_words - 1))
+        pattern = re.compile(
+            rf"(?P<phrase>{phrase})(?P<tail>(?:{separator}(?P=phrase)\b){{{max_phrase_repeats},}})",
+            re.IGNORECASE | re.UNICODE,
+        )
+
+        def replace(match: re.Match[str]) -> str:
+            return " ".join([match.group("phrase")] * max_phrase_repeats)
+
+        previous = None
+        while previous != current:
+            previous = current
+            current = pattern.sub(replace, current)
+
     return current
 
 
