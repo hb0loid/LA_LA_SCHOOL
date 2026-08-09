@@ -1,18 +1,35 @@
+param(
+  [ValidateRange(0, 300)]
+  [int]$StartupDelaySeconds = 0
+)
+
 $ErrorActionPreference = "Stop"
 
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$OutLog = Join-Path $Root "bot.release.out.log"
-$ErrLog = Join-Path $Root "bot.release.err.log"
-$PidFile = Join-Path $Root "bot.release.pid"
-$WatchdogScript = Join-Path $Root "Run-Bot-Watchdog.ps1"
+$Root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
+$RuntimeDir = Join-Path $Root "work\runtime"
+$LogDir = Join-Path $Root "logs"
+$OutLog = Join-Path $LogDir "bot.out.log"
+$ErrLog = Join-Path $LogDir "bot.err.log"
+$PidFile = Join-Path $RuntimeDir "bot.pid"
+$WatchdogScript = Join-Path $PSScriptRoot "Watchdog.ps1"
 $TokenFile = Join-Path $Root ".secrets\Release-Bot-Token.ps1"
 $WorkerTokenFile = Join-Path $Root ".secrets\Worker-Api-Token.txt"
 $WorkDir = Join-Path $Root "runs\bot-release"
 
 Set-Location -LiteralPath $Root
-New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+New-Item -ItemType Directory -Force -Path $WorkDir,$RuntimeDir,$LogDir | Out-Null
 if (-not (Test-Path -LiteralPath $OutLog)) { New-Item -ItemType File -Path $OutLog | Out-Null }
 if (-not (Test-Path -LiteralPath $ErrLog)) { New-Item -ItemType File -Path $ErrLog | Out-Null }
+
+$startMutex = [Threading.Mutex]::new($false, "Local\LaLaDubReleaseStart")
+$hasStartMutex = $false
+try {
+  $hasStartMutex = $startMutex.WaitOne([TimeSpan]::FromSeconds(15))
+  if (-not $hasStartMutex) { throw "Another bot start or stop operation is still running." }
+
+  if ($StartupDelaySeconds -gt 0) {
+    Start-Sleep -Seconds $StartupDelaySeconds
+  }
 
 if (Test-Path -LiteralPath $PidFile) {
   $existingPid = Get-Content -LiteralPath $PidFile -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -20,7 +37,7 @@ if (Test-Path -LiteralPath $PidFile) {
     $existingProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $existingPid" -ErrorAction SilentlyContinue
     if ($existingProcess) {
       if (
-        $existingProcess.CommandLine -like "*Run-Bot-Watchdog.ps1*" -and
+        $existingProcess.CommandLine -like "*tools\runtime\Watchdog.ps1*" -and
         $existingProcess.CommandLine -like "*-Instance release*" -and
         $existingProcess.CommandLine -like "*$Root*"
       ) {
@@ -43,7 +60,7 @@ if (Test-Path -LiteralPath $PidFile) {
 
 $existingWatchdog = Get-CimInstance Win32_Process |
   Where-Object {
-    $_.CommandLine -like "*Run-Bot-Watchdog.ps1*" -and
+    $_.CommandLine -like "*tools\runtime\Watchdog.ps1*" -and
     $_.CommandLine -like "*-Instance release*" -and
     $_.CommandLine -like "*$Root*"
   } |
@@ -52,6 +69,13 @@ if ($existingWatchdog) {
   Set-Content -LiteralPath $PidFile -Value $existingWatchdog.ProcessId
   Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Release watchdog is already running, pid=$($existingWatchdog.ProcessId)" -ErrorAction SilentlyContinue
   exit 0
+}
+
+foreach ($logPath in @($OutLog, $ErrLog)) {
+  $logItem = Get-Item -LiteralPath $logPath -ErrorAction SilentlyContinue
+  if ($logItem -and $logItem.Length -gt 25MB) {
+    Clear-Content -LiteralPath $logPath
+  }
 }
 
 if (-not (Test-Path -LiteralPath $TokenFile)) {
@@ -152,6 +176,7 @@ $env:LALADUB_WORKER_API_TOKEN = $workerToken
 $env:LALADUB_WORKER_PACKAGE_PATH = (Join-Path $Root "dist\LaLaDubWorker-update.zip")
 $env:LALADUB_WORKER_PACKAGE_MANIFEST = (Join-Path $Root "dist\LaLaDubWorker-update.manifest.json")
 $env:LALADUB_DOWNLOAD_CACHE_DIR = (Join-Path $Root "runs\cache\downloads")
+$env:LALADUB_YTDLP_BROWSER_COOKIES = "firefox"
 $env:LALADUB_MEDIA_CACHE_DIR = (Join-Path $Root "runs\cache\media")
 $env:LALADUB_JOB_RETENTION_SECONDS = "2592000"
 $env:LALADUB_CLEANUP_INTERVAL_SECONDS = "3600"
@@ -209,9 +234,15 @@ $env:LALADUB_COSYVOICE_SPEED = "1.0"
 $env:LALADUB_COSYVOICE_TIMEOUT_SECONDS = "1800"
 $env:LALADUB_MULTI_SPEAKER = "1"
 $env:LALADUB_SPEAKER_REFERENCE_SECONDS = "5.0"
-$env:LALADUB_SPEAKER_CLUSTERING = "0"
-$env:LALADUB_MAX_SPEAKER_CLUSTERS = "6"
+$env:LALADUB_SPEAKER_CLUSTERING = "1"
+$env:LALADUB_MAX_SPEAKER_CLUSTERS = "9"
 $env:LALADUB_SPEAKER_CLUSTER_THRESHOLD = "0.08"
+$env:LALADUB_DIARIZATION_PYTHON = (Join-Path $Root ".venv-diarization\Scripts\python.exe")
+$env:LALADUB_DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
+$env:LALADUB_DIARIZATION_DEVICE = "auto"
+$env:LALADUB_DIARIZATION_CACHE_DIR = (Join-Path $Root "models\diarization")
+$env:LALADUB_DIARIZATION_TOKEN_FILE = (Join-Path $Root ".secrets\HuggingFace-Token.txt")
+$env:LALADUB_DIARIZATION_TIMEOUT_SECONDS = "1800"
 $env:LALADUB_SEPARATION = "demucs"
 $env:LALADUB_SEPARATION_DEVICE = "cpu"
 $env:LALADUB_AUDIO_BED = "instrumental"
@@ -266,3 +297,7 @@ $process = Start-Process `
 
 Set-Content -LiteralPath $PidFile -Value $process.Id
 Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Started release watchdog pid=$($process.Id)" -ErrorAction SilentlyContinue
+} finally {
+  if ($hasStartMutex) { $startMutex.ReleaseMutex() }
+  $startMutex.Dispose()
+}

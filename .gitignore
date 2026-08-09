@@ -4,6 +4,7 @@
 .venv-chatterbox/
 .venv-cosyvoice/
 .venv-separator/
+.venv-diarization/
 .secrets/
 paid_users.txt
 admins.txt
@@ -20,6 +21,8 @@ build/
 *.egg-info/
 runs/
 models/
+work/
+restore_notes/
 *.mp4
 *.mkv
 *.mov

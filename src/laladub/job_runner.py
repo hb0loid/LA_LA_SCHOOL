@@ -283,6 +283,12 @@ def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: P
         speaker_clustering=settings.speaker_clustering,
         max_speaker_clusters=settings.max_speaker_clusters,
         speaker_cluster_threshold=settings.speaker_cluster_threshold,
+        diarization_python=settings.diarization_python,
+        diarization_model=settings.diarization_model,
+        diarization_device=settings.diarization_device,
+        diarization_cache_dir=settings.diarization_cache_dir,
+        diarization_token_file=settings.diarization_token_file,
+        diarization_timeout_seconds=settings.diarization_timeout_seconds,
         separation=settings.separation,
         separation_device=settings.separation_device,
         demucs_model=settings.demucs_model,
@@ -309,6 +315,7 @@ def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: P
         collapse_repetitions=settings.collapse_repetitions,
         max_phrase_repeats=settings.max_phrase_repeats,
         max_word_repeats=settings.max_word_repeats,
+        censor_percent=int(job.get("censor_percent") or 0),
     )
     apply_text_extraction_method(config, job, settings)
     apply_translation_chaos(config, job, settings)
@@ -369,6 +376,7 @@ def ensure_translation_seed(job: dict[str, Any]) -> str:
 
 def apply_speaker_count(config: DubConfig, job: dict[str, Any]) -> None:
     count = speaker_count_value(job.get("speaker_count"))
+    config.speaker_count_exact = count
     if count is None:
         return
     config.max_speaker_clusters = count
@@ -385,6 +393,18 @@ def apply_translation_chaos(config: DubConfig, job: dict[str, Any], settings: Bo
     job["translation_chaos"] = chaos
     config.translation_chaos = chaos
     config.translation_seed = ensure_translation_seed(job)
+
+    if config.content_chaos_backbone:
+        config.translation_chaos = "destroy"
+        config.translation_pivots = (
+            f"{settings.translation_pivots}|"
+            "input,ja,ko,tr,ar,en|input,zh,ja,ko,en|"
+            "en,ja,ko,tr,en|en,ms,he,en"
+        )
+        config.translation_second_pass_ratio = max(settings.translation_second_pass_ratio, 0.72)
+        config.artifact_ratio = 0.20
+        config.artifact_max_segments = max(config.artifact_max_segments, 64)
+        return
 
     if chaos == "normal":
         config.translation_pivots = "input,en|en,de|en,fr|en,es"
@@ -413,13 +433,11 @@ def apply_translation_chaos(config: DubConfig, job: dict[str, Any], settings: Bo
     if chaos == "destroy":
         config.translation_pivots = (
             f"{settings.translation_pivots}|"
-            "input,ja,ko,tr,ar,he,ms,de,fr,es,en|"
-            "input,zh,ja,ko,id,ms,he,ar,tr,de,en|"
-            "en,ja,ko,zh,tr,ar,he,ms,de,fr,es,en|"
-            "input,en,de,fr,es,pt,it,pl,az,tr,ar,he,en|"
-            "input,th,zh,ja,ko,en,tr,ar,he,ms,en"
+            "input,ja,ko,tr,ar,en|"
+            "input,zh,ja,ko,en|"
+            "en,ja,ko,tr,en"
         )
-        config.translation_second_pass_ratio = max(settings.translation_second_pass_ratio, 0.90)
+        config.translation_second_pass_ratio = max(settings.translation_second_pass_ratio, 0.55)
         config.artifact_ratio = max(config.artifact_ratio, 0.45)
         config.artifact_max_segments = max(config.artifact_max_segments, 96)
 
@@ -453,10 +471,12 @@ def apply_text_extraction_method(config: DubConfig, job: dict[str, Any], setting
     config.suppress_plain_ascii_tokens = False
     config.asr_retry_on_repetition = not forced
     config.asr_fallback_on_sparse = False
+    config.reference_timing_asr = False
     config.artifact_source_lang = None
     config.input_pivot_lang = None
     config.inject_artifacts = False
     config.artifact_chaos_mode = False
+    config.content_chaos_backbone = False
     config.distort_main_translation = False
     config.glitch_profile = "faithful" if forced else "clean"
 
@@ -483,16 +503,30 @@ def apply_text_extraction_method(config: DubConfig, job: dict[str, Any], setting
         config.glitch_profile = "faithful"
         config.collapse_repetitions = False
         config.distort_main_translation = True
+    elif chaos_backbone and selected_source:
+        config.source_lang = selected_source
+        config.force_source_language = True
+        config.asr_retry_on_repetition = False
+        config.asr_fallback_on_sparse = True
+        config.reference_timing_asr = True
+        config.input_pivot_lang = selected_source
+        config.artifact_source_lang = selected_source
+        config.inject_artifacts = True
+        config.artifact_chaos_mode = True
+        config.content_chaos_backbone = True
+        config.glitch_profile = "faithful"
+        config.collapse_repetitions = True
+        config.distort_main_translation = True
     elif chaos_backbone:
         config.source_lang = None
         config.force_source_language = False
         config.asr_retry_on_repetition = True
         config.asr_fallback_on_sparse = False
-        config.input_pivot_lang = selected_source
-        config.artifact_source_lang = selected_source
-        config.inject_artifacts = bool(settings.inject_artifacts and selected_source)
-        config.artifact_chaos_mode = True
-        config.artifact_max_segments = max(settings.artifact_max_segments, 48)
+        config.reference_timing_asr = False
+        config.input_pivot_lang = None
+        config.artifact_source_lang = None
+        config.inject_artifacts = False
+        config.artifact_chaos_mode = False
         config.glitch_profile = "clean"
         config.distort_main_translation = True
     elif hunt_artifacts:

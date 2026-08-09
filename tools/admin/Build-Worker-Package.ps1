@@ -11,7 +11,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
 $DistDir = Join-Path $Root "dist"
 $PortableDir = Join-Path $DistDir "LaLaDubWorker"
 $PortableZip = Join-Path $DistDir "LaLaDubWorker.zip"
@@ -85,13 +85,18 @@ function Reset-Dir($Path) {
 
 function Copy-CoreFiles($StageDir, [bool]$IncludeExampleConfig) {
   $files = @(
-    "Start-Worker.cmd",
-    "Start-Worker.ps1",
     "README.md",
     "pyproject.toml"
   )
   foreach ($file in $files) {
     $source = Join-Path $Root $file
+    if (Test-Path -LiteralPath $source) {
+      Copy-Item -LiteralPath $source -Destination (Join-Path $StageDir $file) -Force
+    }
+  }
+
+  foreach ($file in @("Start-Worker.cmd", "Start-Worker.ps1", "Start-Worker-Hidden.vbs", "Install-Worker-Autostart.ps1")) {
+    $source = Join-Path $Root "tools\worker\$file"
     if (Test-Path -LiteralPath $source) {
       Copy-Item -LiteralPath $source -Destination (Join-Path $StageDir $file) -Force
     }

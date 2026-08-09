@@ -6,9 +6,52 @@ $VersionPath = Join-Path $Root "worker_version.json"
 $StatePath = Join-Path $Root ".worker_state.json"
 $UpdatesDir = Join-Path $Root "updates"
 $WorkDir = Join-Path $Root "runs\worker"
+$LockPath = Join-Path $Root ".worker.lock"
 
 Set-Location -LiteralPath $Root
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+
+try {
+  $WorkerLock = [IO.File]::Open($LockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+} catch [IO.IOException] {
+  exit 0
+}
+
+function Install-WorkerAutostart {
+  $hiddenLauncher = Join-Path $Root "Start-Worker-Hidden.vbs"
+  if (-not (Test-Path -LiteralPath $hiddenLauncher)) { return }
+  try {
+    $taskName = "LaLaDub Worker Autostart"
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$hiddenLauncher`"" -WorkingDirectory $Root
+    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+    $logonTrigger.Delay = "PT30S"
+    $healthTrigger = New-ScheduledTaskTrigger `
+      -Once `
+      -At ((Get-Date).AddMinutes(1)) `
+      -RepetitionInterval (New-TimeSpan -Minutes 5) `
+      -RepetitionDuration (New-TimeSpan -Days 3650)
+    $settings = New-ScheduledTaskSettingsSet `
+      -MultipleInstances IgnoreNew `
+      -StartWhenAvailable `
+      -DontStopIfGoingOnBatteries `
+      -AllowStartIfOnBatteries `
+      -ExecutionTimeLimit ([TimeSpan]::Zero)
+    $settings.Hidden = $true
+    Register-ScheduledTask `
+      -TaskName $taskName `
+      -Description "Starts the LaLaDub laptop worker and checks it every five minutes." `
+      -Action $action `
+      -Trigger @($logonTrigger, $healthTrigger) `
+      -Settings $settings `
+      -User $user `
+      -Force | Out-Null
+  } catch {
+    Write-Warning "Could not install worker autostart: $($_.Exception.Message)"
+  }
+}
+
+Install-WorkerAutostart
 
 function Read-WorkerConfig {
   if (-not (Test-Path -LiteralPath $ConfigPath)) {
@@ -220,9 +263,15 @@ if (-not $env:LALADUB_F5_REMOVE_SILENCE) { $env:LALADUB_F5_REMOVE_SILENCE = "0" 
 if (-not $env:LALADUB_F5_TIMEOUT_SECONDS) { $env:LALADUB_F5_TIMEOUT_SECONDS = "1800" }
 if (-not $env:LALADUB_MULTI_SPEAKER) { $env:LALADUB_MULTI_SPEAKER = "1" }
 if (-not $env:LALADUB_SPEAKER_REFERENCE_SECONDS) { $env:LALADUB_SPEAKER_REFERENCE_SECONDS = "5.0" }
-if (-not $env:LALADUB_SPEAKER_CLUSTERING) { $env:LALADUB_SPEAKER_CLUSTERING = "0" }
-if (-not $env:LALADUB_MAX_SPEAKER_CLUSTERS) { $env:LALADUB_MAX_SPEAKER_CLUSTERS = "6" }
+if (-not $env:LALADUB_SPEAKER_CLUSTERING) { $env:LALADUB_SPEAKER_CLUSTERING = "1" }
+if (-not $env:LALADUB_MAX_SPEAKER_CLUSTERS) { $env:LALADUB_MAX_SPEAKER_CLUSTERS = "9" }
 if (-not $env:LALADUB_SPEAKER_CLUSTER_THRESHOLD) { $env:LALADUB_SPEAKER_CLUSTER_THRESHOLD = "0.08" }
+if (-not $env:LALADUB_DIARIZATION_PYTHON) { $env:LALADUB_DIARIZATION_PYTHON = (Join-Path $Root ".venv-diarization\Scripts\python.exe") }
+if (-not $env:LALADUB_DIARIZATION_MODEL) { $env:LALADUB_DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1" }
+if (-not $env:LALADUB_DIARIZATION_DEVICE) { $env:LALADUB_DIARIZATION_DEVICE = "auto" }
+if (-not $env:LALADUB_DIARIZATION_CACHE_DIR) { $env:LALADUB_DIARIZATION_CACHE_DIR = (Join-Path $Root "models\diarization") }
+if (-not $env:LALADUB_DIARIZATION_TOKEN_FILE) { $env:LALADUB_DIARIZATION_TOKEN_FILE = (Join-Path $Root ".secrets\HuggingFace-Token.txt") }
+if (-not $env:LALADUB_DIARIZATION_TIMEOUT_SECONDS) { $env:LALADUB_DIARIZATION_TIMEOUT_SECONDS = "1800" }
 if (-not $env:LALADUB_SEPARATION) { $env:LALADUB_SEPARATION = "demucs" }
 if (-not $env:LALADUB_SEPARATION_DEVICE) { $env:LALADUB_SEPARATION_DEVICE = "cpu" }
 if (-not $env:LALADUB_AUDIO_BED) { $env:LALADUB_AUDIO_BED = "instrumental" }

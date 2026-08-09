@@ -53,12 +53,14 @@ def add_image_watermark(
     filter_value = (
         "[0:v]setpts=PTS-STARTPTS,"
         "scale=trunc(iw/2)*2:trunc(ih/2)*2,"
+        "fps=30,"
         "format=yuv420p,"
         "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709[base];"
-        f"[1:v]format=rgba,scale={width}:-1,colorchannelmixer=aa={alpha:.2f}[wm];"
+        f"[1:v]setpts=PTS-STARTPTS,format=rgba,scale={width}:-1,"
+        f"colorchannelmixer=aa={alpha:.2f}[wm];"
         f"[base][wm]overlay="
         f"x=W-w-{margin}:y=H-h-{margin}:"
-        "eval=init:shortest=0:repeatlast=1:eof_action=repeat:"
+        "eval=init:shortest=1:repeatlast=1:eof_action=repeat:"
         "format=auto,format=yuv420p[v]"
     )
     duration_args: list[str] = []

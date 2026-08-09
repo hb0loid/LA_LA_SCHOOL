@@ -8,6 +8,7 @@ import json
 import multiprocessing
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -95,12 +96,6 @@ TARGET_LANGS = [
     ("uk", "Украинский"),
     ("en", "Английский"),
 ]
-TRANSLATION_CHAOS_OPTIONS = [
-    ("normal", "Нормально"),
-    ("crooked", "Криво"),
-    ("nightmare", "Кошмарно"),
-    ("destroy", "Уничтожить"),
-]
 TTS_METHODS = [
     ("cosyvoice", "CosyVoice (основной)"),
     ("f5", "F5 (устаревший)"),
@@ -113,6 +108,8 @@ TELEGRAM_DIRECT_DOWNLOAD_SAFE_BYTES = 20 * 1024 * 1024
 RECOVERABLE_JOB_STATUSES = {"starting", "running", "queued", "ready"}
 CLEANUP_JOB_STATUSES = {"done", "failed", "rejected"}
 _LAST_STATUS_TEXT: dict[tuple[int | None, int | None], str] = {}
+_TELEGRAM_EDIT_BACKOFF_UNTIL = 0.0
+_TELEGRAM_EDIT_BACKOFF_LOGGED_UNTIL = 0.0
 MAINTENANCE_MESSAGE = (
     "Сейчас ведутся технические работы над ботом. "
     "Попробуй снова немного позже."
@@ -153,6 +150,7 @@ def main() -> None:
         f"cosyvoice={settings.cosyvoice_model_id}/{settings.cosyvoice_device}/{settings.cosyvoice_mode} "
         f"multi_speaker={settings.multi_speaker} "
         f"speaker_clustering={settings.speaker_clustering}/{settings.max_speaker_clusters} "
+        f"diarization={settings.diarization_model}/{settings.diarization_device} "
         f"separation={settings.separation} "
         f"audio_bed={settings.audio_bed} "
         f"watermark={settings.watermark_image} "
@@ -187,12 +185,14 @@ def main() -> None:
     application = Application.builder().token(settings.token).post_init(_setup_bot_commands).build()
     application.bot_data["settings"] = settings
     application.bot_data["job_scheduler"] = _JobScheduler(settings)
+    application.add_error_handler(_telegram_error_handler)
     application.add_handler(MessageHandler(filters.ALL, maintenance_message_gate), group=-1)
     application.add_handler(CallbackQueryHandler(maintenance_callback_gate), group=-1)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("me", me))
     application.add_handler(CommandHandler("queue", queue_status))
     application.add_handler(CommandHandler("resume", resume))
+    application.add_handler(CommandHandler("censored", censored))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("maintenance", maintenance))
     application.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_video))
@@ -204,10 +204,126 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(select_asr_method, pattern=r"^asr:"))
     application.add_handler(CallbackQueryHandler(select_speaker_count, pattern=r"^spk:"))
     application.add_handler(CallbackQueryHandler(select_target_lang, pattern=r"^tgt:"))
-    application.add_handler(CallbackQueryHandler(select_translation_chaos, pattern=r"^chaos:"))
     application.add_handler(CallbackQueryHandler(select_tts_method, pattern=r"^tts:"))
     application.add_handler(CallbackQueryHandler(resume_callback, pattern=r"^resume:"))
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+
+
+def _pipeline_process_entry(
+    operation: str,
+    input_path: str,
+    config: DubConfig,
+    result_connection: Any,
+    progress_connection: Any,
+) -> None:
+    def report(stage: str, current: int | None, total: int | None, detail: str | None) -> None:
+        progress_connection.send((stage, current, total, detail))
+
+    config.progress_callback = report
+    try:
+        if operation == "dub":
+            result = run_dub(Path(input_path), config)
+            result_connection.send({"ok": True, "paths": [str(result)]})
+        elif operation == "transcript":
+            srt_path, txt_path = run_transcript(Path(input_path), config)
+            result_connection.send({"ok": True, "paths": [str(srt_path), str(txt_path)]})
+        else:
+            raise ValueError(f"Unknown pipeline operation: {operation}")
+    except BaseException:
+        result_connection.send({"ok": False, "error": traceback.format_exc()})
+    finally:
+        result_connection.close()
+        progress_connection.close()
+
+
+def _terminate_pipeline_process(process: multiprocessing.Process) -> None:
+    if process.pid is None:
+        return
+    if sys.platform == "win32":
+        # A venv Python launcher can create another Python process. Terminating only
+        # the launcher leaves the expensive pipeline running as an orphan.
+        subprocess.run(
+            ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    elif process.is_alive():
+        process.terminate()
+
+
+async def _run_pipeline_isolated(
+    operation: str,
+    input_path: Path,
+    config: DubConfig,
+    progress: _ProgressState,
+) -> list[Path]:
+    config.progress_callback = None
+    process_context = multiprocessing.get_context("spawn")
+    result_parent, result_child = process_context.Pipe(duplex=False)
+    progress_parent, progress_child = process_context.Pipe(duplex=False)
+    process = process_context.Process(
+        target=_pipeline_process_entry,
+        args=(operation, str(input_path), config, result_child, progress_child),
+        name=f"laladub-{operation}-{input_path.stem}",
+    )
+    process.start()
+    result_child.close()
+    progress_child.close()
+    started_at = time.monotonic()
+    completed = False
+
+    def drain_progress() -> None:
+        while True:
+            try:
+                if not progress_parent.poll():
+                    break
+                stage, current, total, detail = progress_parent.recv()
+            except (EOFError, OSError):
+                break
+            progress.update(stage, current, total, detail)
+
+    try:
+        while process.is_alive():
+            if time.monotonic() - started_at > 8 * 60 * 60:
+                raise TimeoutError(f"Pipeline process exceeded 8 hours: {operation} {input_path}")
+            drain_progress()
+            await asyncio.sleep(0.2)
+
+        process.join(timeout=2)
+        drain_progress()
+
+        if not result_parent.poll(2):
+            raise RuntimeError(f"Pipeline process exited with code {process.exitcode} without a result")
+        payload = result_parent.recv()
+        if not payload.get("ok"):
+            raise RuntimeError(str(payload.get("error") or "Pipeline process failed"))
+        completed = True
+        return [Path(value) for value in payload.get("paths") or []]
+    finally:
+        if not completed and process.is_alive():
+            _terminate_pipeline_process(process)
+            process.join(timeout=5)
+        result_parent.close()
+        progress_parent.close()
+
+
+async def _telegram_error_handler(update: Any, context: Any) -> None:
+    try:
+        from telegram.error import Forbidden
+    except Exception:
+        Forbidden = None  # type: ignore[assignment]
+
+    error = getattr(context, "error", None)
+    if Forbidden is not None and isinstance(error, Forbidden):
+        user_id = getattr(getattr(update, "effective_user", None), "id", None) if update is not None else None
+        print(f"Telegram send skipped: bot blocked by user {user_id or '?'}", flush=True)
+        return
+    print("Unhandled Telegram update error:", flush=True)
+    if error is not None:
+        print("".join(traceback.format_exception(type(error), error, error.__traceback__)), flush=True)
 
 
 def _maintenance_flag_path(settings: BotSettings) -> Path:
@@ -245,6 +361,55 @@ def _maintenance_blocks_user(settings: BotSettings, user_id: int | None) -> bool
     return _maintenance_enabled(settings) and not settings.is_admin(user_id)
 
 
+def _censor_settings_path(settings: BotSettings) -> Path:
+    return settings.workdir / "censored_settings.json"
+
+
+def _load_censor_settings(settings: BotSettings) -> dict[str, int]:
+    path = _censor_settings_path(settings)
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, value in raw.items():
+        try:
+            result[str(key)] = max(0, min(100, int(value)))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _save_censor_settings(settings: BotSettings, data: dict[str, int]) -> None:
+    path = _censor_settings_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _get_censor_percent(settings: BotSettings) -> int:
+    data = _load_censor_settings(settings)
+    if "global" in data:
+        return data["global"]
+    legacy_values = [value for key, value in data.items() if key.isdigit()]
+    return max(legacy_values, default=0)
+
+
+def _set_censor_percent(settings: BotSettings, percent: int) -> None:
+    data = {key: value for key, value in _load_censor_settings(settings).items() if not key.isdigit()}
+    percent = max(0, min(100, int(percent)))
+    if percent <= 0:
+        data.pop("global", None)
+    else:
+        data["global"] = percent
+    _save_censor_settings(settings, data)
+
+
 async def _setup_bot_commands(application: Any) -> None:
     settings: BotSettings = application.bot_data["settings"]
     if settings.executor_mode in {"remote", "hybrid"} and "worker_api" not in application.bot_data:
@@ -260,6 +425,7 @@ async def _setup_bot_commands(application: Any) -> None:
         ("start", "Инструкция"),
         ("queue", "Показать очередь задач"),
         ("resume", "Продолжить задачу по номеру"),
+        ("censored", "Experimental censor 0..100"),
         ("me", "Показать Telegram ID"),
         ("cancel", "Сбросить текущую задачу"),
     ]
@@ -378,6 +544,40 @@ async def me(update: Any, context: Any) -> None:
         f"Твой Telegram ID: {user.id}\nСтатус: {status}",
         reply_markup=_remove_reply_keyboard(),
     )
+
+
+async def censored(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    user = update.effective_user
+    if user is None:
+        return
+
+    raw_value = str(context.args[0]).strip() if context.args else ""
+    if len(context.args) != 1 or not raw_value.isdigit():
+        current = _get_censor_percent(settings)
+        await update.effective_message.reply_text(
+            f"Использование: /censored 0..100\nГлобально сейчас: {current}%\n0 выключает режим.",
+            reply_markup=_remove_reply_keyboard(),
+        )
+        return
+
+    percent = int(raw_value)
+    if not 0 <= percent <= 100:
+        await update.effective_message.reply_text(
+            "Использование: /censored 0..100",
+            reply_markup=_remove_reply_keyboard(),
+        )
+        return
+
+    _set_censor_percent(settings, percent)
+    if percent <= 0:
+        text = "Experimental censor глобально выключен для следующих задач."
+    else:
+        text = (
+            f"Experimental censor глобально включён: {percent}%.\n"
+            "Если в переводе найдутся запрещённые слова/маты/slurs, они с этой вероятностью будут заменяться на предупреждения/censored-фразы."
+        )
+    await update.effective_message.reply_text(text, reply_markup=_remove_reply_keyboard())
 
 
 async def queue_status(update: Any, context: Any) -> None:
@@ -887,12 +1087,14 @@ async def _remember_job_and_ask_source(
     input_source: str,
     source_url: str | None = None,
 ) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
     context.user_data["job"] = {
         "job_dir": str(job_dir),
         "input_path": str(input_path),
         "source_title": source_title,
         "input_source": input_source,
         "translation_seed": job_dir.name,
+        "censor_percent": _get_censor_percent(settings),
     }
     if source_url:
         context.user_data["job"]["source_url"] = source_url
@@ -921,8 +1123,9 @@ async def _remember_job_and_ask_source(
 async def _ask_source_language(status: Any, job: dict[str, Any]) -> None:
     _save_job_snapshot(Path(job["job_dir"]), job, status="select_source")
     text = (
-        "Выбери input-язык. Он будет использоваться как промежуточный язык перевода "
-        "и источник Whisper-артефактов."
+        "Выбери input-язык. Если выбрать конкретный язык, Whisper будет принудительно "
+        "слышать на нём всё видео — даже когда настоящий язык другой. Авто оставляет "
+        "обычное распознавание."
     )
     back_callback = "back:cancel" if job.get("input_source") == "telegram_audio" else "back:visual"
     reply_markup = _language_keyboard("src", SOURCE_LANGS, back_callback=back_callback)
@@ -989,14 +1192,16 @@ async def selection_back(update: Any, context: Any) -> None:
         )
         return
     if destination == "chaos":
-        _save_job_snapshot(job_dir, job, status="select_translation_chaos")
+        # Compatibility for an old TTS keyboard left open before this step was
+        # removed: send the user back to the target-language screen.
+        _save_job_snapshot(job_dir, job, status="select_target")
         await query.edit_message_text(
-            "Насколько кошмарным сделать перевод?",
+            "Выбери язык озвучки.",
             reply_markup=_language_keyboard(
-                "chaos",
-                TRANSLATION_CHAOS_OPTIONS,
+                "tgt",
+                TARGET_LANGS,
                 columns=2,
-                back_callback="back:target",
+                back_callback="back:speakers",
             ),
         )
         return
@@ -1107,32 +1312,12 @@ async def select_target_lang(update: Any, context: Any) -> None:
         return
 
     job["target_lang"] = target_lang
-    _save_job_snapshot(Path(job["job_dir"]), job, status="select_translation_chaos")
-    await query.edit_message_text(
-        "Насколько кошмарным сделать перевод?",
-        reply_markup=_language_keyboard("chaos", TRANSLATION_CHAOS_OPTIONS, columns=2, back_callback="back:target"),
-    )
-
-
-async def select_translation_chaos(update: Any, context: Any) -> None:
-    query = update.callback_query
-    await query.answer()
-    job = context.user_data.get("job")
-    if not job:
-        await query.edit_message_text("Нет активной задачи. Сначала пришли видео.")
-        return
-
-    chaos = _translation_chaos_value(query.data.split(":", 1)[1])
-    if chaos is None:
-        await query.edit_message_text("Неизвестный уровень перевода. Пришли видео ещё раз.")
-        return
-
-    job["translation_chaos"] = chaos
+    job["translation_chaos"] = "crooked"
     _ensure_translation_seed(job)
     _save_job_snapshot(Path(job["job_dir"]), job, status="select_tts")
     await query.edit_message_text(
         "Выбери метод озвучки.",
-        reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2, back_callback="back:chaos"),
+        reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2, back_callback="back:target"),
     )
 
 
@@ -1152,7 +1337,7 @@ async def select_tts_method(update: Any, context: Any) -> None:
         provider_label = _tts_method_label(tts_provider)
         await query.edit_message_text(
             f"{provider_label} не поддерживает украинскую озвучку. Выбери F5.",
-            reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2, back_callback="back:chaos"),
+            reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2, back_callback="back:target"),
         )
         return
 
@@ -1163,7 +1348,6 @@ async def select_tts_method(update: Any, context: Any) -> None:
     await query.edit_message_text(
         f"Ставлю задачу в очередь. Голоса: {_speaker_count_label(job.get('speaker_count'))}. "
         f"Язык озвучки: {_target_lang_label(job.get('target_lang'))}. "
-        f"Перевод: {_translation_chaos_label(job.get('translation_chaos'))}. "
         f"Движок: {_tts_method_label(tts_provider)}."
     )
     context.user_data.pop("job", None)
@@ -1260,20 +1444,11 @@ async def _recover_interrupted_jobs(application: Any) -> None:
         job["resume"] = "1"
         job["recovered_at"] = time.time()
         job["target_lang"] = _target_lang_value(job.get("target_lang"))
-        try:
-            status_message = await application.bot.send_message(
-                chat_id=chat_id,
-                text="Бот был перезапущен. Автоматически продолжаю задачу и ставлю её обратно в очередь.",
-                read_timeout=60,
-                write_timeout=60,
-                connect_timeout=30,
-                pool_timeout=30,
-            )
-        except Exception as exc:
-            skipped += 1
-            _save_job_snapshot(job_dir, job, status="failed", error=f"startup_recovery_send_failed: {exc}")
-            print(f"Startup recovery send failed for {job_dir}: {type(exc).__name__}: {exc}", flush=True)
-            continue
+        # Do not send one Telegram message per recovered job.  A restart can
+        # restore dozens of items, and that burst previously triggered hours
+        # of Telegram flood control.  The job will create a status message
+        # only when it actually starts running.
+        status_message = None
 
         input_path = Path(str(job.get("input_path") or ""))
         if job.get("input_source") == "telegram_audio" and not job.get("audio_visual"):
@@ -2057,11 +2232,6 @@ def _translation_chaos_value(value: Any) -> str | None:
     return aliases.get(text)
 
 
-def _translation_chaos_label(value: Any) -> str:
-    chaos = _translation_chaos_value(value) or "crooked"
-    return next((label for code, label in TRANSLATION_CHAOS_OPTIONS if code == chaos), chaos)
-
-
 def _ensure_translation_seed(job: dict[str, Any]) -> str:
     seed = str(job.get("translation_seed") or "").strip()
     if not seed:
@@ -2109,6 +2279,7 @@ def _speaker_count_label(value: Any) -> str:
 
 def _apply_speaker_count(config: DubConfig, job: dict[str, Any]) -> None:
     count = _speaker_count_value(job.get("speaker_count"))
+    config.speaker_count_exact = count
     if count is None:
         return
     config.max_speaker_clusters = count
@@ -2125,6 +2296,18 @@ def _apply_translation_chaos(config: DubConfig, job: dict[str, Any], settings: B
     job["translation_chaos"] = chaos
     config.translation_chaos = chaos
     config.translation_seed = _ensure_translation_seed(job)
+
+    if config.content_chaos_backbone:
+        config.translation_chaos = "destroy"
+        config.translation_pivots = (
+            f"{settings.translation_pivots}|"
+            "input,ja,ko,tr,ar,en|input,zh,ja,ko,en|"
+            "en,ja,ko,tr,en|en,ms,he,en"
+        )
+        config.translation_second_pass_ratio = max(settings.translation_second_pass_ratio, 0.72)
+        config.artifact_ratio = 0.20
+        config.artifact_max_segments = max(config.artifact_max_segments, 64)
+        return
 
     if chaos == "normal":
         config.translation_pivots = "input,en|en,de|en,fr|en,es"
@@ -2153,18 +2336,16 @@ def _apply_translation_chaos(config: DubConfig, job: dict[str, Any], settings: B
     if chaos == "destroy":
         config.translation_pivots = (
             f"{settings.translation_pivots}|"
-            "input,ja,ko,tr,ar,he,ms,de,fr,es,en|"
-            "input,zh,ja,ko,id,ms,he,ar,tr,de,en|"
-            "en,ja,ko,zh,tr,ar,he,ms,de,fr,es,en|"
-            "input,en,de,fr,es,pt,it,pl,az,tr,ar,he,en|"
-            "input,th,zh,ja,ko,en,tr,ar,he,ms,en"
+            "input,ja,ko,tr,ar,en|"
+            "input,zh,ja,ko,en|"
+            "en,ja,ko,tr,en"
         )
-        config.translation_second_pass_ratio = max(settings.translation_second_pass_ratio, 0.90)
+        config.translation_second_pass_ratio = max(settings.translation_second_pass_ratio, 0.55)
         config.artifact_ratio = max(config.artifact_ratio, 0.45)
         config.artifact_max_segments = max(config.artifact_max_segments, 96)
 
 
-async def _progress_updater(message: Any, progress: _ProgressState, interval_seconds: float = 2.5) -> None:
+async def _progress_updater(message: Any, progress: _ProgressState, interval_seconds: float = 30.0) -> None:
     last_text = getattr(message, "text", "") or ""
     while True:
         text = progress.render()
@@ -2176,18 +2357,41 @@ async def _progress_updater(message: Any, progress: _ProgressState, interval_sec
         await asyncio.sleep(interval_seconds)
 
 
-async def _safe_edit_status(message: Any, text: str) -> None:
+async def _safe_edit_status(message: Any, text: str) -> bool:
+    global _TELEGRAM_EDIT_BACKOFF_UNTIL, _TELEGRAM_EDIT_BACKOFF_LOGGED_UNTIL
+
+    if message is None:
+        return False
     key = (getattr(getattr(message, "chat", None), "id", None), getattr(message, "message_id", None))
     if _LAST_STATUS_TEXT.get(key) == text:
-        return
+        return True
+    now = time.monotonic()
+    if now < _TELEGRAM_EDIT_BACKOFF_UNTIL:
+        return False
     try:
         await message.edit_text(text)
         _LAST_STATUS_TEXT[key] = text
+        return True
     except Exception as exc:
         if "Message is not modified" in str(exc):
             _LAST_STATUS_TEXT[key] = text
-            return
+            return True
+        retry_after = getattr(exc, "retry_after", None)
+        if retry_after is not None:
+            try:
+                seconds = float(retry_after.total_seconds())
+            except AttributeError:
+                seconds = float(retry_after)
+            except (TypeError, ValueError):
+                seconds = 60.0
+            seconds = max(1.0, seconds)
+            _TELEGRAM_EDIT_BACKOFF_UNTIL = max(_TELEGRAM_EDIT_BACKOFF_UNTIL, now + seconds)
+            if _TELEGRAM_EDIT_BACKOFF_UNTIL > _TELEGRAM_EDIT_BACKOFF_LOGGED_UNTIL:
+                _TELEGRAM_EDIT_BACKOFF_LOGGED_UNTIL = _TELEGRAM_EDIT_BACKOFF_UNTIL
+                print(f"Telegram progress edits paused for {seconds:.0f}s after flood control", flush=True)
+            return False
         print(f"Progress edit skipped: {type(exc).__name__}: {exc}", flush=True)
+        return False
 
 
 async def _finish_progress(
@@ -2238,10 +2442,12 @@ def _apply_text_extraction_method(config: DubConfig, job: dict[str, str], settin
     config.suppress_plain_ascii_tokens = False
     config.asr_retry_on_repetition = not forced
     config.asr_fallback_on_sparse = False
+    config.reference_timing_asr = False
     config.artifact_source_lang = None
     config.input_pivot_lang = None
     config.inject_artifacts = False
     config.artifact_chaos_mode = False
+    config.content_chaos_backbone = False
     config.distort_main_translation = False
     config.glitch_profile = "faithful" if forced else "clean"
 
@@ -2268,16 +2474,32 @@ def _apply_text_extraction_method(config: DubConfig, job: dict[str, str], settin
         config.glitch_profile = "faithful"
         config.collapse_repetitions = False
         config.distort_main_translation = True
+    elif chaos_backbone and selected_source:
+        # Keep the deliberately wrong ASR pass as a controlled corruption
+        # source, while the automatic pass supplies content and timings.
+        config.source_lang = selected_source
+        config.force_source_language = True
+        config.asr_retry_on_repetition = False
+        config.asr_fallback_on_sparse = True
+        config.reference_timing_asr = True
+        config.input_pivot_lang = selected_source
+        config.artifact_source_lang = selected_source
+        config.inject_artifacts = True
+        config.artifact_chaos_mode = True
+        config.content_chaos_backbone = True
+        config.glitch_profile = "faithful"
+        config.collapse_repetitions = True
+        config.distort_main_translation = True
     elif chaos_backbone:
         config.source_lang = None
         config.force_source_language = False
         config.asr_retry_on_repetition = True
         config.asr_fallback_on_sparse = False
-        config.input_pivot_lang = selected_source
-        config.artifact_source_lang = selected_source
-        config.inject_artifacts = bool(settings.inject_artifacts and selected_source)
-        config.artifact_chaos_mode = True
-        config.artifact_max_segments = max(settings.artifact_max_segments, 48)
+        config.reference_timing_asr = False
+        config.input_pivot_lang = None
+        config.artifact_source_lang = None
+        config.inject_artifacts = False
+        config.artifact_chaos_mode = False
         config.glitch_profile = "clean"
         config.distort_main_translation = True
     elif hunt_artifacts:
@@ -2383,6 +2605,12 @@ async def _process_job(
         speaker_clustering=settings.speaker_clustering,
         max_speaker_clusters=settings.max_speaker_clusters,
         speaker_cluster_threshold=settings.speaker_cluster_threshold,
+        diarization_python=settings.diarization_python,
+        diarization_model=settings.diarization_model,
+        diarization_device=settings.diarization_device,
+        diarization_cache_dir=settings.diarization_cache_dir,
+        diarization_token_file=settings.diarization_token_file,
+        diarization_timeout_seconds=settings.diarization_timeout_seconds,
         separation=settings.separation,
         separation_device=settings.separation_device,
         demucs_model=settings.demucs_model,
@@ -2409,6 +2637,7 @@ async def _process_job(
         collapse_repetitions=settings.collapse_repetitions,
         max_phrase_repeats=settings.max_phrase_repeats,
         max_word_repeats=settings.max_word_repeats,
+        censor_percent=int(job.get("censor_percent") or 0),
     )
     _apply_text_extraction_method(config, job, settings)
     _apply_translation_chaos(config, job, settings)
@@ -2450,9 +2679,12 @@ async def _process_job(
             else:
                 status_message = await context.bot.send_message(chat_id=chat_id, text=progress.render())
             progress_task = asyncio.create_task(_progress_updater(status_message, progress))
-            transcript_config.progress_callback = progress.update
-
-            srt_path, txt_path = await asyncio.to_thread(run_transcript, Path(job["input_path"]), transcript_config)
+            srt_path, txt_path = await _run_pipeline_isolated(
+                "transcript",
+                Path(job["input_path"]),
+                transcript_config,
+                progress,
+            )
             meta_path = job_dir / "work" / "whisper_only_meta.json"
             meta_path.write_text(
                 json.dumps(
@@ -2505,7 +2737,6 @@ async def _process_job(
                 f"цель={target_lang}, "
                 f"метод={_asr_method_label(job.get('asr_method') or settings.default_asr_method)}, "
                 f"голоса={_speaker_count_label(job.get('speaker_count'))}, "
-                f"перевод={_translation_chaos_label(job.get('translation_chaos'))}, "
                 f"TTS={_tts_method_label(tts_provider)}, "
                 f"ASR={config.asr_backend} {config.whisper_model}, "
                 f"pivot={config.input_pivot_lang or '-'}"
@@ -2516,9 +2747,12 @@ async def _process_job(
         else:
             status_message = await context.bot.send_message(chat_id=chat_id, text=progress.render())
         progress_task = asyncio.create_task(_progress_updater(status_message, progress))
-        config.progress_callback = progress.update
-
-        result = await asyncio.to_thread(run_dub, Path(job["input_path"]), config)
+        [result] = await _run_pipeline_isolated(
+            "dub",
+            Path(job["input_path"]),
+            config,
+            progress,
+        )
         send_path = result
 
         watermarked_path = job_dir / "dubbed_watermarked.mp4"

@@ -5,7 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
 $FlagPath = Join-Path $Root "runs\\bot-release\\maintenance.flag"
 
 switch ($Mode) {

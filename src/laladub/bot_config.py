@@ -87,6 +87,12 @@ class BotSettings:
     speaker_clustering: bool
     max_speaker_clusters: int
     speaker_cluster_threshold: float
+    diarization_python: Path | None
+    diarization_model: str
+    diarization_device: str
+    diarization_cache_dir: Path
+    diarization_token_file: Path | None
+    diarization_timeout_seconds: int
     separation: str
     separation_device: str
     demucs_model: str
@@ -161,7 +167,7 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         watermark_text=os.environ.get("LALADUB_WATERMARK_TEXT", "La La Local Dub"),
         watermark_image=_optional_path(os.environ.get("LALADUB_WATERMARK_IMAGE")),
         max_file_mb=int(os.environ.get("LALADUB_MAX_FILE_MB", "200")),
-        free_max_duration_seconds=float(os.environ.get("LALADUB_FREE_MAX_DURATION_SECONDS", "60")),
+        free_max_duration_seconds=float(os.environ.get("LALADUB_FREE_MAX_DURATION_SECONDS", "180")),
         paid_max_duration_seconds=float(os.environ.get("LALADUB_PAID_MAX_DURATION_SECONDS", "0")),
         translator=os.environ.get("LALADUB_TRANSLATOR", "hybrid"),
         tts=os.environ.get("LALADUB_TTS", "xtts"),
@@ -237,6 +243,18 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         speaker_clustering=_parse_bool(os.environ.get("LALADUB_SPEAKER_CLUSTERING", "1")),
         max_speaker_clusters=max(1, int(os.environ.get("LALADUB_MAX_SPEAKER_CLUSTERS", "6"))),
         speaker_cluster_threshold=float(os.environ.get("LALADUB_SPEAKER_CLUSTER_THRESHOLD", "0.08")),
+        diarization_python=_optional_path(
+            os.environ.get("LALADUB_DIARIZATION_PYTHON", ".venv-diarization\\Scripts\\python.exe")
+        ),
+        diarization_model=os.environ.get(
+            "LALADUB_DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1"
+        ),
+        diarization_device=os.environ.get("LALADUB_DIARIZATION_DEVICE", "auto"),
+        diarization_cache_dir=Path(os.environ.get("LALADUB_DIARIZATION_CACHE_DIR", "models/diarization")),
+        diarization_token_file=_optional_path(
+            os.environ.get("LALADUB_DIARIZATION_TOKEN_FILE", ".secrets\\HuggingFace-Token.txt")
+        ),
+        diarization_timeout_seconds=int(os.environ.get("LALADUB_DIARIZATION_TIMEOUT_SECONDS", "1800")),
         separation=os.environ.get("LALADUB_SEPARATION", "demucs"),
         separation_device=os.environ.get("LALADUB_SEPARATION_DEVICE", "cpu"),
         demucs_model=os.environ.get("LALADUB_DEMUCS_MODEL", "htdemucs"),

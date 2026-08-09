@@ -163,8 +163,20 @@ def make_audio_visual_video(
             segment_path.unlink(missing_ok=True)
             continue
         if segment_path.exists() and segment_path.stat().st_size > 1024:
+            try:
+                actual_duration = probe_duration(segment_path)
+            except Exception:
+                segment_path.unlink(missing_ok=True)
+                continue
+            if actual_duration < 0.1:
+                segment_path.unlink(missing_ok=True)
+                continue
             segment_paths.append(segment_path)
-            visual_duration += out_duration
+            # A short source clip can yield less video than the requested
+            # out_duration after speed-up.  Counting the requested value made
+            # the loop stop early and players held the final frame until the
+            # longer audio track ended.
+            visual_duration += actual_duration
 
     if not segment_paths:
         _make_fallback_audio_video(audio_path, output_path, target_duration, resolution)
@@ -270,7 +282,8 @@ def _make_visual_segment(
     scale_filter = (
         f"setpts=PTS/{max(0.1, speed):.4f},"
         f"scale={resolution}:{resolution}:force_original_aspect_ratio=increase,"
-        f"crop={resolution}:{resolution},fps=30,format=yuv420p"
+        f"crop={resolution}:{resolution},fps=30,setsar=1,format=yuv420p,"
+        "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709"
     )
     run(
         [
@@ -551,7 +564,10 @@ def prepare_voice_reference(input_path: Path, output_path: Path, sample_rate: in
             str(input_path),
             "-vn",
             "-af",
-            "highpass=f=70,lowpass=f=7600,afftdn=nf=-25,dynaudnorm=f=75:g=15,volume=1.15",
+            # Preserve speaker timbre for cloning. Aggressive FFT denoising
+            # and dynamic normalization made Demucs/reference artifacts more
+            # prominent and could turn one voice into a metallic average.
+            "highpass=f=65,lowpass=f=10000,volume=1.05,alimiter=limit=0.95",
             "-ac",
             "1",
             "-ar",
@@ -566,6 +582,19 @@ def prepare_voice_reference(input_path: Path, output_path: Path, sample_rate: in
 def make_whisper_chaos_audio(input_path: Path, output_path: Path, gain_db: float = 50.0) -> None:
     ffmpeg = require_tool("ffmpeg")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # This path is intentionally not "clean" audio. It is a hard ASR helper for
+    # quiet/uneven meme clips where Whisper misses speech under loud effects.
+    # The old version was just volume+limiter; this aggressively flattens voice
+    # dynamics before limiting.
+    voice_crush_filter = (
+        "highpass=f=70,"
+        "lowpass=f=7800,"
+        "compand=attacks=0.002:decays=0.04:"
+        "points=-90/-35|-60/-14|-35/-4|-12/0|0/0,"
+        "acompressor=threshold=-35dB:ratio=20:attack=1:release=50:makeup=16,"
+        "volume=6dB,"
+        "alimiter=limit=1.0"
+    )
     run(
         [
             ffmpeg,
@@ -574,7 +603,7 @@ def make_whisper_chaos_audio(input_path: Path, output_path: Path, gain_db: float
             str(input_path),
             "-vn",
             "-af",
-            f"volume={gain_db:.1f}dB,alimiter=limit=0.98",
+            voice_crush_filter,
             "-ac",
             "1",
             "-ar",

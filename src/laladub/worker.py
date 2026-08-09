@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import time
 import traceback
@@ -55,6 +56,7 @@ def main(argv: list[str] | None = None) -> None:
         save_config=not args.no_save_config,
     )
     workdir.mkdir(parents=True, exist_ok=True)
+    _ensure_windows_autostart()
     print(f"LaLaDub worker started: id={worker_id} server={server} workdir={workdir}", flush=True)
 
     if args.auto_update and _remote_update_available(client):
@@ -383,6 +385,33 @@ def _default_worker_id() -> str:
     user = getpass.getuser()
     host = socket.gethostname()
     return f"{host}-{user}"
+
+
+def _ensure_windows_autostart() -> None:
+    if os.name != "nt":
+        return
+    installer = Path.cwd() / "Install-Worker-Autostart.ps1"
+    if not installer.is_file():
+        return
+    try:
+        subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+                str(installer),
+            ],
+            cwd=Path.cwd(),
+            check=False,
+            timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        print(f"Worker autostart setup skipped: {type(exc).__name__}: {exc}", flush=True)
 
 
 def _safe_name(value: str) -> str:

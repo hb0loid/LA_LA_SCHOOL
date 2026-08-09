@@ -144,7 +144,7 @@ laladub-bot
 ## Запуск: Тест И Релиз
 
 - `Start-Test-Bot.cmd` / `Stop-Test-Bot.cmd` - текущий тестовый бот. Логи: `bot.out.log`, `bot.err.log`; pid: `bot.pid`; задачи: `runs/bot`.
-- `Start-Release-Bot.cmd` / `Stop-Release-Bot.cmd` - релизный бот. Логи: `bot.release.out.log`, `bot.release.err.log`; pid: `bot.release.pid`; задачи: `runs/bot-release`.
+- `БОТ - ЗАПУСТИТЬ.cmd` / `БОТ - ОСТАНОВИТЬ.cmd` - единственные ручные кнопки управления релизным ботом. Технические сценарии лежат в `tools/runtime`, журналы — в `logs`, задачи — в `runs/bot-release`.
 - Токен релизного бота лежит в `.secrets/Release-Bot-Token.ps1`; папка `.secrets` добавлена в `.gitignore`.
 
 - `LALADUB_BOT_TOKEN` - токен Telegram-бота, обязательный.

@@ -8,6 +8,12 @@ amara.org
 solanya
 dimatorzok
 dima torzok
+игорь негода
+с вами был игорь негода
+девушки отдыхают
+девушка отдыхает
+девочки отдыхают
+các cô gái thư giãn
 subscribe
 subscribed
 thanks for watching
@@ -48,3 +54,244 @@ subtítulos
 suscr
 untertitel
 abonnieren
+
+# Known subtitle-credit and transcription-service hallucinations.
+amara
+amara org
+amara.org community
+amara org community
+amara community
+solania
+salania
+salawny
+salagna
+subtitles by solanya
+subtitles by solania
+rev.com
+otter.ai
+transcribed by eso
+transcribed by
+transcription by
+closed captioning provided by
+captions provided by
+captions created by
+subtitles provided by
+subtitles created by
+subtitles made by
+community subtitles
+steamteamextra
+bf-watch tv
+soustitreur.com
+sous-titreur.com
+société radio-canada
+radio-canada
+
+# Confirmed Russian subtitle-credit families.
+субтитры сделал
+субтитры создавал
+субтитры добавил
+субтитры делал
+субтитры предоставил
+субтитры предоставлены
+перевод и субтитры
+спасибо за субтитры
+субтитры подогнал симон
+добавил субтитры
+редактор субтитров
+корректор а. егорова
+корректор а.егорова
+лосева
+синецкая
+горелова
+жукова
+захарова
+воинова
+кулакова
+симон
+
+# Russian YouTube/outro and continuation hallucinations.
+подписывайтесь на мой канал
+подписывайтесь на наш канал
+подпишись на канал
+ставьте лайки и подписывайтесь
+ставьте лайк
+нажмите на колокольчик
+спасибо за внимание
+до встречи в следующем видео
+увидимся в следующем видео
+смотрите продолжение
+в следующей части видео
+в следующей серии
+добро пожаловать на мой канал
+пишите комментарии
+поехали
+
+# Confirmed Russian sound-description hallucinations from noise-only audio.
+веселая музыка
+весёлая музыка
+спокойная музыка
+грустная мелодия
+лирическая музыка
+динамичная музыка
+таинственная музыка
+торжественная музыка
+интригующая музыка
+напряженная музыка
+напряжённая музыка
+печальная музыка
+тревожная музыка
+музыкальная заставка
+перестрелка
+гудок поезда
+рев мотора
+рёв мотора
+шум двигателя
+сигнал автомобиля
+лай собак
+пес лает
+пёс лает
+шум дождя
+полицейская сирена
+звонок в дверь
+стук в дверь
+городской шум
+аплодисменты
+
+# Vietnamese Whisper families, including the confirmed La La School corpus.
+la la school
+lalaschool
+ghiền mì gõ
+ghien mi go
+đại gia đình
+hẹn đại gia đình
+большая семья
+вся большая семья
+до встречи большая семья
+hẹn gặp lại
+video tiếp theo
+không bỏ lỡ
+những video hấp dẫn
+ủng hộ kênh
+đăng kí kênh
+đăng ký kênh
+theo dõi
+xin chào và hẹn gặp lại
+các bạn nhớ đăng ký
+các bạn hãy đăng ký
+
+# English outro, channel and boilerplate hallucinations.
+thank you for watching until the end
+thank you for watching my video
+thanks for watching until the end
+thanks for watching please subscribe
+thank you for watching please subscribe
+please subscribe to my channel
+please subscribe to our channel
+don't forget to subscribe
+do not forget to subscribe
+hit the like button
+click the bell icon
+like comment and subscribe
+like share and subscribe
+leave a comment below
+see you in the next video
+see you next time
+welcome to my channel
+this is the end of the video
+
+# English music/copyright/broadcast boilerplate seen on non-speech audio.
+piano music continues
+relaxing piano music
+pomp and circumstance
+the star spangled banner
+my country tis of thee
+dance of the sugar plum fairy
+this video is a derivative work
+touhou project
+copyright osho
+satsang with mooji
+imperial news network
+
+# Spanish and Portuguese outro/credit families.
+gracias por ver el video
+gracias por ver el vídeo
+gracias por su atención
+gracias por su atencion
+suscríbete al canal
+suscribete al canal
+no olviden suscribirse
+comunidad de amara
+obrigado por assistir
+obrigada por assistir
+inscreva-se no canal
+inscreva se no canal
+até a próxima
+ate a proxima
+legendas pela comunidade
+
+# French, German and Italian outro/credit families.
+merci d'avoir regardé
+merci d avoir regardé
+merci pour votre attention
+n'oubliez pas de vous abonner
+oubliez pas de vous abonner
+communauté d'amara
+communaute d amara
+sous titres par
+sous titres réalisés
+danke fürs zuschauen
+danke fürs ansehen
+vielen dank fürs ansehen
+willkommen auf meinem kanal
+grazie per la visione
+sottotitoli creati dalla comunità
+
+# East-Asian outro, channel and broadcaster families.
+谢谢观看
+謝謝觀看
+感谢收看
+感謝觀看
+下次见
+下次見
+明镜与点点
+明鏡與點點
+欢迎订阅我的频道
+字幕由amara
+見てくれてありがとう
+ご視聴ありがとうございました
+ご視聴ありがとうございます
+サブタイトル
+音声なし
+시청해 주셔서 감사합니다
+시청해주셔서 감사합니다
+오늘도 영상 봐주셔서 감사합니다
+좋아요와 구독
+다음 영상에서 만나요
+자막제작
+mbc 뉴스
+
+# Other frequent multilingual outro families.
+дякую за перегляд
+підписуйтесь на наш канал
+izlediğiniz için teşekkür ederim
+izlediğiniz için tesekkür ederim
+kanalıma abone olmayı
+bir sonraki videoda görüşürüz
+çeviri ve altyazı
+شكرا على المشاهدة
+شكرا للمشاهدة
+اشتركوا في القناة
+
+# Model/refusal boilerplate that can arrive from ASR or translation layers.
+i cannot comply with that request
+i can't comply with that request
+i cannot fulfill that request
+i'm sorry but i can't
+sorry i can't help with that
+the content appears to
+no text provided
+не могу выполнить этот запрос
+не могу помочь с этим запросом
+не могу перевести эту фразу
+lo siento pero no puedo
+je suis désolé mais je ne peux pas

@@ -88,6 +88,16 @@ def clamp_obvious_word_repeats(text: str, *, max_word_repeats: int = 3) -> str:
     if not text:
         return text
 
+    # Translation corruption can produce one very long token such as
+    # "вакавакавака..." without separators.  The back-reference regexes below
+    # are intended for repeated words and phrases; applying them to a single
+    # giant token can trigger catastrophic backtracking for minutes or hours.
+    # There is nothing word-level to clamp in that case, so leave it for the
+    # later duration/character budget step.
+    raw_words = text.split()
+    if len(raw_words) < 2 or any(len(word) > 64 for word in raw_words):
+        return text
+
     text = _clamp_obvious_phrase_repeats(text, max_phrase_repeats=max_word_repeats)
 
     pattern = re.compile(
