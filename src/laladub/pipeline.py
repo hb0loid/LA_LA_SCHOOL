@@ -1020,7 +1020,7 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
                     raw_path.unlink(missing_ok=True)
                     synthesize_segment(segment, raw_path, fallback_config)
 
-    mix_items: list[tuple[Path, int]] = []
+    fitted_items: list[tuple[Segment, Path]] = []
     for index, segment in enumerate(segments, start=1):
         if not segment.spoken_text:
             continue
@@ -1039,7 +1039,7 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
                 fit_wav_to_duration(raw_path, fitted_path, max(0.1, segment.duration))
             else:
                 normalize_wav(raw_path, fitted_path)
-        mix_items.append((fitted_path, int(segment.start * 1000)))
+        fitted_items.append((segment, fitted_path))
         if index == len(segments) or index % 5 == 0:
             percent = 70 + round(20 * index / max(1, len(segments)))
             position = _format_video_position(segment.end, source_duration)
@@ -1053,6 +1053,8 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         if index % 25 == 0:
             print(f"      synthesized {index}/{len(segments)}")
     _save_resume_state(config, tts_fit=True)
+
+    mix_items = _plan_overlap_aware_mix(fitted_items, source_audio, config)
 
     _report_progress(config, "Собираю аудиодорожку", 92, 100, None)
     print("[5/7] Mixing dub track")
@@ -2972,6 +2974,150 @@ def _tts_fit_complete(segments: list[Segment], config: DubConfig) -> bool:
         if segment.spoken_text
     ]
     return bool(spoken_indices) and all(_file_ready(fit_dir / f"{index:05d}.wav") for index in spoken_indices)
+
+
+def _plan_overlap_aware_mix(
+    fitted_items: list[tuple[Segment, Path]],
+    source_audio: Path,
+    config: DubConfig,
+) -> list[tuple[Path, int, float, float | None]]:
+    """Keep useful background overlap while ducking competing foreground lines."""
+    if not fitted_items:
+        return []
+
+    try:
+        import numpy as np
+
+        source_samples, sample_rate = _read_wav_mono(source_audio)
+    except Exception as exc:
+        print(f"      Overlap loudness analysis skipped: {type(exc).__name__}: {exc}")
+        source_samples, sample_rate = None, 0
+
+    rms_levels: list[float] = []
+    for segment, _path in fitted_items:
+        rms = 0.0
+        if source_samples is not None and sample_rate > 0:
+            start_sample = max(0, round(segment.start * sample_rate))
+            end_sample = min(source_samples.size, round(segment.end * sample_rate))
+            excerpt = source_samples[start_sample:end_sample]
+            if excerpt.size:
+                rms = float(np.sqrt(np.mean(excerpt * excerpt)))
+        rms_levels.append(rms)
+
+    positive_levels = sorted(level for level in rms_levels if level > 1e-5)
+    median_rms = positive_levels[len(positive_levels) // 2] if positive_levels else 0.0
+    background_cutoff = median_rms * 0.42
+    is_background = [
+        bool(median_rms > 0.0 and level > 0.0 and level < background_cutoff)
+        for level in rms_levels
+    ]
+
+    artifact_segments: list[Segment] = []
+    artifact_path = _debug_path(config, "artifact_injected.srt")
+    if artifact_path.is_file():
+        try:
+            artifact_segments = read_srt(artifact_path, translated=True)
+        except Exception:
+            artifact_segments = []
+
+    def is_artifact(segment: Segment) -> bool:
+        signature = _artifact_signature(segment.spoken_text)
+        return any(
+            abs(segment.start - artifact.start) <= 0.12
+            and (
+                signature == _artifact_signature(artifact.spoken_text)
+                or abs(segment.end - artifact.end) <= 0.12
+            )
+            for artifact in artifact_segments
+        )
+
+    artifact_flags = [is_artifact(segment) for segment, _path in fitted_items]
+    gains = [0.52 if background else 1.0 for background in is_background]
+    duck_after: list[float | None] = [None] * len(fitted_items)
+    durations: list[float] = []
+    for _segment, path in fitted_items:
+        try:
+            durations.append(probe_duration(path))
+        except Exception:
+            durations.append(0.0)
+
+    actions: list[dict[str, object]] = []
+    for index in range(len(fitted_items) - 1):
+        segment, _path = fitted_items[index]
+        next_segment, _next_path = fitted_items[index + 1]
+        generated_end = segment.start + durations[index]
+        overlap = generated_end - next_segment.start
+        if overlap <= 0.35:
+            continue
+
+        current_artifact = artifact_flags[index]
+        next_artifact = artifact_flags[index + 1]
+        different_speakers = bool(
+            segment.speaker_id
+            and next_segment.speaker_id
+            and segment.speaker_id != next_segment.speaker_id
+        )
+        reason = ""
+        if current_artifact and not next_artifact:
+            duck_after[index] = max(0.0, next_segment.start - segment.start)
+            reason = "artifact_yields_to_main"
+        elif next_artifact and not current_artifact:
+            gains[index + 1] = min(gains[index + 1], 0.55)
+            reason = "artifact_under_main_tail"
+        elif different_speakers and (is_background[index] or is_background[index + 1]):
+            # A quiet second voice is a useful part of the scene. Its base gain
+            # already follows the source RMS, so retain the overlap untouched.
+            reason = "different_speaker_background_allowed"
+        elif different_speakers and overlap <= 1.25:
+            reason = "different_speaker_short_overlap_allowed"
+        elif different_speakers and rms_levels[index + 1] < rms_levels[index]:
+            gains[index + 1] = min(gains[index + 1], 0.58)
+            reason = "quieter_next_speaker_lowered"
+        else:
+            duck_after[index] = max(0.0, next_segment.start - segment.start)
+            reason = "foreground_conflict_duck_previous"
+
+        actions.append(
+            {
+                "segment": index + 1,
+                "next_segment": index + 2,
+                "overlap_seconds": round(overlap, 3),
+                "reason": reason,
+            }
+        )
+
+    manifest = {
+        "median_source_rms": round(median_rms, 6),
+        "background_cutoff_rms": round(background_cutoff, 6),
+        "segments": [
+            {
+                "segment": index + 1,
+                "start": round(segment.start, 3),
+                "end": round(segment.end, 3),
+                "generated_seconds": round(durations[index], 3),
+                "source_rms": round(rms_levels[index], 6),
+                "background": is_background[index],
+                "artifact": artifact_flags[index],
+                "speaker": segment.speaker_id or "",
+                "gain": round(gains[index], 3),
+                "duck_after_seconds": None if duck_after[index] is None else round(duck_after[index], 3),
+            }
+            for index, (segment, _path) in enumerate(fitted_items)
+        ],
+        "overlap_actions": actions,
+    }
+    (config.workdir / "overlap_mix_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(
+        "      Overlap-aware mix: "
+        f"background={sum(is_background)}/{len(fitted_items)}, conflicts={len(actions)}, "
+        f"ducked={sum(item is not None for item in duck_after)}"
+    )
+    return [
+        (path, int(segment.start * 1000), gains[index], duck_after[index])
+        for index, (segment, path) in enumerate(fitted_items)
+    ]
 
 
 def _needs_speaker_references(config: DubConfig) -> bool:

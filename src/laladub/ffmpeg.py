@@ -756,7 +756,7 @@ def fit_wav_to_duration(
 
 
 def delayed_mix(
-    items: list[tuple[Path, int]],
+    items: list[tuple[Path, int] | tuple[Path, int, float, float | None]],
     duration: float,
     output_path: Path,
     temp_dir: Path,
@@ -780,14 +780,36 @@ def delayed_mix(
         return
 
     cmd = [ffmpeg, "-y"]
-    for audio_path, _delay_ms in items:
+    normalized_items: list[tuple[Path, int, float, float | None]] = []
+    for item in items:
+        if len(item) == 2:
+            audio_path, delay_ms = item
+            normalized_items.append((audio_path, delay_ms, 1.0, None))
+        else:
+            audio_path, delay_ms, gain, duck_after_seconds = item
+            normalized_items.append((audio_path, delay_ms, gain, duck_after_seconds))
+
+    for audio_path, _delay_ms, _gain, _duck_after_seconds in normalized_items:
         cmd.extend(["-i", str(audio_path)])
 
     filter_parts: list[str] = []
     labels: list[str] = []
-    for idx, (_audio_path, delay_ms) in enumerate(items):
+    for idx, (_audio_path, delay_ms, gain, duck_after_seconds) in enumerate(normalized_items):
         label = f"a{idx}"
-        filter_parts.append(f"[{idx}:a]adelay={max(0, delay_ms)}:all=1[{label}]")
+        filters = [f"volume={max(0.0, gain):.3f}"]
+        if duck_after_seconds is not None:
+            # Keep the full phrase but move its tail behind the newly started
+            # foreground line. The expression runs before adelay, so t is
+            # relative to this individual clip.
+            duck_at = max(0.0, duck_after_seconds)
+            duck_done = duck_at + 0.18
+            filters.append(
+                "volume='if(lt(t,"
+                f"{duck_at:.3f}),1,if(lt(t,{duck_done:.3f}),"
+                f"1-(t-{duck_at:.3f})*3.8889,0.30))':eval=frame"
+            )
+        filters.append(f"adelay={max(0, delay_ms)}:all=1")
+        filter_parts.append(f"[{idx}:a]{','.join(filters)}[{label}]")
         labels.append(f"[{label}]")
 
     joined_labels = "".join(labels)
