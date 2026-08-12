@@ -97,10 +97,10 @@ TARGET_LANGS = [
     ("en", "Английский"),
 ]
 TTS_METHODS = [
-    ("cosyvoice", "CosyVoice (основной)"),
-    ("f5", "F5 (устаревший)"),
-    ("qwen3", "Qwen3 (экспериментальный)"),
-    ("chatterbox", "Chatterbox (экспериментальный)"),
+    ("moss", "MOSS v1.5 (основной)"),
+    ("cosyvoice", "CosyVoice (скрытый резерв)"),
+    ("f5", "F5 (резерв для украинского)"),
+    ("qwen3", "Qwen3 (скрытый резерв)"),
 ]
 
 TELEGRAM_SAFE_VIDEO_BYTES = 45 * 1024 * 1024
@@ -146,8 +146,8 @@ def main() -> None:
         f"tts={settings.tts} "
         f"f5={settings.f5_model}/{settings.f5_device} "
         f"qwen3={settings.qwen3_model} "
-        f"chatterbox={settings.chatterbox_model}/{settings.chatterbox_device} "
         f"cosyvoice={settings.cosyvoice_model_id}/{settings.cosyvoice_device}/{settings.cosyvoice_mode} "
+        f"moss={settings.moss_model_dir}/{settings.moss_device} "
         f"multi_speaker={settings.multi_speaker} "
         f"speaker_clustering={settings.speaker_clustering}/{settings.max_speaker_clusters} "
         f"diarization={settings.diarization_model}/{settings.diarization_device} "
@@ -825,19 +825,20 @@ async def _prepare_input_audio_as_video(
         duration = await asyncio.to_thread(probe_duration, audio_path)
     except Exception as exc:
         print(f"Audio duration check failed: {type(exc).__name__}: {exc}", flush=True)
-        await status.edit_text(f"Не смог определить длительность аудио:\n{type(exc).__name__}: {exc}")
+        await _safe_edit_status(status, f"Не смог определить длительность аудио:\n{type(exc).__name__}: {exc}")
         return None
 
     target_duration = duration
     limit = _duration_limit_seconds(settings, user_id)
     if limit is not None and duration > limit + 0.5:
         target_duration = limit
-        await status.edit_text(
+        await _safe_edit_status(
+            status,
             f"Аудио длиннее лимита: {_format_duration(duration)}.\n"
             f"Взял первые {_format_duration(limit)} и собираю видеоряд."
         )
     else:
-        await status.edit_text("Собираю случайный видеоряд для аудио...")
+        await _safe_edit_status(status, "Собираю случайный видеоряд для аудио...")
 
     source_roots = _trusted_visual_source_roots(settings)
     output_path = job_dir / "input_audio_visual.mp4"
@@ -860,13 +861,13 @@ async def _prepare_input_audio_as_video(
     )
 
     if not output_path.exists() or output_path.stat().st_size < 1024:
-        await status.edit_text("Не удалось собрать видео из аудио: получился пустой файл.")
+        await _safe_edit_status(status, "Не удалось собрать видео из аудио: получился пустой файл.")
         return None
     if not await asyncio.to_thread(has_video_and_audio, output_path):
-        await status.edit_text("Не удалось собрать видео из аудио: в результате нет видео и аудио.")
+        await _safe_edit_status(status, "Не удалось собрать видео из аудио: в результате нет видео и аудио.")
         return None
 
-    await status.edit_text("Аудио превращено в видео. Продолжаю.")
+    await _safe_edit_status(status, "Аудио превращено в видео. Продолжаю.")
     return output_path
 
 
@@ -1312,13 +1313,21 @@ async def select_target_lang(update: Any, context: Any) -> None:
         return
 
     job["target_lang"] = target_lang
+    # MOSS is the normal production engine and is selected without an extra
+    # user-facing screen. MOSS v1.5 has no Ukrainian language, so Ukrainian
+    # jobs transparently retain the compatible F5 path.
+    tts_provider = "f5" if target_lang == "uk" else "moss"
+    job["tts_provider"] = tts_provider
     job["translation_chaos"] = "crooked"
     _ensure_translation_seed(job)
-    _save_job_snapshot(Path(job["job_dir"]), job, status="select_tts")
+    _save_job_snapshot(Path(job["job_dir"]), job, status="queued")
     await query.edit_message_text(
-        "Выбери метод озвучки.",
-        reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2, back_callback="back:target"),
+        f"Ставлю задачу в очередь. Голоса: {_speaker_count_label(job.get('speaker_count'))}. "
+        f"Язык озвучки: {_target_lang_label(target_lang)}. "
+        f"Движок: {_tts_method_label(tts_provider)}."
     )
+    context.user_data.pop("job", None)
+    await _enqueue_job(update, context, job, query.message)
 
 
 async def select_tts_method(update: Any, context: Any) -> None:
@@ -1333,7 +1342,7 @@ async def select_tts_method(update: Any, context: Any) -> None:
     if tts_provider is None:
         await query.edit_message_text("Неизвестный метод озвучки. Пришли видео ещё раз.")
         return
-    if _target_lang_value(job.get("target_lang")) == "uk" and tts_provider in {"qwen3", "chatterbox", "cosyvoice"}:
+    if _target_lang_value(job.get("target_lang")) == "uk" and tts_provider in {"qwen3", "cosyvoice", "moss"}:
         provider_label = _tts_method_label(tts_provider)
         await query.edit_message_text(
             f"{provider_label} не поддерживает украинскую озвучку. Выбери F5.",
@@ -1927,7 +1936,9 @@ class _JobScheduler:
             return False
         if execution_kind == "remote" and _target_lang_value(item.job.get("target_lang")) != "ru":
             return False
-        if execution_kind == "remote" and _tts_provider_value(item.job.get("tts_provider")) in {"qwen3", "cosyvoice"}:
+        if execution_kind == "remote" and _tts_provider_value(item.job.get("tts_provider")) in {
+            "qwen3", "cosyvoice", "moss"
+        }:
             return False
         if item.user_id is None:
             return True
@@ -2247,10 +2258,10 @@ def _tts_provider_value(value: Any) -> str | None:
         return "qwen3"
     if text in {"f5", "f5-tts", "f5tts"}:
         return "f5"
-    if text in {"chatterbox", "chatterbox-tts", "chatterboxtts"}:
-        return "chatterbox"
     if text in {"cosyvoice", "cosyvoice-tts", "cosyvoicetts", "cosy"}:
         return "cosyvoice"
+    if text in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
+        return "moss"
     return None
 
 
@@ -2532,13 +2543,14 @@ async def _process_job(
         "qwen3",
         "qwen3-tts",
         "qwen3tts",
-        "chatterbox",
-        "chatterbox-tts",
-        "chatterboxtts",
         "cosyvoice",
         "cosyvoice-tts",
         "cosyvoicetts",
         "cosy",
+        "moss",
+        "moss-tts",
+        "mosstts",
+        "moss-v1.5",
     }:
         tts_provider = "f5"
     job["translation_chaos"] = _translation_chaos_value(job.get("translation_chaos")) or "crooked"
@@ -2584,13 +2596,6 @@ async def _process_job(
         qwen3_model=settings.qwen3_model,
         qwen3_cache_dir=settings.qwen3_cache_dir,
         qwen3_timeout_seconds=settings.qwen3_timeout_seconds,
-        chatterbox_python=settings.chatterbox_python,
-        chatterbox_model=settings.chatterbox_model,
-        chatterbox_device=settings.chatterbox_device,
-        chatterbox_cache_dir=settings.chatterbox_cache_dir,
-        chatterbox_exaggeration=settings.chatterbox_exaggeration,
-        chatterbox_cfg_weight=settings.chatterbox_cfg_weight,
-        chatterbox_timeout_seconds=settings.chatterbox_timeout_seconds,
         cosyvoice_python=settings.cosyvoice_python,
         cosyvoice_repo_dir=settings.cosyvoice_repo_dir,
         cosyvoice_model_dir=settings.cosyvoice_model_dir,
@@ -2600,6 +2605,11 @@ async def _process_job(
         cosyvoice_device=settings.cosyvoice_device,
         cosyvoice_speed=settings.cosyvoice_speed,
         cosyvoice_timeout_seconds=settings.cosyvoice_timeout_seconds,
+        moss_python=settings.moss_python,
+        moss_model_dir=settings.moss_model_dir,
+        moss_codec_dir=settings.moss_codec_dir,
+        moss_device=settings.moss_device,
+        moss_timeout_seconds=settings.moss_timeout_seconds,
         multi_speaker=settings.multi_speaker,
         speaker_reference_seconds=settings.speaker_reference_seconds,
         speaker_clustering=settings.speaker_clustering,

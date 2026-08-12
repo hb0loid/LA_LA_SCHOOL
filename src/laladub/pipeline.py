@@ -40,7 +40,7 @@ from .quality import (
 from .separation import SeparationResult, separate_audio
 from .srt import read_srt, write_srt, write_txt
 from .translation import translate_segments, translate_text_chain
-from .tts import synthesize_chatterbox_batch, synthesize_cosyvoice_batch, synthesize_qwen3_batch, synthesize_segment
+from .tts import synthesize_cosyvoice_batch, synthesize_moss_batch, synthesize_qwen3_batch, synthesize_segment
 
 
 _DEFAULT_META_HALLUCINATION_TERMS = [
@@ -933,7 +933,8 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
                 source_duration=source_duration,
             )
         segments = _fill_sparse_dub_segments(segments, config, source_audio, source_duration)
-        segments = _fit_segment_text_budgets(segments, config)
+        if config.tts.lower() not in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
+            segments = _fit_segment_text_budgets(segments, config)
         segments, repeat_clamp_changed = clamp_obvious_word_repeats_in_segments(
             segments,
             max_word_repeats=3,
@@ -943,7 +944,9 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         translation_changed = True
     filled_segments = _fill_sparse_dub_segments(segments, config, source_audio, source_duration)
     if filled_segments is not segments:
-        segments = _fit_segment_text_budgets(filled_segments, config)
+        segments = filled_segments
+        if config.tts.lower() not in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
+            segments = _fit_segment_text_budgets(segments, config)
         segments, repeat_clamp_changed = clamp_obvious_word_repeats_in_segments(
             segments,
             max_word_repeats=3,
@@ -984,13 +987,14 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         "qwen3",
         "qwen3-tts",
         "qwen3tts",
-        "chatterbox",
-        "chatterbox-tts",
-        "chatterboxtts",
         "cosyvoice",
         "cosyvoice-tts",
         "cosyvoicetts",
         "cosy",
+        "moss",
+        "moss-tts",
+        "mosstts",
+        "moss-v1.5",
     }
     batch_items: list[tuple[int, Segment, Path]] = []
     if batch_provider:
@@ -1002,10 +1006,10 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
             try:
                 if tts_provider in {"qwen3", "qwen3-tts", "qwen3tts"}:
                     synthesize_qwen3_batch(batch_items, config)
-                elif tts_provider in {"chatterbox", "chatterbox-tts", "chatterboxtts"}:
-                    synthesize_chatterbox_batch(batch_items, config)
                 elif tts_provider in {"cosyvoice", "cosyvoice-tts", "cosyvoicetts", "cosy"}:
                     synthesize_cosyvoice_batch(batch_items, config)
+                elif tts_provider in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
+                    synthesize_moss_batch(batch_items, config)
             except Exception as exc:
                 print(f"      {config.tts} batch fallback to F5: {type(exc).__name__}: {exc}")
                 fallback_config = copy(config)
@@ -1027,7 +1031,11 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         else:
             if not batch_provider:
                 synthesize_segment(segment, raw_path, config)
-            if config.fit_to_segments:
+            if tts_provider in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
+                # MOSS controls its own delivery and must be allowed to finish
+                # the phrase instead of being time-stretched or trimmed.
+                normalize_wav(raw_path, fitted_path)
+            elif config.fit_to_segments:
                 fit_wav_to_duration(raw_path, fitted_path, max(0.1, segment.duration))
             else:
                 normalize_wav(raw_path, fitted_path)
@@ -2996,13 +3004,14 @@ def _needs_speaker_references(config: DubConfig) -> bool:
         "qwen3",
         "qwen3-tts",
         "qwen3tts",
-        "chatterbox",
-        "chatterbox-tts",
-        "chatterboxtts",
         "cosyvoice",
         "cosyvoice-tts",
         "cosyvoicetts",
         "cosy",
+        "moss",
+        "moss-tts",
+        "mosstts",
+        "moss-v1.5",
     }
 
 

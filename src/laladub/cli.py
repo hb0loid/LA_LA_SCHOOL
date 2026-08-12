@@ -61,13 +61,6 @@ def main(argv: list[str] | None = None) -> None:
             f5_cross_fade_duration=args.f5_cross_fade_duration,
             f5_remove_silence=args.f5_remove_silence,
             f5_timeout_seconds=args.f5_timeout_seconds,
-            chatterbox_python=args.chatterbox_python,
-            chatterbox_model=args.chatterbox_model,
-            chatterbox_device=args.chatterbox_device,
-            chatterbox_cache_dir=args.chatterbox_cache_dir,
-            chatterbox_exaggeration=args.chatterbox_exaggeration,
-            chatterbox_cfg_weight=args.chatterbox_cfg_weight,
-            chatterbox_timeout_seconds=args.chatterbox_timeout_seconds,
             cosyvoice_python=args.cosyvoice_python,
             cosyvoice_repo_dir=args.cosyvoice_repo_dir,
             cosyvoice_model_dir=args.cosyvoice_model_dir,
@@ -77,6 +70,11 @@ def main(argv: list[str] | None = None) -> None:
             cosyvoice_device=args.cosyvoice_device,
             cosyvoice_speed=args.cosyvoice_speed,
             cosyvoice_timeout_seconds=args.cosyvoice_timeout_seconds,
+            moss_python=args.moss_python,
+            moss_model_dir=args.moss_model_dir,
+            moss_codec_dir=args.moss_codec_dir,
+            moss_device=args.moss_device,
+            moss_timeout_seconds=args.moss_timeout_seconds,
             multi_speaker=not args.no_multi_speaker,
             speaker_reference_seconds=args.speaker_reference_seconds,
             separation=args.separation,
@@ -149,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument(
         "--tts",
         default="sapi",
-        choices=["sapi", "piper", "xtts", "f5", "chatterbox", "cosyvoice", "none"],
+        choices=["sapi", "piper", "xtts", "f5", "cosyvoice", "moss", "none"],
         help="TTS provider.",
     )
     dub.add_argument("--voice", default=None, help="SAPI voice name.")
@@ -178,13 +176,6 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument("--f5-cross-fade-duration", type=float, default=0.15)
     dub.add_argument("--f5-remove-silence", action="store_true")
     dub.add_argument("--f5-timeout-seconds", type=int, default=1800)
-    dub.add_argument("--chatterbox-python", type=Path, default=Path(".venv-chatterbox") / "Scripts" / "python.exe")
-    dub.add_argument("--chatterbox-model", default="v3")
-    dub.add_argument("--chatterbox-device", default="auto", choices=["auto", "cpu", "cuda"])
-    dub.add_argument("--chatterbox-cache-dir", type=Path, default=Path("models/chatterbox"))
-    dub.add_argument("--chatterbox-exaggeration", type=float, default=0.5)
-    dub.add_argument("--chatterbox-cfg-weight", type=float, default=0.5)
-    dub.add_argument("--chatterbox-timeout-seconds", type=int, default=1800)
     dub.add_argument("--cosyvoice-python", type=Path, default=Path(".venv-cosyvoice") / "Scripts" / "python.exe")
     dub.add_argument("--cosyvoice-repo-dir", type=Path, default=Path("models/cosyvoice/CosyVoice"))
     dub.add_argument(
@@ -198,6 +189,11 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument("--cosyvoice-device", default="auto", choices=["auto", "cpu", "cuda"])
     dub.add_argument("--cosyvoice-speed", type=float, default=1.0)
     dub.add_argument("--cosyvoice-timeout-seconds", type=int, default=1800)
+    dub.add_argument("--moss-python", type=Path, default=Path(".venv-moss") / "Scripts" / "python.exe")
+    dub.add_argument("--moss-model-dir", type=Path, default=Path("models/moss/MOSS-TTS-Local-Transformer-v1.5"))
+    dub.add_argument("--moss-codec-dir", type=Path, default=Path("models/moss/MOSS-Audio-Tokenizer-v2"))
+    dub.add_argument("--moss-device", default="auto", choices=["auto", "cpu", "cuda"])
+    dub.add_argument("--moss-timeout-seconds", type=int, default=1800)
     dub.add_argument("--no-multi-speaker", action="store_true", help="Use one speaker reference for all segments.")
     dub.add_argument(
         "--speaker-reference-seconds",

@@ -144,6 +144,13 @@ def synthesize_segment(segment: Segment, output_path: Path, config: DubConfig) -
             _fallback_segment_to_f5(segment, text, output_path, config, "CosyVoice", exc)
         return
 
+    if provider in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
+        try:
+            synthesize_moss_batch([(1, segment, output_path)], config)
+        except Exception as exc:
+            _fallback_segment_to_f5(segment, text, output_path, config, "MOSS", exc)
+        return
+
     raise TTSError(f"Unknown TTS provider: {config.tts}")
 
 
@@ -441,6 +448,78 @@ def synthesize_cosyvoice_batch(
     missing = [str(path) for _index, _segment, path in items if not path.is_file() or path.stat().st_size < 1024]
     if missing:
         raise TTSError(f"CosyVoice did not create valid WAV files: {', '.join(missing[:3])}")
+
+
+def synthesize_moss_batch(
+    items: list[tuple[int, Segment, Path]],
+    config: DubConfig,
+) -> None:
+    if not items:
+        return
+
+    python_path = _resolve_moss_python(config)
+    runner_path = _repo_root() / "tools" / "moss_tts_batch_runner.py"
+    if not runner_path.is_file():
+        raise TTSError(f"MOSS batch runner does not exist: {runner_path}")
+
+    language = _moss_language(config.target_lang)
+    manifest_items: list[dict[str, object]] = []
+    for _index, segment, output_path in items:
+        text = _sanitize_text_for_xtts(segment.spoken_text)
+        if config.target_lang == "ru":
+            text = _apply_f5_pronunciation_dictionary(text)
+        if not text:
+            make_silence(output_path, max(0.15, segment.duration))
+            continue
+        speaker_wav = segment.speaker_wav or config.speaker_wav
+        if not speaker_wav or not speaker_wav.is_file():
+            raise TTSError(f"MOSS speaker reference does not exist: {speaker_wav}")
+        source_seconds = max(0.4, float(segment.duration))
+        manifest_items.append(
+            {
+                "output": str(output_path.resolve()),
+                "text": text,
+                "reference": str(speaker_wav.resolve()),
+                "source_seconds": source_seconds,
+                "target_seconds": source_seconds,
+                "language": language,
+            }
+        )
+
+    if not manifest_items:
+        return
+
+    manifest_path = config.workdir / "moss_batch_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "model_dir": str(_resolve_repo_relative_path(config.moss_model_dir)),
+        "codec_dir": str(_resolve_repo_relative_path(config.moss_codec_dir)),
+        "device": config.moss_device,
+        "seed": 42,
+        "duration_control": False,
+        "lead_pause_seconds": 0.3,
+        "trail_pause_seconds": 0.25,
+        "natural_max_new_tokens": 512,
+        "edge_padding_seconds": 0.04,
+        "items": manifest_items,
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    command = [str(python_path), str(runner_path), "--manifest", str(manifest_path.resolve())]
+    _run_progress_tts_batch(
+        command,
+        items,
+        config,
+        label="MOSS",
+        start_prefix="MOSS_START",
+        progress_prefix="MOSS_PROGRESS",
+        timeout_seconds=config.moss_timeout_seconds,
+        extra_env={"HF_HUB_DISABLE_XET": "1"},
+    )
+
+    missing = [str(path) for _index, _segment, path in items if not path.is_file() or path.stat().st_size < 1024]
+    if missing:
+        raise TTSError(f"MOSS did not create valid WAV files: {', '.join(missing[:3])}")
 
 
 def _run_progress_tts_batch(
@@ -827,6 +906,16 @@ def _resolve_qwen3_python(config: DubConfig) -> Path:
     return python_path
 
 
+def _resolve_moss_python(config: DubConfig) -> Path:
+    python_path = config.moss_python or Path(".venv-moss") / "Scripts" / "python.exe"
+    python_path = _resolve_repo_relative_path(python_path)
+    if not python_path.is_file():
+        raise TTSError(
+            "MOSS Python was not found. Set LALADUB_MOSS_PYTHON to the isolated MOSS environment."
+        )
+    return python_path
+
+
 def _synthesize_chatterbox(segment: Segment, text: str, output_path: Path, config: DubConfig) -> None:
     text = _sanitize_text_for_xtts(text)
     if config.target_lang == "ru":
@@ -1080,6 +1169,16 @@ def _qwen3_language(target_lang: str) -> str:
         "en": "English",
         "uk": "Russian",
     }.get((target_lang or "ru").lower(), "Russian")
+
+
+def _moss_language(target_lang: str) -> str:
+    language = {
+        "ru": "Russian",
+        "en": "English",
+    }.get((target_lang or "ru").lower())
+    if language is None:
+        raise TTSError(f"MOSS-TTS v1.5 does not support target language: {target_lang}")
+    return language
 
 
 def _resolve_f5_model_file(local_path: Path | None, repo: str, repo_path: str, cache_dir: Path) -> Path:
