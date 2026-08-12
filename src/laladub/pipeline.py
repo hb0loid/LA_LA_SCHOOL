@@ -1120,11 +1120,9 @@ def _build_artifact_segments(
     artifact_config.force_source_language = True
     artifact_config.suppress_plain_ascii_tokens = False
     artifact_config.condition_on_previous_text = True
-    artifact_config.initial_prompt = _artifact_initial_prompt(
-        artifact_lang,
-        same_language=ru_same_language_hunt,
-        seed_material=f"{_translation_seed_base(config)}|artifact|full",
-    )
+    # Only accept hallucinations produced from this video's audio. Supplying
+    # known phrases here made prompted text look like a genuine Whisper find.
+    artifact_config.initial_prompt = None
     artifact_config.hallucination_silence_threshold = None
     artifact_config.collapse_repetitions = True
     try:
@@ -1196,14 +1194,6 @@ def _build_artifact_segments(
             print(f"      Whisper artifact layer skipped: {type(exc).__name__}: {exc}")
 
     artifacts = whole_artifacts if config.artifact_chaos_mode else _dedupe_artifact_segments(whole_artifacts)
-    if config.artifact_chaos_mode:
-        artifacts = _fill_sparse_artifacts_from_history(
-            artifacts,
-            config,
-            artifact_lang,
-            base_segments,
-            source_duration,
-        )
     if artifacts:
         write_srt(_debug_path(config, "artifact_translated.srt"), artifacts, translated=True)
         print(f"      Artifact candidates: {len(artifacts)}")
@@ -2105,18 +2095,9 @@ def _harvest_chunked_forced_artifacts(
     print(f"      Chaos artifact chunk harvest: windows={len(windows)}")
     chunk_config = copy(artifact_config)
     chunk_config.condition_on_previous_text = True
-    same_language_ru = bool(
-        artifact_config.source_lang == "ru"
-        and config.source_lang
-        and artifact_config.source_lang == config.source_lang
-    )
     result: list[Segment] = []
     for index, (start, duration) in enumerate(windows, start=1):
-        chunk_config.initial_prompt = _artifact_initial_prompt(
-            artifact_config.source_lang,
-            same_language=same_language_ru,
-            seed_material=f"{_translation_seed_base(config)}|artifact|chunk|{index}",
-        ) or artifact_config.initial_prompt
+        chunk_config.initial_prompt = None
         chunk_path = chunk_dir / f"{index:04d}_{start:.2f}_{duration:.2f}.wav"
         try:
             extract_wav_slice(source_audio, chunk_path, start, duration)
@@ -2682,15 +2663,12 @@ def _inject_chaos_artifact_segments(
     return sorted([*kept_segments, *sorted_replacements], key=lambda item: (item.start, item.end))
 
 
-def _chaos_artifact_rank(artifact: Segment) -> tuple[int, int, int, float, int, float]:
+def _chaos_artifact_rank(artifact: Segment) -> tuple[int, int, float, int, float]:
     text = artifact.spoken_text
-    signature = _artifact_signature(text)
-    legacy_signatures = {_artifact_signature(item) for item in _legacy_artifact_inserts_ru()}
-    is_legacy = int(signature in legacy_signatures)
     is_meta = int(_looks_like_meta_hallucination(text) or _looks_like_meta_hallucination(artifact.text))
     words = len(text.split())
     has_body = int(words >= 3)
-    return (is_legacy, is_meta, has_body, min(artifact.duration, 30.0), words, -artifact.start)
+    return (is_meta, has_body, min(artifact.duration, 30.0), words, -artifact.start)
 
 
 def _chaos_artifact_replacement_interval(artifact: Segment, text: str, source_duration: float) -> tuple[float, float]:
