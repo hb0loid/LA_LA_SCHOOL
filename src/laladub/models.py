@@ -111,13 +111,6 @@ class DubConfig:
     qwen3_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
     qwen3_cache_dir: Path = Path("models/qwen3tts")
     qwen3_timeout_seconds: int = 1800
-    chatterbox_python: Path | None = None
-    chatterbox_model: str = "v3"
-    chatterbox_device: str = "auto"
-    chatterbox_cache_dir: Path = Path("models/chatterbox")
-    chatterbox_exaggeration: float = 0.5
-    chatterbox_cfg_weight: float = 0.5
-    chatterbox_timeout_seconds: int = 1800
     cosyvoice_python: Path | None = None
     cosyvoice_repo_dir: Path = Path("models/cosyvoice/CosyVoice")
     cosyvoice_model_dir: Path = Path("models/cosyvoice/pretrained_models/Fun-CosyVoice3-0.5B")
@@ -127,6 +120,11 @@ class DubConfig:
     cosyvoice_device: str = "auto"
     cosyvoice_speed: float = 1.0
     cosyvoice_timeout_seconds: int = 1800
+    moss_python: Path | None = None
+    moss_model_dir: Path = Path("models/moss/MOSS-TTS-Local-Transformer-v1.5")
+    moss_codec_dir: Path = Path("models/moss/MOSS-Audio-Tokenizer-v2")
+    moss_device: str = "auto"
+    moss_timeout_seconds: int = 1800
     separation: str = "none"
     separation_device: str = "cpu"
     demucs_model: str = "htdemucs"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import re
 from pathlib import Path
 
 
@@ -42,6 +43,17 @@ def main() -> None:
     device = _resolve_device(args.device)
 
     from f5_tts.api import F5TTS
+    from f5_tts.infer.utils_infer import preprocess_ref_audio_text
+
+    prepared_ref, prepared_ref_text = preprocess_ref_audio_text(str(Path(args.ref_audio)), ref_text)
+    reference_seconds = _wav_duration(Path(prepared_ref))
+    words = re.findall(r"[^\W_]+", prepared_ref_text, flags=re.UNICODE)
+    letters = re.sub(r"\W+", "", prepared_ref_text, flags=re.UNICODE)
+    corrected_speed = args.speed
+    if words and letters:
+        expected_speech_seconds = max(0.55, len(words) / 2.4, len(letters) / 15.0)
+        duration_correction = max(0.75, min(7.0, reference_seconds / expected_speech_seconds))
+        corrected_speed = max(0.25, args.speed * duration_correction)
 
     tts = F5TTS(
         model=args.model,
@@ -50,15 +62,15 @@ def main() -> None:
         device=device,
     )
     tts.infer(
-        ref_file=str(Path(args.ref_audio)),
-        ref_text=ref_text,
+        ref_file=prepared_ref,
+        ref_text=prepared_ref_text,
         gen_text=text,
         file_wave=str(output_path),
         target_rms=args.target_rms,
         cross_fade_duration=args.cross_fade_duration,
         cfg_strength=args.cfg_strength,
         nfe_step=args.nfe_step,
-        speed=args.speed,
+        speed=corrected_speed,
         remove_silence=args.remove_silence,
     )
 
@@ -72,10 +84,18 @@ def main() -> None:
                 "device": device,
                 "ckpt_file": str(ckpt_file),
                 "vocab_file": str(vocab_file),
+                "speed": corrected_speed,
             },
             ensure_ascii=False,
         )
     )
+
+
+def _wav_duration(path: Path) -> float:
+    import wave
+
+    with wave.open(str(path), "rb") as stream:
+        return max(0.1, stream.getnframes() / max(1, stream.getframerate()))
 
 
 def _resolve_model_file(local_path: str, repo: str, repo_path: str, cache_dir: str) -> Path:

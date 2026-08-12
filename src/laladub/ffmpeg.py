@@ -615,6 +615,34 @@ def make_whisper_chaos_audio(input_path: Path, output_path: Path, gain_db: float
     )
 
 
+def make_whisper_semantic_audio(input_path: Path, output_path: Path) -> None:
+    """Flatten speech dynamics without the hard clipping used by artifact ASR."""
+    ffmpeg = require_tool("ffmpeg")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    run(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(input_path),
+            "-vn",
+            "-af",
+            (
+                "highpass=f=70,lowpass=f=7800,"
+                "acompressor=threshold=-32dB:ratio=10:attack=4:release=120:makeup=8dB,"
+                "alimiter=limit=0.98"
+            ),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(output_path),
+        ]
+    )
+
+
 def extract_wav_slice(
     input_path: Path,
     output_path: Path,
@@ -717,8 +745,8 @@ def fit_wav_to_duration(
     output_path: Path,
     target_duration: float,
     *,
-    min_tempo: float = 0.92,
-    max_tempo: float = 2.15,
+    min_tempo: float = 0.80,
+    max_tempo: float = 8.0,
 ) -> None:
     source_duration = probe_duration(input_path)
     if target_duration <= 0.05 or source_duration <= 0.05:
@@ -726,15 +754,20 @@ def fit_wav_to_duration(
         return
 
     tempo = source_duration / target_duration
-    if tempo < min_tempo:
-        normalize_wav(input_path, output_path)
-        return
-    if min_tempo <= tempo <= 1.08:
+    fitted_tempo = max(min_tempo, min(tempo, max_tempo))
+    if 0.98 <= fitted_tempo <= 1.0:
         normalize_wav(input_path, output_path)
         return
 
     ffmpeg = require_tool("ffmpeg")
-    filter_value = _atempo_chain(min(tempo, max_tempo))
+    # Mildly slow compact TTS down instead of leaving a large empty slot.  For
+    # long clips use the full required tempo so the sentence finishes before
+    # the next one.  apad+atrim makes the allocated window a hard boundary;
+    # trimming is only a last-resort guard for ratios beyond max_tempo.
+    filter_value = (
+        f"{_atempo_chain(fitted_tempo)},"
+        f"apad=pad_dur={target_duration:.4f},atrim=duration={target_duration:.4f}"
+    )
 
     run(
         [

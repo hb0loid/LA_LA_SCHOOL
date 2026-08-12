@@ -66,13 +66,6 @@ class BotSettings:
     qwen3_model: str
     qwen3_cache_dir: Path
     qwen3_timeout_seconds: int
-    chatterbox_python: Path | None
-    chatterbox_model: str
-    chatterbox_device: str
-    chatterbox_cache_dir: Path
-    chatterbox_exaggeration: float
-    chatterbox_cfg_weight: float
-    chatterbox_timeout_seconds: int
     cosyvoice_python: Path | None
     cosyvoice_repo_dir: Path
     cosyvoice_model_dir: Path
@@ -82,6 +75,11 @@ class BotSettings:
     cosyvoice_device: str
     cosyvoice_speed: float
     cosyvoice_timeout_seconds: int
+    moss_python: Path | None
+    moss_model_dir: Path
+    moss_codec_dir: Path
+    moss_device: str
+    moss_timeout_seconds: int
     multi_speaker: bool
     speaker_reference_seconds: float
     speaker_clustering: bool
@@ -170,7 +168,7 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         free_max_duration_seconds=float(os.environ.get("LALADUB_FREE_MAX_DURATION_SECONDS", "180")),
         paid_max_duration_seconds=float(os.environ.get("LALADUB_PAID_MAX_DURATION_SECONDS", "0")),
         translator=os.environ.get("LALADUB_TRANSLATOR", "hybrid"),
-        tts=os.environ.get("LALADUB_TTS", "xtts"),
+        tts=os.environ.get("LALADUB_TTS", "moss"),
         voice=_empty_to_none(os.environ.get("LALADUB_VOICE", "Microsoft Irina Desktop")),
         speaker_wav=_optional_path(os.environ.get("LALADUB_SPEAKER_WAV")),
         xtts_model=os.environ.get("LALADUB_XTTS_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2"),
@@ -215,15 +213,6 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         qwen3_model=os.environ.get("LALADUB_QWEN3_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
         qwen3_cache_dir=Path(os.environ.get("LALADUB_QWEN3_CACHE_DIR", "models/qwen3tts")),
         qwen3_timeout_seconds=int(os.environ.get("LALADUB_QWEN3_TIMEOUT_SECONDS", "1800")),
-        chatterbox_python=_optional_path(
-            os.environ.get("LALADUB_CHATTERBOX_PYTHON", ".venv-chatterbox\\Scripts\\python.exe")
-        ),
-        chatterbox_model=os.environ.get("LALADUB_CHATTERBOX_MODEL", "v3"),
-        chatterbox_device=os.environ.get("LALADUB_CHATTERBOX_DEVICE", "auto"),
-        chatterbox_cache_dir=Path(os.environ.get("LALADUB_CHATTERBOX_CACHE_DIR", "models/chatterbox")),
-        chatterbox_exaggeration=float(os.environ.get("LALADUB_CHATTERBOX_EXAGGERATION", "0.5")),
-        chatterbox_cfg_weight=float(os.environ.get("LALADUB_CHATTERBOX_CFG_WEIGHT", "0.5")),
-        chatterbox_timeout_seconds=int(os.environ.get("LALADUB_CHATTERBOX_TIMEOUT_SECONDS", "1800")),
         cosyvoice_python=_optional_path(os.environ.get("LALADUB_COSYVOICE_PYTHON", ".venv-cosyvoice\\Scripts\\python.exe")),
         cosyvoice_repo_dir=Path(os.environ.get("LALADUB_COSYVOICE_REPO_DIR", "models/cosyvoice/CosyVoice")),
         cosyvoice_model_dir=Path(
@@ -238,6 +227,13 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         cosyvoice_device=os.environ.get("LALADUB_COSYVOICE_DEVICE", "auto"),
         cosyvoice_speed=float(os.environ.get("LALADUB_COSYVOICE_SPEED", "1.0")),
         cosyvoice_timeout_seconds=int(os.environ.get("LALADUB_COSYVOICE_TIMEOUT_SECONDS", "1800")),
+        moss_python=_optional_path(os.environ.get("LALADUB_MOSS_PYTHON", ".venv-moss\\Scripts\\python.exe")),
+        moss_model_dir=Path(
+            os.environ.get("LALADUB_MOSS_MODEL_DIR", "models/moss/MOSS-TTS-Local-Transformer-v1.5")
+        ),
+        moss_codec_dir=Path(os.environ.get("LALADUB_MOSS_CODEC_DIR", "models/moss/MOSS-Audio-Tokenizer-v2")),
+        moss_device=os.environ.get("LALADUB_MOSS_DEVICE", "auto"),
+        moss_timeout_seconds=int(os.environ.get("LALADUB_MOSS_TIMEOUT_SECONDS", "1800")),
         multi_speaker=_parse_bool(os.environ.get("LALADUB_MULTI_SPEAKER", "1")),
         speaker_reference_seconds=float(os.environ.get("LALADUB_SPEAKER_REFERENCE_SECONDS", "5.0")),
         speaker_clustering=_parse_bool(os.environ.get("LALADUB_SPEAKER_CLUSTERING", "1")),

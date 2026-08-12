@@ -23,8 +23,8 @@ from .ffmpeg import (
     extract_audio,
     extract_audio_track,
     extract_wav_slice,
-    fit_wav_to_duration,
     make_whisper_chaos_audio,
+    make_whisper_semantic_audio,
     normalize_wav,
     prepare_voice_reference,
     probe_duration,
@@ -40,7 +40,7 @@ from .quality import (
 from .separation import SeparationResult, separate_audio
 from .srt import read_srt, write_srt, write_txt
 from .translation import translate_segments, translate_text_chain
-from .tts import synthesize_chatterbox_batch, synthesize_cosyvoice_batch, synthesize_qwen3_batch, synthesize_segment
+from .tts import synthesize_cosyvoice_batch, synthesize_moss_batch, synthesize_qwen3_batch, synthesize_segment
 
 
 _DEFAULT_META_HALLUCINATION_TERMS = [
@@ -425,7 +425,7 @@ def _save_resume_state(config: DubConfig, **updates: object) -> None:
 def _source_asr_signature(config: DubConfig) -> str:
     """Identify source transcripts that are safe to reuse after pipeline changes."""
     values = (
-        "content-chaos-v3",
+        "content-chaos-v6-short-variable-semantic-neuralmix",
         config.asr_backend,
         config.whisper_model,
         config.source_lang or "auto",
@@ -722,6 +722,8 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
             raise RuntimeError("audio_bed=instrumental needs --separation demucs")
     _save_resume_state(config, audio=True, separation=separation_result is not None)
     source_duration = probe_duration(source_audio)
+    if config.content_chaos_backbone:
+        config.artifact_ratio = _semantic_artifact_ratio(config)
     _report_progress(config, "Аудио подготовлено", 20, 100, None)
 
     _report_progress(
@@ -756,12 +758,23 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         resumed_lang = resume_state.get("source_lang")
         if not config.force_source_language and isinstance(resumed_lang, str) and resumed_lang:
             config.source_lang = resumed_lang
+        if config.content_chaos_backbone:
+            resumed_artifact_lang = resume_state.get("artifact_source_lang")
+            if isinstance(resumed_artifact_lang, str) and resumed_artifact_lang:
+                config.artifact_source_lang = resumed_artifact_lang
+            config.input_pivot_lang = None
         segments = read_srt(source_srt_path, translated=False)
         print(f"      Resume: loaded source ASR segments={len(segments)}")
     else:
         requested_source_lang = config.source_lang
         main_asr_audio = _whisper_chaos_audio(source_audio, config, purpose="main")
-        segments = transcribe(main_asr_audio, config)
+        if config.content_chaos_backbone:
+            segments = _build_semantic_chaos_backbone(source_audio, config, source_duration)
+            if not segments:
+                print("      Semantic chaos backbone was empty; using whole forced ASR")
+                segments = transcribe(main_asr_audio, config)
+        else:
+            segments = transcribe(main_asr_audio, config)
         segments = _clamp_segments_to_duration(segments, source_duration)
         if (
             config.artifact_chaos_mode
@@ -835,20 +848,19 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
                             config,
                         )
                         config.artifact_source_lang = artifact_lang
-                        config.input_pivot_lang = forced_lang
-                        config.source_lang = timing_lang
+                        config.input_pivot_lang = None
+                        config.source_lang = forced_lang
                         config.force_source_language = False
                         config.inject_artifacts = bool(artifact_lang)
-                        config.artifact_ratio = 0.20
                         segments = [
                             Segment(start=item.start, end=item.end, text=item.text)
-                            for item in timing_segments
+                            for item in aligned_segments
                             if item.text.strip()
                         ]
                         print(
                             "      Content chaos backbone: "
-                            f"content={len(segments)} forced_artifacts={len(aligned_segments)} "
-                            f"source={config.source_lang or 'auto'} "
+                            f"semantic={len(segments)} timing={len(timing_segments)} "
+                            f"source={config.source_lang or 'auto'} ratio={config.artifact_ratio:.2f} "
                             f"selected={forced_lang or 'none'} corruption={artifact_lang or 'none'}"
                         )
                     else:
@@ -862,6 +874,7 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
             config,
             source_asr=True,
             source_lang=config.source_lang,
+            artifact_source_lang=config.artifact_source_lang,
             source_asr_signature=requested_source_signature,
         )
     retry_segments = _retry_sparse_source_asr(source_audio, config, segments, source_duration)
@@ -933,7 +946,6 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
                 source_duration=source_duration,
             )
         segments = _fill_sparse_dub_segments(segments, config, source_audio, source_duration)
-        segments = _fit_segment_text_budgets(segments, config)
         segments, repeat_clamp_changed = clamp_obvious_word_repeats_in_segments(
             segments,
             max_word_repeats=3,
@@ -943,7 +955,6 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         translation_changed = True
     filled_segments = _fill_sparse_dub_segments(segments, config, source_audio, source_duration)
     if filled_segments is not segments:
-        segments = _fit_segment_text_budgets(filled_segments, config)
         segments, repeat_clamp_changed = clamp_obvious_word_repeats_in_segments(
             segments,
             max_word_repeats=3,
@@ -984,13 +995,14 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         "qwen3",
         "qwen3-tts",
         "qwen3tts",
-        "chatterbox",
-        "chatterbox-tts",
-        "chatterboxtts",
         "cosyvoice",
         "cosyvoice-tts",
         "cosyvoicetts",
         "cosy",
+        "moss",
+        "moss-tts",
+        "mosstts",
+        "moss-v1.5",
     }
     batch_items: list[tuple[int, Segment, Path]] = []
     if batch_provider:
@@ -1002,10 +1014,10 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
             try:
                 if tts_provider in {"qwen3", "qwen3-tts", "qwen3tts"}:
                     synthesize_qwen3_batch(batch_items, config)
-                elif tts_provider in {"chatterbox", "chatterbox-tts", "chatterboxtts"}:
-                    synthesize_chatterbox_batch(batch_items, config)
                 elif tts_provider in {"cosyvoice", "cosyvoice-tts", "cosyvoicetts", "cosy"}:
                     synthesize_cosyvoice_batch(batch_items, config)
+                elif tts_provider in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
+                    synthesize_moss_batch(batch_items, config)
             except Exception as exc:
                 print(f"      {config.tts} batch fallback to F5: {type(exc).__name__}: {exc}")
                 fallback_config = copy(config)
@@ -1028,7 +1040,10 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
             if not batch_provider:
                 synthesize_segment(segment, raw_path, config)
             if config.fit_to_segments:
-                fit_wav_to_duration(raw_path, fitted_path, max(0.1, segment.duration))
+                # Keep the TTS engine's natural delivery.  Speeding every WAV
+                # up/down or shortening its text to subtitle boundaries sounds
+                # worse than overlap, particularly with different speakers.
+                normalize_wav(raw_path, fitted_path)
             else:
                 normalize_wav(raw_path, fitted_path)
         mix_items.append((fitted_path, int(segment.start * 1000)))
@@ -1085,7 +1100,11 @@ def _build_artifact_segments(
     artifact_lang = config.artifact_source_lang
     if not config.inject_artifacts or not artifact_lang or artifact_lang == "auto":
         return []
-    same_language_hunt = bool(config.source_lang and artifact_lang == config.source_lang)
+    same_language_hunt = bool(
+        not config.content_chaos_backbone
+        and config.source_lang
+        and artifact_lang == config.source_lang
+    )
     ru_same_language_hunt = same_language_hunt and artifact_lang == "ru"
     if same_language_hunt and not ru_same_language_hunt:
         return []
@@ -1112,13 +1131,21 @@ def _build_artifact_segments(
     artifact_config.force_source_language = True
     artifact_config.suppress_plain_ascii_tokens = False
     artifact_config.condition_on_previous_text = True
-    artifact_config.initial_prompt = _artifact_initial_prompt(
-        artifact_lang,
-        same_language=ru_same_language_hunt,
-        seed_material=f"{_translation_seed_base(config)}|artifact|full",
+    artifact_config.initial_prompt = (
+        None
+        if config.content_chaos_backbone
+        else _artifact_initial_prompt(
+            artifact_lang,
+            same_language=ru_same_language_hunt,
+            seed_material=f"{_translation_seed_base(config)}|artifact|full",
+        )
     )
     artifact_config.hallucination_silence_threshold = None
     artifact_config.collapse_repetitions = True
+    if config.content_chaos_backbone:
+        # Keep the short-window output recognisably neural. Do not run it
+        # through the main translation-destruction chains a second time.
+        artifact_config.distort_translation = False
     try:
         source_duration = probe_duration(source_audio)
     except Exception:
@@ -1188,7 +1215,7 @@ def _build_artifact_segments(
             print(f"      Whisper artifact layer skipped: {type(exc).__name__}: {exc}")
 
     artifacts = whole_artifacts if config.artifact_chaos_mode else _dedupe_artifact_segments(whole_artifacts)
-    if config.artifact_chaos_mode:
+    if config.artifact_chaos_mode and not config.content_chaos_backbone:
         artifacts = _fill_sparse_artifacts_from_history(
             artifacts,
             config,
@@ -1622,6 +1649,8 @@ def _artifact_corruption_language(
 ) -> str | None:
     selected = _normalize_lang(selected_lang)
     detected = _normalize_lang(detected_lang)
+    if config.content_chaos_backbone and selected and selected == detected:
+        return "en" if detected == "vi" else "vi"
     if not selected or selected != detected or selected == "ru":
         return selected
 
@@ -2030,7 +2059,13 @@ def _artifact_family(text: str) -> str:
         return "thanks_subtitles"
     if "подогнал" in normalized:
         return "subtitle_sync"
-    if "подпис" in normalized or "subscribe" in normalized or "abonnieren" in normalized:
+    if (
+        "подпи" in normalized
+        or "subscribe" in normalized
+        or "abonnieren" in normalized
+        or "đăng ký" in normalized
+        or "dang ky" in normalized
+    ):
         return "subscribe"
     if "amara" in normalized:
         return "amara"
@@ -2043,6 +2078,97 @@ def _artifact_family(text: str) -> str:
     ):
         return "subtitle_credit"
     return "meta"
+
+
+def _semantic_artifact_ratio(config: DubConfig) -> float:
+    seed_material = f"{_translation_seed_base(config)}|semantic-neural-artifact-ratio-v1"
+    bucket = int.from_bytes(hashlib.sha256(seed_material.encode("utf-8", errors="ignore")).digest()[:8], "big")
+    return 0.30 + (bucket / float(1 << 64)) * 0.20
+
+
+def _build_semantic_chaos_backbone(
+    source_audio: Path,
+    config: DubConfig,
+    source_duration: float,
+) -> list[Segment]:
+    if not config.source_lang or source_duration < 0.75:
+        return []
+
+    semantic_audio = config.workdir / "semantic_whisper_compressed.wav"
+    if not _file_ready(semantic_audio):
+        try:
+            print("      Preparing compressed semantic Whisper audio")
+            make_whisper_semantic_audio(source_audio, semantic_audio)
+        except Exception as exc:
+            print(f"      Semantic Whisper compression skipped: {type(exc).__name__}: {exc}")
+            semantic_audio = source_audio
+
+    chunk_seed = hashlib.sha256(
+        f"{_translation_seed_base(config)}|semantic-window-v2".encode("utf-8", errors="ignore")
+    ).digest()
+    windows = _semantic_backbone_windows(source_duration, chunk_seed)
+    chunk_dir = config.workdir / "semantic_chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    semantic_config = copy(config)
+    semantic_config.condition_on_previous_text = True
+    semantic_config.initial_prompt = None
+    semantic_config.collapse_repetitions = False
+    result: list[Segment] = []
+    for index, (start, duration) in enumerate(windows, start=1):
+        if duration < 0.75:
+            continue
+        chunk_path = chunk_dir / f"{index:04d}_{start:.2f}_{duration:.2f}.wav"
+        try:
+            extract_wav_slice(semantic_audio, chunk_path, start, duration)
+            local = transcribe(chunk_path, semantic_config)
+            local = _clamp_segments_to_duration(local, duration)
+            result.extend(_offset_segments(local, start, source_duration))
+        except Exception as exc:
+            print(f"      Semantic chaos chunk skipped {index}: {type(exc).__name__}: {exc}")
+
+    if not result:
+        return []
+    write_srt(_debug_path(config, "semantic_backbone_source_raw.srt"), result, translated=False)
+    result = collapse_repetitions_in_segments(
+        result,
+        max_phrase_repeats=4,
+        max_word_repeats=4,
+        max_ngram_words=8,
+    )
+    write_srt(_debug_path(config, "semantic_backbone_source.srt"), result, translated=False)
+    window_sizes = [duration for _start, duration in windows]
+    window_detail = (
+        f"{min(window_sizes):.1f}-{max(window_sizes):.1f}s"
+        if window_sizes
+        else "none"
+    )
+    print(f"      Semantic chaos backbone chunks: {len(result)} segments, windows={window_detail}")
+    return result
+
+
+def _semantic_backbone_windows(
+    source_duration: float,
+    seed_digest: bytes,
+) -> list[tuple[float, float]]:
+    """Cover the source with short, job-specific Whisper contexts."""
+    if source_duration <= 0.0:
+        return []
+    seed = int.from_bytes(seed_digest[:8], "big")
+    rng = random.Random(seed)
+    windows: list[tuple[float, float]] = []
+    cursor = 0.0
+    while cursor < source_duration and len(windows) < 30:
+        remaining = source_duration - cursor
+        if windows and remaining < 2.5:
+            previous_start, previous_duration = windows[-1]
+            windows[-1] = (previous_start, round(previous_duration + remaining, 3))
+            break
+        requested = rng.uniform(5.0, 10.0)
+        duration = min(requested, remaining)
+        if duration >= 0.75:
+            windows.append((round(cursor, 3), round(duration, 3)))
+        cursor += requested
+    return windows
 
 
 def _whisper_chaos_audio(source_audio: Path, config: DubConfig, *, purpose: str) -> Path:
@@ -2524,6 +2650,11 @@ def _artifact_injection_limit(
 
     ratio = max(0.0, min(1.0, float(config.artifact_ratio)))
     ratio_limit = round(source_count * ratio)
+    if config.content_chaos_backbone and source_count >= 5:
+        ratio_limit = max(
+            math.ceil(source_count * 0.30),
+            min(math.floor(source_count * 0.50), ratio_limit),
+        )
     if ratio > 0.0 and ratio_limit <= 0:
         ratio_limit = 1
     limit = min(absolute_max, ratio_limit, len(candidates))
@@ -2548,11 +2679,18 @@ def _limit_chaos_artifacts_before_translation(
     # Keep a small reserve for timing conflicts or failed translations, but do
     # not run expensive multilingual chains over a bank that cannot be used.
     limit = min(len(candidates), max(needed, needed * 2))
-    if limit >= len(candidates):
-        return candidates
     ranked = sorted(candidates, key=_chaos_artifact_rank, reverse=True)
-    print(f"      Artifact pre-translation limit: {len(candidates)} -> {limit} (needed={needed})")
-    return ranked[:limit]
+    diverse = _select_diverse_artifact_candidates(
+        ranked,
+        limit,
+        family_cap=max(1, math.ceil(needed * 0.20)),
+        seed_material=f"{_translation_seed_base(config)}|artifact-pretranslation-v2",
+    )
+    print(
+        "      Artifact pre-translation limit: "
+        f"{len(candidates)} -> {len(diverse)} (needed={needed}, diverse)"
+    )
+    return diverse
 
 
 def _inject_artifact_segments(
@@ -2632,6 +2770,13 @@ def _inject_chaos_artifact_segments(
     max_count = _artifact_injection_limit(segments, candidates, config)
     if max_count <= 0:
         return segments
+    if config.content_chaos_backbone:
+        return _replace_semantic_backbone_with_neural_artifacts(
+            segments,
+            candidates,
+            config,
+            max_count=max_count,
+        )
     ranked = sorted(candidates, key=_chaos_artifact_rank, reverse=True)
     replacements: list[Segment] = []
     used_ranges: list[tuple[float, float]] = []
@@ -2672,6 +2817,238 @@ def _inject_chaos_artifact_segments(
     sorted_replacements = sorted(replacements, key=lambda item: (item.start, item.end))
     write_srt(_debug_path(config, "artifact_injected.srt"), sorted_replacements, translated=True)
     return sorted([*kept_segments, *sorted_replacements], key=lambda item: (item.start, item.end))
+
+
+def _semantic_repeat_score(text: str) -> float:
+    words = re.findall(r"[^\W_]+", text.casefold(), flags=re.UNICODE)
+    if len(words) < 2:
+        return 0.0
+    duplicate_words = len(words) - len(set(words))
+    repeated_ngrams = 0
+    for size in range(2, min(5, len(words) // 2 + 1)):
+        counts: dict[tuple[str, ...], int] = {}
+        for index in range(len(words) - size + 1):
+            ngram = tuple(words[index : index + size])
+            counts[ngram] = counts.get(ngram, 0) + 1
+        repeated_ngrams += sum(count - 1 for count in counts.values() if count > 1) * size
+    return round((duplicate_words + repeated_ngrams * 1.8) / len(words), 4)
+
+
+def _replace_semantic_backbone_with_neural_artifacts(
+    segments: list[Segment],
+    candidates: list[Segment],
+    config: DubConfig,
+    *,
+    max_count: int,
+) -> list[Segment]:
+    if not segments or not candidates or max_count <= 0:
+        return segments
+
+    seed_material = f"{_translation_seed_base(config)}|semantic-neural-replacements-v1"
+    seed = int.from_bytes(hashlib.sha256(seed_material.encode("utf-8", errors="ignore")).digest()[:8], "big")
+    rng = random.Random(seed)
+    scores = [(index, _semantic_repeat_score(segment.spoken_text)) for index, segment in enumerate(segments)]
+    repeated = sorted(
+        (item for item in scores if item[1] > 0.12),
+        key=lambda item: (item[1], segments[item[0]].duration),
+        reverse=True,
+    )
+    selected_indices = [index for index, _score in repeated[:max_count]]
+    remaining = [index for index in range(len(segments)) if index not in selected_indices]
+    rng.shuffle(remaining)
+    selected_indices.extend(remaining[: max(0, max_count - len(selected_indices))])
+
+    # An artifact is tied to the part of the source where Whisper produced it.
+    # Pairing two globally shuffled lists used to move phrases from the end of a
+    # video to its beginning (and vice versa).  Keep the chaotic text, but only
+    # let it replace a nearby semantic segment.
+    ranked = sorted(candidates, key=_chaos_artifact_rank, reverse=True)
+    rank_position = {id(candidate): index for index, candidate in enumerate(ranked)}
+    max_artifact_distance = 8.0
+    family_cap = max(1, math.ceil(len(selected_indices) * 0.20))
+    used_candidates: set[int] = set()
+    seen_signatures: set[str] = set()
+    selected_tokens: list[set[str]] = []
+    family_counts: dict[str, int] = {}
+
+    result = list(segments)
+    replacements: list[Segment] = []
+    manifest: list[dict[str, object]] = []
+    skipped_no_local = 0
+    for segment_index in selected_indices:
+        original = segments[segment_index]
+        original_center = (original.start + original.end) / 2.0
+        local_candidates: list[tuple[int, float, int, Segment]] = []
+        for artifact in ranked:
+            if id(artifact) in used_candidates:
+                continue
+            artifact_center = (artifact.start + artifact.end) / 2.0
+            distance = abs(artifact_center - original_center)
+            overlaps = artifact.start < original.end and artifact.end > original.start
+            if not overlaps and distance > max_artifact_distance:
+                continue
+            local_candidates.append(
+                (0 if overlaps else 1, distance, rank_position[id(artifact)], artifact)
+            )
+
+        local_candidates.sort(key=lambda item: item[:3])
+        artifact: Segment | None = None
+        artifact_distance = 0.0
+        # Prefer a distinct artifact family, but never relax the time boundary.
+        for _overlap_rank, distance, _quality_rank, candidate in local_candidates:
+            text = candidate.spoken_text
+            signature = _artifact_signature(text)
+            family = _artifact_family(f"{candidate.text} {text}")
+            tokens = _artifact_similarity_tokens(text)
+            if not signature or signature in seen_signatures:
+                continue
+            if family != "meta" and family_counts.get(family, 0) >= family_cap:
+                continue
+            if tokens and any(_artifact_token_similarity(tokens, previous) >= 0.72 for previous in selected_tokens):
+                continue
+            artifact = candidate
+            artifact_distance = distance
+            break
+
+        # If diversity filters rejected every nearby option, a local repeat is
+        # still safer than importing unrelated speech from another scene.
+        if artifact is None and local_candidates:
+            _overlap_rank, artifact_distance, _quality_rank, artifact = local_candidates[0]
+        if artifact is None:
+            skipped_no_local += 1
+            continue
+
+        text = _shorten_artifact_text(artifact.spoken_text, max_words=32, max_chars=240)
+        if not text:
+            continue
+        used_candidates.add(id(artifact))
+        signature = _artifact_signature(text)
+        family = _artifact_family(f"{artifact.text} {text}")
+        tokens = _artifact_similarity_tokens(text)
+        if signature:
+            seen_signatures.add(signature)
+        if tokens:
+            selected_tokens.append(tokens)
+        family_counts[family] = family_counts.get(family, 0) + 1
+        score = _semantic_repeat_score(original.spoken_text)
+        replacement = Segment(
+            start=original.start,
+            end=original.end,
+            text=artifact.text,
+            translated_text=text,
+        )
+        result[segment_index] = replacement
+        replacements.append(replacement)
+        manifest.append(
+            {
+                "segment_index": segment_index,
+                "reason": "repetition" if score > 0.12 else "random",
+                "repeat_score": score,
+                "start": round(original.start, 3),
+                "end": round(original.end, 3),
+                "artifact_start": round(artifact.start, 3),
+                "artifact_end": round(artifact.end, 3),
+                "distance_seconds": round(artifact_distance, 3),
+                "original": original.spoken_text,
+                "artifact_raw": artifact.text,
+                "artifact_translated": text,
+            }
+        )
+
+    if not replacements:
+        return segments
+    write_srt(
+        _debug_path(config, "artifact_injected.srt"),
+        sorted(replacements, key=lambda item: (item.start, item.end)),
+        translated=True,
+    )
+    manifest_path = _debug_path(config, "neural_artifact_mix_manifest.json")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "requested_ratio": round(config.artifact_ratio, 4),
+                "actual_ratio": round(len(replacements) / len(segments), 4),
+                "segments": len(segments),
+                "max_artifact_distance_seconds": max_artifact_distance,
+                "skipped_no_local_artifact": skipped_no_local,
+                "replacements": manifest,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(
+        "      Semantic neural artifact replacements: "
+        f"{len(replacements)}/{len(segments)} ratio={len(replacements) / len(segments):.2f}, "
+        f"local_only<=8s, skipped_no_local={skipped_no_local}"
+    )
+    return result
+
+
+def _select_diverse_artifact_candidates(
+    candidates: list[Segment],
+    limit: int,
+    *,
+    family_cap: int,
+    seed_material: str | None = None,
+) -> list[Segment]:
+    """Prefer distinct hallucinations and rotate them between separate jobs."""
+    if limit <= 0:
+        return []
+
+    ordered = list(candidates)
+    if seed_material and len(ordered) > 1:
+        # Candidates arrive quality-ranked, but always walking that list from
+        # the top made repeated runs of one video select the exact same bank.
+        # Shuffle a generous high-quality pool with the job seed, keeping the
+        # result reproducible for /resume while varying it between job numbers.
+        pool_size = min(len(ordered), max(12, limit * 3))
+        pool = ordered[:pool_size]
+        seed = int.from_bytes(
+            hashlib.sha256(seed_material.encode("utf-8", errors="ignore")).digest()[:8],
+            "big",
+        )
+        random.Random(seed).shuffle(pool)
+        ordered = [*pool, *ordered[pool_size:]]
+
+    selected: list[Segment] = []
+    selected_tokens: list[set[str]] = []
+    seen_signatures: set[str] = set()
+    family_counts: dict[str, int] = {}
+    for candidate in ordered:
+        text = candidate.spoken_text
+        signature = _artifact_signature(text)
+        if not signature or signature in seen_signatures:
+            continue
+        family = _artifact_family(f"{candidate.text} {text}")
+        if family != "meta" and family_counts.get(family, 0) >= max(1, family_cap):
+            continue
+        tokens = _artifact_similarity_tokens(text)
+        if tokens and any(_artifact_token_similarity(tokens, previous) >= 0.72 for previous in selected_tokens):
+            continue
+
+        selected.append(candidate)
+        selected_tokens.append(tokens)
+        seen_signatures.add(signature)
+        family_counts[family] = family_counts.get(family, 0) + 1
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _artifact_similarity_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[^\W_]+", _artifact_signature(text), flags=re.UNICODE)
+        if len(token) >= 3
+    }
+
+
+def _artifact_token_similarity(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / max(1, min(len(left), len(right)))
 
 
 def _chaos_artifact_rank(artifact: Segment) -> tuple[int, int, int, float, int, float]:
@@ -2801,7 +3178,12 @@ def _ranges_overlap(left_start: float, left_end: float, right_start: float, righ
     return _overlap_seconds(left_start, left_end, right_start, right_end) > 0.05
 
 
-def _fit_segment_text_budgets(segments: list[Segment], config: DubConfig) -> list[Segment]:
+def _fit_segment_text_budgets(
+    segments: list[Segment],
+    config: DubConfig,
+    *,
+    source_duration: float | None = None,
+) -> list[Segment]:
     if config.tts.lower() == "none":
         return segments
 
@@ -2847,8 +3229,10 @@ def _shorten_text_to_duration(text: str, duration: float, *, chaos: bool = False
         shortened = True
 
     text = text.rstrip(" ,;:")
-    if shortened and text and not text.endswith(("...", "…")):
-        return f"{text}..."
+    if shortened and text and not text.endswith((".", "!", "?", "…")):
+        # A literal ellipsis made intentionally budgeted lines sound as though
+        # the TTS had been cut off.  Close the shortened phrase cleanly.
+        text = f"{text}."
     return text
 
 
@@ -2996,13 +3380,14 @@ def _needs_speaker_references(config: DubConfig) -> bool:
         "qwen3",
         "qwen3-tts",
         "qwen3tts",
-        "chatterbox",
-        "chatterbox-tts",
-        "chatterboxtts",
         "cosyvoice",
         "cosyvoice-tts",
         "cosyvoicetts",
         "cosy",
+        "moss",
+        "moss-tts",
+        "mosstts",
+        "moss-v1.5",
     }
 
 
@@ -3101,6 +3486,7 @@ def _assign_segment_speaker_refs(
             continue
         candidate.segment.speaker_wav = bank_path
         candidate.segment.speaker_id = f"speaker_{candidate.cluster_id:02d}"
+        candidate.segment.speaker_ref_text = ""
 
     _assign_missing_cluster_refs(segments, candidates, bank_paths, config)
     _write_speaker_map(segments, candidates, config, clustered=True)
@@ -3450,7 +3836,9 @@ def _write_pyannote_speaker_map(
 
 
 def _speaker_reference_text(segment: Segment) -> str:
-    text = re.sub(r"\s+", " ", segment.spoken_text).strip()
+    # The extracted reference slice contains source speech, so its transcript
+    # must use the source ASR text rather than the translated/generated line.
+    text = re.sub(r"\s+", " ", segment.text).strip()
     if len(text) > 260:
         text = text[:260].rsplit(" ", 1)[0].strip() or text[:260].strip()
     return text
@@ -3722,6 +4110,7 @@ def _assign_missing_cluster_refs(
             continue
         segment.speaker_wav = bank_path
         segment.speaker_id = f"speaker_{nearest.cluster_id:02d}"
+        segment.speaker_ref_text = ""
     if config.speaker_wav is not None:
         for segment in segments:
             if segment.spoken_text and segment.speaker_wav is None:

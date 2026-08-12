@@ -17,7 +17,7 @@ import unicodedata
 from pathlib import Path
 from typing import Iterator
 
-from .ffmpeg import concat_wavs, make_silence
+from .ffmpeg import concat_wavs, make_silence, probe_duration
 from .models import DubConfig, Segment
 
 
@@ -130,18 +130,18 @@ def synthesize_segment(segment: Segment, output_path: Path, config: DubConfig) -
         synthesize_qwen3_batch([(1, segment, output_path)], config)
         return
 
-    if provider in {"chatterbox", "chatterbox-tts", "chatterboxtts"}:
-        try:
-            _synthesize_chatterbox(segment, text, output_path, config)
-        except Exception as exc:
-            _fallback_segment_to_f5(segment, text, output_path, config, "Chatterbox", exc)
-        return
-
     if provider in {"cosyvoice", "cosyvoice-tts", "cosyvoicetts", "cosy"}:
         try:
             _synthesize_cosyvoice(segment, text, output_path, config)
         except Exception as exc:
             _fallback_segment_to_f5(segment, text, output_path, config, "CosyVoice", exc)
+        return
+
+    if provider in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
+        try:
+            synthesize_moss_batch([(1, segment, output_path)], config)
+        except Exception as exc:
+            _fallback_segment_to_f5(segment, text, output_path, config, "MOSS", exc)
         return
 
     raise TTSError(f"Unknown TTS provider: {config.tts}")
@@ -304,76 +304,6 @@ def synthesize_qwen3_batch(
         raise TTSError(f"Qwen3-TTS did not create valid WAV files: {', '.join(missing[:3])}")
 
 
-def synthesize_chatterbox_batch(
-    items: list[tuple[int, Segment, Path]],
-    config: DubConfig,
-) -> None:
-    if not items:
-        return
-
-    python_path = _resolve_chatterbox_python(config)
-    runner_path = _repo_root() / "tools" / "chatterbox_tts_batch_runner.py"
-    if not runner_path.is_file():
-        raise TTSError(f"Chatterbox batch runner does not exist: {runner_path}")
-
-    manifest_items: list[dict[str, object]] = []
-    for _index, segment, output_path in items:
-        text = _sanitize_text_for_xtts(segment.spoken_text)
-        if config.target_lang == "ru":
-            text = _apply_f5_pronunciation_dictionary(text)
-        if not text:
-            make_silence(output_path, max(0.15, segment.duration))
-            continue
-        speaker_wav = segment.speaker_wav or config.speaker_wav
-        if not speaker_wav or not speaker_wav.is_file():
-            raise TTSError(f"Chatterbox speaker reference does not exist: {speaker_wav}")
-        chunks = _split_text_for_xtts(text, max_chars=260, max_words=40)
-        manifest_items.append(
-            {
-                "output": str(output_path.resolve()),
-                "text": text,
-                "chunks": chunks,
-                "reference": str(speaker_wav.resolve()),
-                "language_id": _chatterbox_language_id(config.target_lang),
-            }
-        )
-
-    if not manifest_items:
-        return
-
-    manifest_path = config.workdir / "chatterbox_batch_manifest.json"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest = {
-        "model": config.chatterbox_model,
-        "device": config.chatterbox_device,
-        "cache_dir": str(_resolve_repo_relative_path(config.chatterbox_cache_dir)),
-        "language_id": _chatterbox_language_id(config.target_lang),
-        "exaggeration": config.chatterbox_exaggeration,
-        "cfg_weight": config.chatterbox_cfg_weight,
-        "items": manifest_items,
-    }
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    command = [str(python_path), str(runner_path), "--manifest", str(manifest_path.resolve())]
-    _run_progress_tts_batch(
-        command,
-        items,
-        config,
-        label="Chatterbox",
-        start_prefix="CHATTERBOX_START",
-        progress_prefix="CHATTERBOX_PROGRESS",
-        timeout_seconds=config.chatterbox_timeout_seconds,
-        extra_env={
-            "HF_HOME": str(_resolve_repo_relative_path(config.chatterbox_cache_dir)),
-            "HF_HUB_CACHE": str(_resolve_repo_relative_path(config.chatterbox_cache_dir) / "hub"),
-        },
-    )
-
-    missing = [str(path) for _index, _segment, path in items if not path.is_file() or path.stat().st_size < 1024]
-    if missing:
-        raise TTSError(f"Chatterbox did not create valid WAV files: {', '.join(missing[:3])}")
-
-
 def synthesize_cosyvoice_batch(
     items: list[tuple[int, Segment, Path]],
     config: DubConfig,
@@ -441,6 +371,81 @@ def synthesize_cosyvoice_batch(
     missing = [str(path) for _index, _segment, path in items if not path.is_file() or path.stat().st_size < 1024]
     if missing:
         raise TTSError(f"CosyVoice did not create valid WAV files: {', '.join(missing[:3])}")
+
+
+def synthesize_moss_batch(
+    items: list[tuple[int, Segment, Path]],
+    config: DubConfig,
+) -> None:
+    if not items:
+        return
+
+    python_path = _resolve_moss_python(config)
+    runner_path = _repo_root() / "tools" / "moss_tts_batch_runner.py"
+    if not runner_path.is_file():
+        raise TTSError(f"MOSS batch runner does not exist: {runner_path}")
+
+    language = _moss_language(config.target_lang)
+    manifest_items: list[dict[str, object]] = []
+    for _index, segment, output_path in items:
+        text = _sanitize_text_for_xtts(segment.spoken_text)
+        if config.target_lang == "ru":
+            text = _apply_f5_pronunciation_dictionary(text)
+        if not text:
+            make_silence(output_path, max(0.15, segment.duration))
+            continue
+        speaker_wav = segment.speaker_wav or config.speaker_wav
+        if not speaker_wav or not speaker_wav.is_file():
+            raise TTSError(f"MOSS speaker reference does not exist: {speaker_wav}")
+        source_seconds = max(0.4, float(segment.duration))
+        manifest_items.append(
+            {
+                "output": str(output_path.resolve()),
+                "text": text,
+                "reference": str(speaker_wav.resolve()),
+                "source_seconds": source_seconds,
+                "target_seconds": source_seconds,
+                "language": language,
+            }
+        )
+
+    if not manifest_items:
+        return
+
+    manifest_path = config.workdir / "moss_batch_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "model_dir": str(_resolve_repo_relative_path(config.moss_model_dir)),
+        "codec_dir": str(_resolve_repo_relative_path(config.moss_codec_dir)),
+        "device": config.moss_device,
+        "seed": 42,
+        # Duration control makes MOSS drop words from dense subtitles and fill
+        # long windows with hallucinated speech. Let the model stop naturally
+        # on its EOS token, as in the official v1.5 inference example.
+        "duration_control": False,
+        "lead_pause_seconds": 0.3,
+        "trail_pause_seconds": 0.25,
+        "natural_max_new_tokens": 512,
+        "edge_padding_seconds": 0.04,
+        "items": manifest_items,
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    command = [str(python_path), str(runner_path), "--manifest", str(manifest_path.resolve())]
+    _run_progress_tts_batch(
+        command,
+        items,
+        config,
+        label="MOSS",
+        start_prefix="MOSS_START",
+        progress_prefix="MOSS_PROGRESS",
+        timeout_seconds=config.moss_timeout_seconds,
+        extra_env={"HF_HUB_DISABLE_XET": "1"},
+    )
+
+    missing = [str(path) for _index, _segment, path in items if not path.is_file() or path.stat().st_size < 1024]
+    if missing:
+        raise TTSError(f"MOSS did not create valid WAV files: {', '.join(missing[:3])}")
 
 
 def _run_progress_tts_batch(
@@ -647,7 +652,13 @@ def _synthesize_f5tts(segment: Segment, text: str, output_path: Path, config: Du
     if not text:
         make_silence(output_path, max(0.15, segment.duration))
         return
-    ref_text = _sanitize_text_for_f5(segment.speaker_ref_text or segment.spoken_text, config)
+    # The reference transcript must describe speaker_wav, not the sentence we
+    # are about to generate.  Passing spoken_text here made F5 treat a short
+    # target phrase as the transcript of a much longer reference recording;
+    # the resulting WAVs were often about ten seconds long regardless of the
+    # requested text.  An empty ref_text is intentional: F5 transcribes and
+    # caches the actual reference audio itself.
+    ref_text = _sanitize_text_for_f5(segment.speaker_ref_text or "", config)
 
     speaker_wav = segment.speaker_wav or config.speaker_wav
     if not speaker_wav:
@@ -682,16 +693,21 @@ def _f5_to_file(
 ) -> None:
     try:
         model = _load_f5_model(config)
+        prepared_ref, prepared_ref_text, corrected_speed = _prepare_f5_reference(
+            speaker_wav,
+            ref_text,
+            config.f5_speed,
+        )
         model.infer(
-            ref_file=str(speaker_wav),
-            ref_text=ref_text,
+            ref_file=str(prepared_ref),
+            ref_text=prepared_ref_text,
             gen_text=text,
             file_wave=str(output_path),
             target_rms=config.f5_target_rms,
             cross_fade_duration=config.f5_cross_fade_duration,
             cfg_strength=config.f5_cfg_strength,
             nfe_step=config.f5_nfe_step,
-            speed=config.f5_speed,
+            speed=corrected_speed,
             remove_silence=config.f5_remove_silence,
         )
     except Exception as exc:
@@ -701,6 +717,34 @@ def _f5_to_file(
 
     if not output_path.exists() or output_path.stat().st_size < 1024:
         raise TTSError(f"F5-TTS produced an empty WAV file: {output_path}")
+
+
+def _prepare_f5_reference(
+    speaker_wav: Path,
+    ref_text: str,
+    configured_speed: float,
+) -> tuple[Path, str, float]:
+    """Correct F5's duration estimate when a long ref has very little speech."""
+    from f5_tts.infer.utils_infer import preprocess_ref_audio_text
+
+    prepared_path, prepared_text = preprocess_ref_audio_text(str(speaker_wav), ref_text)
+    prepared = Path(prepared_path)
+    reference_seconds = max(0.1, probe_duration(prepared))
+    words = re.findall(r"[^\W_]+", prepared_text, flags=re.UNICODE)
+    letters = re.sub(r"\W+", "", prepared_text, flags=re.UNICODE)
+    if not words or not letters:
+        return prepared, prepared_text, configured_speed
+
+    expected_speech_seconds = max(0.55, len(words) / 2.4, len(letters) / 15.0)
+    duration_correction = max(0.75, min(7.0, reference_seconds / expected_speech_seconds))
+    corrected_speed = max(0.25, configured_speed * duration_correction)
+    if abs(duration_correction - 1.0) >= 0.15:
+        print(
+            "      F5 reference duration correction: "
+            f"ref={reference_seconds:.2f}s expected_speech={expected_speech_seconds:.2f}s "
+            f"speed={corrected_speed:.2f}"
+        )
+    return prepared, prepared_text, corrected_speed
 
 
 def _load_f5_model(config: DubConfig) -> object:
@@ -827,115 +871,14 @@ def _resolve_qwen3_python(config: DubConfig) -> Path:
     return python_path
 
 
-def _synthesize_chatterbox(segment: Segment, text: str, output_path: Path, config: DubConfig) -> None:
-    text = _sanitize_text_for_xtts(text)
-    if config.target_lang == "ru":
-        text = _apply_f5_pronunciation_dictionary(text)
-    if not text:
-        make_silence(output_path, max(0.15, segment.duration))
-        return
-
-    speaker_wav = segment.speaker_wav or config.speaker_wav
-    if not speaker_wav:
-        raise TTSError("Chatterbox needs a speaker reference WAV.")
-    if not speaker_wav.exists():
-        raise TTSError(f"Chatterbox speaker reference does not exist: {speaker_wav}")
-
-    chunks = _split_text_for_xtts(text, max_chars=260, max_words=40)
-    if len(chunks) > 1:
-        print(f"      Chatterbox split long segment into {len(chunks)} chunks")
-        chunk_paths: list[Path] = []
-        chunk_dir = output_path.parent / f"{output_path.stem}_chatterbox_chunks"
-        chunk_dir.mkdir(parents=True, exist_ok=True)
-        for index, chunk in enumerate(chunks, start=1):
-            chunk_path = chunk_dir / f"{index:04d}.wav"
-            _chatterbox_to_file(chunk, chunk_path, speaker_wav, config)
-            chunk_paths.append(chunk_path)
-        concat_wavs(chunk_paths, output_path)
-    else:
-        _chatterbox_to_file(text, output_path, speaker_wav, config)
-
-    if not output_path.exists() or output_path.stat().st_size < 1024:
-        raise TTSError(f"Chatterbox produced an empty WAV file: {output_path}")
-
-
-def _chatterbox_to_file(text: str, output_path: Path, speaker_wav: Path, config: DubConfig) -> None:
-    python_path = _resolve_chatterbox_python(config)
-    runner_path = _repo_root() / "tools" / "chatterbox_tts_runner.py"
-    if not runner_path.exists():
-        raise TTSError(f"Chatterbox runner does not exist: {runner_path}")
-
-    command = [
-        str(python_path),
-        str(runner_path),
-        "--ref-audio",
-        str(speaker_wav),
-        "--text-base64",
-        base64.b64encode(text.encode("utf-8")).decode("ascii"),
-        "--output",
-        str(output_path),
-        "--language-id",
-        _chatterbox_language_id(config.target_lang),
-        "--model",
-        config.chatterbox_model,
-        "--device",
-        config.chatterbox_device,
-        "--cache-dir",
-        str(_resolve_repo_relative_path(config.chatterbox_cache_dir)),
-        "--exaggeration",
-        str(config.chatterbox_exaggeration),
-        "--cfg-weight",
-        str(config.chatterbox_cfg_weight),
-    ]
-
-    env = os.environ.copy()
-    env.setdefault("PYTHONIOENCODING", "utf-8")
-    env.setdefault("HF_HOME", str(_resolve_repo_relative_path(config.chatterbox_cache_dir)))
-    try:
-        result = subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-            timeout=config.chatterbox_timeout_seconds,
-        )
-    except subprocess.CalledProcessError as exc:
-        if _tts_output_ready(output_path):
-            details = _short_subprocess_output(exc.stdout, exc.stderr)
-            suffix = f": {details}" if details else ""
-            print(f"      Chatterbox runner returned {exc.returncode}, but WAV is ready; keeping output{suffix}")
-            return
-        details = _short_subprocess_output(exc.stdout, exc.stderr)
-        if details:
-            raise TTSError(f"Chatterbox runner failed: {details}") from exc
-        raise TTSError(f"Chatterbox runner failed with exit code {exc.returncode}.") from exc
-    message = _short_subprocess_output(result.stdout, result.stderr)
-    if message:
-        print(f"      Chatterbox runner: {message}")
-
-    if not output_path.exists() or output_path.stat().st_size < 1024:
-        raise TTSError(f"Chatterbox produced an empty WAV file: {output_path}")
-
-
-def _resolve_chatterbox_python(config: DubConfig) -> Path:
-    python_path = config.chatterbox_python or Path(".venv-chatterbox") / "Scripts" / "python.exe"
+def _resolve_moss_python(config: DubConfig) -> Path:
+    python_path = config.moss_python or Path(".venv-moss") / "Scripts" / "python.exe"
     python_path = _resolve_repo_relative_path(python_path)
     if not python_path.is_file():
         raise TTSError(
-            "Chatterbox Python was not found. Expected .venv-chatterbox\\Scripts\\python.exe. "
-            "Create it with: python -m venv .venv-chatterbox"
+            "MOSS Python was not found. Set LALADUB_MOSS_PYTHON to the isolated MOSS environment."
         )
     return python_path
-
-
-def _chatterbox_language_id(target_lang: str) -> str:
-    return {
-        "ru": "ru",
-        "en": "en",
-    }.get((target_lang or "ru").lower(), "ru")
 
 
 def _synthesize_cosyvoice(segment: Segment, text: str, output_path: Path, config: DubConfig) -> None:
@@ -1080,6 +1023,16 @@ def _qwen3_language(target_lang: str) -> str:
         "en": "English",
         "uk": "Russian",
     }.get((target_lang or "ru").lower(), "Russian")
+
+
+def _moss_language(target_lang: str) -> str:
+    language = {
+        "ru": "Russian",
+        "en": "English",
+    }.get((target_lang or "ru").lower())
+    if language is None:
+        raise TTSError(f"MOSS-TTS v1.5 does not support target language: {target_lang}")
+    return language
 
 
 def _resolve_f5_model_file(local_path: Path | None, repo: str, repo_path: str, cache_dir: Path) -> Path:
