@@ -176,7 +176,23 @@ $env:LALADUB_WORKER_API_TOKEN = $workerToken
 $env:LALADUB_WORKER_PACKAGE_PATH = (Join-Path $Root "dist\LaLaDubWorker-update.zip")
 $env:LALADUB_WORKER_PACKAGE_MANIFEST = (Join-Path $Root "dist\LaLaDubWorker-update.manifest.json")
 $env:LALADUB_DOWNLOAD_CACHE_DIR = (Join-Path $Root "runs\cache\downloads")
-$env:LALADUB_YTDLP_BROWSER_COOKIES = "firefox"
+$projectUserHome = Split-Path -Parent (Split-Path -Parent $Root)
+$firefoxProfilesRoot = Join-Path $projectUserHome "AppData\Roaming\Mozilla\Firefox\Profiles"
+$firefoxProfile = Get-ChildItem -LiteralPath $firefoxProfilesRoot -Directory -ErrorAction SilentlyContinue |
+  Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "cookies.sqlite") } |
+  Sort-Object `
+    @{ Expression = { if ($_.Name -like "*.default-release") { 0 } else { 1 } } },
+    @{ Expression = { $_.LastWriteTime }; Descending = $true } |
+  Select-Object -First 1
+if ($firefoxProfile) {
+  $env:LALADUB_YTDLP_BROWSER_COOKIES = "firefox"
+  $env:LALADUB_YTDLP_BROWSER_PROFILE = $firefoxProfile.FullName
+  Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) yt-dlp Firefox profile: $($firefoxProfile.FullName)" -ErrorAction SilentlyContinue
+} else {
+  $env:LALADUB_YTDLP_BROWSER_COOKIES = ""
+  $env:LALADUB_YTDLP_BROWSER_PROFILE = ""
+  Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) Firefox cookies.sqlite was not found under: $firefoxProfilesRoot" -ErrorAction SilentlyContinue
+}
 $env:LALADUB_MEDIA_CACHE_DIR = (Join-Path $Root "runs\cache\media")
 $env:LALADUB_JOB_RETENTION_SECONDS = "2592000"
 $env:LALADUB_CLEANUP_INTERVAL_SECONDS = "3600"

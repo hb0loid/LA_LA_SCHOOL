@@ -20,6 +20,14 @@ _URL_RE = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
 _MEDIA_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 
 
+def _browser_cookie_config() -> tuple[str, str | None, None, None] | None:
+    browser = os.environ.get("LALADUB_YTDLP_BROWSER_COOKIES", "").strip()
+    if not browser:
+        return None
+    profile = os.environ.get("LALADUB_YTDLP_BROWSER_PROFILE", "").strip() or None
+    return browser, profile, None, None
+
+
 def extract_url(text: str) -> str | None:
     match = _URL_RE.search(text)
     if not match:
@@ -57,9 +65,15 @@ def download_video_url(url: str, output_dir: Path, max_file_mb: int) -> Path:
         "js_runtimes": {"node": {}, "deno": {}},
         "remote_components": ["ejs:github"],
     }
-    browser_cookies = os.environ.get("LALADUB_YTDLP_BROWSER_COOKIES", "").strip()
-    if browser_cookies:
-        options["cookiesfrombrowser"] = (browser_cookies, None, None, None)
+    browser_cookie_config = _browser_cookie_config()
+    if browser_cookie_config:
+        browser_cookies, browser_profile, _, _ = browser_cookie_config
+        options["cookiesfrombrowser"] = browser_cookie_config
+        print(
+            "yt-dlp browser cookies: "
+            f"browser={browser_cookies} profile={browser_profile or 'automatic'}",
+            flush=True,
+        )
 
     errors: list[str] = []
     info = None
