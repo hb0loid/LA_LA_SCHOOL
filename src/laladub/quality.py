@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 
 from .models import Segment
 
@@ -81,6 +82,130 @@ def clamp_obvious_word_repeats_in_segments(
     if changed:
         print(f"      Obvious word repeat clamp: changed={changed}/{len(segments)}, max={max_word_repeats}")
     return segments, changed
+
+
+def suppress_pathological_segment_loops(
+    segments: list[Segment],
+    *,
+    window_segments: int = 20,
+    window_seconds: float = 30.0,
+    min_window_segments: int = 8,
+    repeated_share: float = 0.65,
+    low_diversity_share: float = 0.85,
+    max_unique_loop_phrases: int = 3,
+    max_kept_per_cluster: int = 3,
+    max_signature_words: int = 16,
+) -> list[Segment]:
+    """Remove only dense cross-segment ASR loops.
+
+    Whisper failures often arrive as hundreds of separate one-line segments, so
+    the normal per-line repetition clamp cannot see them.  This pass marks a
+    phrase only when it dominates a dense local window, or when almost the
+    entire window alternates between no more than a few short phrases.  Sparse
+    callbacks and ordinary repeated jokes are deliberately left alone.
+    """
+    if len(segments) < min_window_segments:
+        return segments
+
+    keys: list[str] = []
+    for segment in segments:
+        key = _normalize_for_repeat_key(segment.spoken_text)
+        if not key or len(key.split()) > max_signature_words:
+            key = ""
+        keys.append(key)
+
+    flagged: set[int] = set()
+    left = 0
+    for right, segment in enumerate(segments):
+        left = max(left, right - max(1, window_segments) + 1)
+        while left < right and segment.end - segments[left].start > window_seconds:
+            left += 1
+        if right - left + 1 < min_window_segments:
+            continue
+
+        window_keys = keys[left : right + 1]
+        counts = Counter(key for key in window_keys if key)
+        if not counts:
+            continue
+        window_size = len(window_keys)
+        short_count = sum(counts.values())
+        low_diversity_loop = (
+            len(counts) <= max_unique_loop_phrases
+            and short_count / window_size >= low_diversity_share
+        )
+        bad_keys = {
+            key
+            for key, count in counts.items()
+            if count > max_kept_per_cluster
+            and (count / window_size >= repeated_share or low_diversity_loop)
+        }
+        if bad_keys:
+            flagged.update(index for index in range(left, right + 1) if keys[index] in bad_keys)
+
+    if not flagged:
+        return segments
+
+    kept: list[Segment] = []
+    cluster_counts: dict[str, int] = {}
+    cluster_start: dict[str, float] = {}
+    last_seen: dict[str, tuple[int, float]] = {}
+    dropped = 0
+    for index, segment in enumerate(segments):
+        key = keys[index]
+        if index not in flagged or not key:
+            kept.append(segment)
+            continue
+
+        previous = last_seen.get(key)
+        if (
+            previous is None
+            or index - previous[0] > window_segments
+            or segment.start - previous[1] > window_seconds
+            or segment.start - cluster_start.get(key, segment.start) >= window_seconds
+        ):
+            cluster_counts[key] = 0
+            cluster_start[key] = segment.start
+        last_seen[key] = (index, segment.end)
+        cluster_counts[key] = cluster_counts.get(key, 0) + 1
+        if cluster_counts[key] > max_kept_per_cluster:
+            dropped += 1
+            continue
+        kept.append(segment)
+
+    if dropped:
+        print(f"      Pathological segment loop cleanup: dropped={dropped}/{len(segments)}")
+    return kept
+
+
+def limit_repeated_segment_phrases(
+    segments: list[Segment],
+    *,
+    trigger_occurrences: int = 8,
+    max_occurrences: int = 3,
+    max_signature_words: int = 16,
+) -> list[Segment]:
+    """Globally cap exact phrase floods in an artifact candidate stream."""
+    keys = [_normalize_for_repeat_key(segment.spoken_text) for segment in segments]
+    totals = Counter(
+        key for key in keys if key and len(key.split()) <= max_signature_words
+    )
+    flooded = {key for key, count in totals.items() if count >= trigger_occurrences}
+    if not flooded:
+        return segments
+
+    seen: Counter[str] = Counter()
+    kept: list[Segment] = []
+    dropped = 0
+    for segment, key in zip(segments, keys):
+        if key in flooded:
+            seen[key] += 1
+            if seen[key] > max_occurrences:
+                dropped += 1
+                continue
+        kept.append(segment)
+    if dropped:
+        print(f"      Repeated artifact phrase cleanup: dropped={dropped}/{len(segments)}")
+    return kept
 
 
 def clamp_obvious_word_repeats(text: str, *, max_word_repeats: int = 3) -> str:

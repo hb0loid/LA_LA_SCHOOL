@@ -35,6 +35,8 @@ from .quality import (
     clamp_obvious_word_repeats_in_segments,
     collapse_repetitions,
     collapse_repetitions_in_segments,
+    limit_repeated_segment_phrases,
+    suppress_pathological_segment_loops,
     is_repetitive_loop,
 )
 from .separation import SeparationResult, separate_audio
@@ -870,6 +872,19 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         source_asr_changed = True
         write_srt(source_srt_path, segments, translated=False)
         _save_resume_state(config, source_asr=True, source_lang=config.source_lang, sparse_source_fallback=True)
+    loop_cleaned_source = suppress_pathological_segment_loops(segments)
+    if len(loop_cleaned_source) != len(segments):
+        write_srt(_debug_path(config, "source_before_loop_cleanup.srt"), segments, translated=False)
+        segments = loop_cleaned_source
+        source_asr_changed = True
+        write_srt(source_srt_path, segments, translated=False)
+        _save_resume_state(
+            config,
+            source_asr=True,
+            source_lang=config.source_lang,
+            source_segment_loop_cleanup=True,
+            segment_count=len(segments),
+        )
     segments, pre_censor_changed = _apply_experimental_censor(segments, config, stage="pre")
     if pre_censor_changed:
         source_asr_changed = True
@@ -899,9 +914,18 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
             segments,
             max_word_repeats=3,
         )
-        if repeat_clamp_changed:
+        loop_cleaned_segments = suppress_pathological_segment_loops(segments)
+        segment_loops_changed = len(loop_cleaned_segments) != len(segments)
+        segments = loop_cleaned_segments
+        if repeat_clamp_changed or segment_loops_changed:
             write_srt(translated_srt_path, segments, translated=True)
-            _save_resume_state(config, translated=True, segment_count=len(segments), repeat_clamp=True)
+            _save_resume_state(
+                config,
+                translated=True,
+                segment_count=len(segments),
+                repeat_clamp=bool(repeat_clamp_changed),
+                segment_loop_cleanup=segment_loops_changed,
+            )
             translation_changed = True
     else:
         segments = _translate_dub_segments(segments, config)
@@ -939,6 +963,7 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
             segments,
             max_word_repeats=3,
         )
+        segments = suppress_pathological_segment_loops(segments)
         write_srt(translated_srt_path, segments, translated=True)
         _save_resume_state(config, translated=True, segment_count=len(segments))
         translation_changed = True
@@ -951,6 +976,7 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
             segments,
             max_word_repeats=3,
         )
+        segments = suppress_pathological_segment_loops(segments)
         write_srt(translated_srt_path, segments, translated=True)
         _save_resume_state(config, translated=True, segment_count=len(segments), sparse_fill=True)
         translation_changed = True
@@ -2552,7 +2578,10 @@ def _inject_artifact_segments(
     config: DubConfig,
     source_duration: float,
 ) -> list[Segment]:
-    candidates = [artifact for artifact in artifacts if artifact.spoken_text]
+    candidates = suppress_pathological_segment_loops(
+        [artifact for artifact in artifacts if artifact.spoken_text]
+    )
+    candidates = limit_repeated_segment_phrases(candidates)
     if not candidates:
         return segments
     if config.artifact_chaos_mode:
