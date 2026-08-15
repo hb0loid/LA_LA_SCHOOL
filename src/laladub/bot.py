@@ -20,7 +20,7 @@ from typing import Any
 
 from .bot_config import BotSettings, load_bot_settings
 from .download import download_video_url, extract_url, has_video_and_audio
-from .ffmpeg import compress_video_for_telegram, make_audio_visual_video, probe_duration
+from .ffmpeg import compress_video_for_telegram, make_audio_visual_video, probe_duration, trim_video
 from .karma import KARMA_SCALE, level_for_karma, next_level_for_karma, visible_karma
 from .asr import clear_openai_whisper_cache
 from .models import DubConfig
@@ -1544,12 +1544,62 @@ async def _reserve_daily_allowance(
         job["daily_used_ms_after_enqueue"] = used_ms
         return True
     remaining_ms = max(0, limit_ms - used_ms)
+    if remaining_ms >= 1000:
+        original_duration_ms = duration_ms
+        trimmed_path = input_path.with_name(f"{input_path.stem}_daily_trimmed{input_path.suffix}")
+        await _safe_edit_status(
+            status_message,
+            "Видео длиннее оставшегося суточного лимита.\n"
+            f"Обрезаю начало до {_format_duration_ms(remaining_ms)}…",
+        )
+        try:
+            await asyncio.to_thread(trim_video, input_path, trimmed_path, remaining_ms / 1000.0)
+            if not trimmed_path.is_file() or trimmed_path.stat().st_size < 1024:
+                raise RuntimeError("получился пустой файл")
+            if not await asyncio.to_thread(has_video_and_audio, trimmed_path):
+                raise RuntimeError("в обрезанном файле нет видео или аудио")
+        except Exception as exc:
+            print(f"Daily quota trim failed: {type(exc).__name__}: {exc}", flush=True)
+            trimmed_path.unlink(missing_ok=True)
+            await _safe_edit_status(
+                status_message,
+                "Не смог обрезать видео до оставшегося суточного лимита.\n"
+                f"{type(exc).__name__}: {exc}",
+            )
+            return False
+
+        accepted, used_after_trim_ms = await asyncio.to_thread(
+            store.reserve_daily_usage,
+            user_id=user_id,
+            job_number=_job_number(job),
+            day_key=_today_key(),
+            duration_ms=remaining_ms,
+            limit_ms=limit_ms,
+        )
+        if accepted:
+            job["input_path"] = str(trimmed_path)
+            job["quota_duration_ms"] = remaining_ms
+            job["daily_used_ms_after_enqueue"] = used_after_trim_ms
+            job["daily_trimmed"] = True
+            job["daily_original_duration_ms"] = original_duration_ms
+            job["daily_trimmed_duration_ms"] = remaining_ms
+            await _safe_edit_status(
+                status_message,
+                "Видео обрезано по остатку суточного лимита.\n"
+                f"Было: {_format_duration_ms(original_duration_ms)}. "
+                f"В работу пойдёт: {_format_duration_ms(remaining_ms)}.",
+            )
+            return True
+        trimmed_path.unlink(missing_ok=True)
+        used_ms = used_after_trim_ms
+        remaining_ms = max(0, limit_ms - used_ms)
+
     await _safe_edit_status(
         status_message,
-        "Суточного лимита не хватает для этого видео.\n"
+        "Суточный лимит на сегодня уже израсходован.\n"
         f"Уровень: {level.name}. Лимит: {_format_duration_ms(limit_ms)}.\n"
         f"Сегодня использовано: {_format_duration_ms(used_ms)}. Осталось: {_format_duration_ms(remaining_ms)}.\n"
-        f"Длительность видео: {_format_duration_ms(duration_ms)}. Видео не обрезано — его можно отправить после обновления лимита.",
+        "Новую задачу можно отправить после обновления лимита.",
     )
     return False
 
@@ -2282,18 +2332,27 @@ class _JobScheduler:
         tier = str(item.job.get("queue_priority_label") or ("премиум" if item.premium else "обычный"))
         target_label = _target_lang_label(item.job.get("target_lang"))
         tts_label = _tts_method_label(item.job.get("tts_provider") or self._settings.tts)
-        return "\n".join(
+        lines = [
+            f"{title}: В очереди",
+            f"Работа №{job_number}",
+            f"Позиция: {position}",
+            f"Сейчас выполняется: {self._active_total}/{self._settings.max_active_jobs}",
+            f"У тебя выполняется: {active_for_user}/{self._settings.max_active_jobs_per_user}",
+        ]
+        if item.job.get("daily_trimmed"):
+            lines.append(
+                "Обрезано по дневному лимиту: "
+                f"{_format_duration_ms(item.job.get('daily_original_duration_ms') or 0)} → "
+                f"{_format_duration_ms(item.job.get('daily_trimmed_duration_ms') or 0)}"
+            )
+        lines.extend(
             [
-                f"{title}: В очереди",
-                f"Работа №{job_number}",
-                f"Позиция: {position}",
-                f"Сейчас выполняется: {self._active_total}/{self._settings.max_active_jobs}",
-                f"У тебя выполняется: {active_for_user}/{self._settings.max_active_jobs_per_user}",
                 f"Язык озвучки: {target_label}",
                 f"Движок: {tts_label}",
                 f"Приоритет: {tier}",
             ]
         )
+        return "\n".join(lines)
 
     def _mark_remote_worker_locked(self, worker_id: str, *, active_job_id: str | None) -> None:
         worker_id = str(worker_id or "worker").strip() or "worker"
