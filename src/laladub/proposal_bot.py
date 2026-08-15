@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .ffmpeg import probe_duration
-from .karma import format_karma_milli, karma_milli_for_duration, visible_karma
+from .karma import format_karma_milli, karma_milli_for_duration, level_for_karma, visible_karma
 from .proposal_store import ProposalStore, Submission
 
 
@@ -261,6 +261,7 @@ async def moderation_callback(update: Any, context: Any) -> None:
 
     await query.answer("Публикую…" if target_chat else "Отмечаю…")
     new_message = None
+    karma_before = await asyncio.to_thread(store.karma_total, claimed.user_id)
     try:
         duration_ms = claimed.duration_ms
         if duration_ms <= 0 and Path(claimed.video_path).is_file():
@@ -296,6 +297,22 @@ async def moderation_callback(update: Any, context: Any) -> None:
     ):
         with contextlib.suppress(Exception):
             await context.bot.delete_message(claimed.publication_chat_id, claimed.publication_message_id)
+
+    karma_after = await asyncio.to_thread(store.karma_total, updated.user_id)
+    level_message = _level_up_message(karma_before, karma_after)
+    if level_message:
+        try:
+            await asyncio.to_thread(
+                store.enqueue_author_message,
+                updated.id,
+                int(moderator_id),
+                level_message,
+            )
+        except Exception as exc:
+            print(
+                f"Could not enqueue level-up notice user={updated.user_id}: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     tag_updated = await _sync_karma_tag(context.bot, settings, store, updated.user_id)
     await _refresh_moderator_messages(context.bot, store, updated)
@@ -356,6 +373,21 @@ def _karma_tag(total_milli: int) -> str:
     if len(primary) <= 16:
         return primary
     return f"К: {int(total)}"[:16]
+
+
+def _level_up_message(before_milli: int, after_milli: int) -> str | None:
+    old_level = level_for_karma(before_milli)
+    new_level = level_for_karma(after_milli)
+    if new_level.minimum <= old_level.minimum:
+        return None
+    priority = "обычный" if new_level.priority_bonus == 0 else f"+{new_level.priority_bonus}"
+    return (
+        "🎉 Новый уровень кармы!\n\n"
+        f"Теперь твой уровень — {new_level.name}.\n"
+        f"Доступно: {new_level.daily_minutes} минут перевода в сутки.\n"
+        f"Приоритет в очереди: {priority}.\n"
+        "Лимита на длину одного видео нет — учитывается общий суточный лимит."
+    )
 
 
 async def _publish_to_channel(bot: Any, target_chat: str, submission: Submission) -> Any:

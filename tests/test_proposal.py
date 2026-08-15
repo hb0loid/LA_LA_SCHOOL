@@ -14,6 +14,7 @@ from laladub.proposal_bot import (
     _author_caption,
     _find_submission_subtitles,
     _karma_tag,
+    _level_up_message,
     _moderation_caption,
     _moderation_keyboard,
 )
@@ -196,6 +197,15 @@ class ProposalUiTests(unittest.TestCase):
         )
         self.assertIn("Статус: ✅ Опубликовано", _moderation_caption(submission))
         self.assertIn("Решение: La La School", _moderation_caption(submission))
+
+    def test_level_up_message_lists_new_privileges(self) -> None:
+        message = _level_up_message(4_900, 5_100)
+        self.assertIsNotNone(message)
+        self.assertIn("Участник", message)
+        self.assertIn("5 минут", message)
+        self.assertIn("Приоритет в очереди: обычный", message)
+        self.assertIsNone(_level_up_message(5_100, 5_900))
+        self.assertIsNone(_level_up_message(25_100, 5_100))
 
     def test_karma_tag_fits_telegram_limit(self) -> None:
         self.assertEqual(_karma_tag(6_999), "Карма: 6")
