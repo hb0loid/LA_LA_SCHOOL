@@ -13,6 +13,8 @@ param(
 
   [string]$Python = "",
 
+  [string]$Module = "laladub.bot",
+
   [int]$RestartDelaySeconds = 8
 )
 
@@ -31,7 +33,7 @@ Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Watchdog started 
 
 while ($true) {
   Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Watchdog launching instance=$Instance" -ErrorAction SilentlyContinue
-  $command = "`"$python`" -m laladub.bot --instance $Instance 1>> `"$OutLog`" 2>> `"$ErrLog`""
+  $command = "`"$python`" -m $Module --instance $Instance 1>> `"$OutLog`" 2>> `"$ErrLog`""
   & cmd.exe /d /c $command
   $exitCode = $LASTEXITCODE
   Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Bot exited instance=$Instance code=$exitCode; restarting in ${RestartDelaySeconds}s" -ErrorAction SilentlyContinue

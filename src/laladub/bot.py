@@ -22,6 +22,7 @@ from .ffmpeg import compress_video_for_telegram, make_audio_visual_video, probe_
 from .asr import clear_openai_whisper_cache
 from .models import DubConfig
 from .pipeline import run_dub, run_transcript
+from .proposal_store import ProposalStore
 from .tts import clear_tts_model_caches
 from .watermark import add_watermark
 
@@ -163,6 +164,7 @@ def main() -> None:
         f"{settings.audio_visual_safety_device} "
         f"paid_users={len(settings.paid_users)}/{settings.paid_users_file} "
         f"admin_users={len(settings.admin_users)}/{settings.admin_users_file} "
+        f"proposal={settings.proposal_enabled}/{settings.proposal_db} "
         f"duration_limits=free:{settings.free_max_duration_seconds}/paid:{settings.paid_max_duration_seconds} "
         f"collapse_repetitions={settings.collapse_repetitions}/"
         f"{settings.max_phrase_repeats}/{settings.max_word_repeats} "
@@ -185,6 +187,8 @@ def main() -> None:
     application = Application.builder().token(settings.token).post_init(_setup_bot_commands).build()
     application.bot_data["settings"] = settings
     application.bot_data["job_scheduler"] = _JobScheduler(settings)
+    if settings.proposal_enabled:
+        application.bot_data["proposal_store"] = ProposalStore(settings.proposal_db)
     application.add_error_handler(_telegram_error_handler)
     application.add_handler(MessageHandler(filters.ALL, maintenance_message_gate), group=-1)
     application.add_handler(CallbackQueryHandler(maintenance_callback_gate), group=-1)
@@ -206,6 +210,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(select_target_lang, pattern=r"^tgt:"))
     application.add_handler(CallbackQueryHandler(select_tts_method, pattern=r"^tts:"))
     application.add_handler(CallbackQueryHandler(resume_callback, pattern=r"^resume:"))
+    application.add_handler(CallbackQueryHandler(proposal_callback, pattern=r"^proposal:"))
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
@@ -442,6 +447,8 @@ async def _setup_bot_commands(application: Any) -> None:
     asyncio.create_task(_recover_interrupted_jobs(application))
     asyncio.create_task(_cleanup_finished_jobs_loop(application))
     asyncio.create_task(_maintenance_watch_loop(application))
+    if settings.proposal_enabled:
+        asyncio.create_task(_proposal_outbox_loop(application))
 
 
 async def _maintenance_watch_loop(application: Any) -> None:
@@ -459,6 +466,34 @@ async def _maintenance_watch_loop(application: Any) -> None:
             await scheduler.maintenance_changed(_ApplicationContext(application))
         except Exception:
             print(traceback.format_exc(), flush=True)
+
+
+async def _proposal_outbox_loop(application: Any) -> None:
+    store: ProposalStore = application.bot_data["proposal_store"]
+    while True:
+        try:
+            messages = await asyncio.to_thread(store.pending_author_messages, limit=20)
+            for item in messages:
+                error = None
+                try:
+                    await application.bot.send_message(
+                        chat_id=int(item["user_id"]),
+                        text=(
+                            f"Сообщение от модерации по работе №{item['job_number']}:\n\n"
+                            f"{item['text']}"
+                        ),
+                        read_timeout=60,
+                        write_timeout=60,
+                        connect_timeout=30,
+                        pool_timeout=30,
+                    )
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    print(f"Proposal author message failed: {error}", flush=True)
+                await asyncio.to_thread(store.finish_author_message, int(item["id"]), error=error)
+        except Exception:
+            print("Proposal outbox loop failed:\n" + traceback.format_exc(), flush=True)
+        await asyncio.sleep(3.0)
 
 
 async def maintenance_message_gate(update: Any, context: Any) -> None:
@@ -481,10 +516,13 @@ async def maintenance_callback_gate(update: Any, context: Any) -> None:
     if not _maintenance_blocks_user(settings, user.id if user else None):
         return
 
+    query = update.callback_query
+    if query is not None and str(query.data or "").startswith("proposal:"):
+        return
+
     from telegram.ext import ApplicationHandlerStop
 
     context.user_data.clear()
-    query = update.callback_query
     if query is not None:
         await query.answer("Ведутся технические работы. Попробуй позже.", show_alert=True)
         with contextlib.suppress(Exception):
@@ -683,6 +721,72 @@ async def resume_callback(update: Any, context: Any) -> None:
     _prepare_job_for_resume(job)
     await query.edit_message_text(f"Восстанавливаю работу №{_job_number(job)} и ставлю её в очередь.")
     await _enqueue_job(update, context, job, query.message)
+
+
+async def proposal_callback(update: Any, context: Any) -> None:
+    query = update.callback_query
+    settings: BotSettings = context.application.bot_data["settings"]
+    user = update.effective_user
+    if user is None:
+        await query.answer("Не удалось определить пользователя.", show_alert=True)
+        return
+    if not settings.proposal_enabled or "proposal_store" not in context.application.bot_data:
+        await query.answer("Предложка сейчас отключена.", show_alert=True)
+        return
+
+    parts = str(query.data or "").split(":")
+    if len(parts) != 3:
+        await query.answer("Некорректная кнопка.", show_alert=True)
+        return
+    action, value = parts[1], parts[2]
+    if action == "submitted":
+        await query.answer("Видео уже отправлено в предложку.")
+        return
+    if action != "submit" or not value.isdigit():
+        await query.answer("Некорректная кнопка.", show_alert=True)
+        return
+
+    job_dir = settings.workdir / str(user.id) / value
+    snapshot_path = _job_snapshot_path(job_dir)
+    try:
+        job = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except Exception:
+        await query.answer("Данные этой работы уже не найдены.", show_alert=True)
+        return
+    if not isinstance(job, dict) or _coerce_int(job.get("user_id")) != user.id:
+        await query.answer("Эта работа принадлежит другому пользователю.", show_alert=True)
+        return
+    if str(job.get("status") or "") not in {"ready", "done"}:
+        await query.answer("Работа ещё не завершена.", show_alert=True)
+        return
+
+    video_path = Path(str(job.get("proposal_video_path") or ""))
+    if not video_path.is_file():
+        await query.answer("Итоговый видеофайл уже не найден.", show_alert=True)
+        return
+    output_filename = str(job.get("proposal_output_filename") or video_path.name).strip() or video_path.name
+    author_name = str(getattr(user, "full_name", "") or getattr(user, "username", "") or user.id).strip()
+    author_username = str(getattr(user, "username", "") or "").strip() or None
+    store: ProposalStore = context.application.bot_data["proposal_store"]
+    try:
+        submission, created = await asyncio.to_thread(
+            store.create_submission,
+            job_number=value,
+            user_id=user.id,
+            chat_id=int(update.effective_chat.id),
+            author_name=author_name,
+            author_username=author_username,
+            video_path=video_path,
+            output_filename=output_filename,
+        )
+    except Exception as exc:
+        print("Proposal submission failed:\n" + traceback.format_exc(), flush=True)
+        await query.answer(f"Не удалось отправить: {type(exc).__name__}", show_alert=True)
+        return
+
+    with contextlib.suppress(Exception):
+        await query.edit_message_reply_markup(reply_markup=_proposal_submitted_keyboard(submission.id))
+    await query.answer("Отправлено в предложку." if created else "Видео уже находится в предложке.")
 
 
 async def receive_video(update: Any, context: Any) -> None:
@@ -2782,12 +2886,19 @@ async def _process_job(
             progress.update("Отправляю видео", 99, 100, None)
         output_filename = _lalaschool_filename(job.get("source_title") or Path(job["input_path"]).stem, send_path.suffix)
         transcript_text = _read_transcript_text(job_dir / "work" / "translated.srt")
-        _save_job_snapshot(job_dir, job, status="ready")
+        _save_job_snapshot(
+            job_dir,
+            job,
+            status="ready",
+            proposal_video_path=str(send_path),
+            proposal_output_filename=output_filename,
+        )
         await _send_video_file(
             context.bot,
             chat_id,
             send_path,
             output_filename,
+            reply_markup=_proposal_keyboard(_job_number(job)) if settings.proposal_enabled else None,
         )
         fun_visual_sent = await _send_fun_visual_if_present(
             context.bot,
@@ -2896,8 +3007,21 @@ async def _send_remote_worker_result(context: Any, item: _QueuedJob, manifest: d
             manifest.get("output_filename")
             or _lalaschool_filename(job.get("source_title") or video_path.stem, video_path.suffix)
         )
-        _save_job_snapshot(job_dir, job, status="ready")
-        await _send_video_file(context.bot, item.chat_id, video_path, output_filename)
+        _save_job_snapshot(
+            job_dir,
+            job,
+            status="ready",
+            proposal_video_path=str(video_path),
+            proposal_output_filename=output_filename,
+        )
+        settings: BotSettings = context.application.bot_data["settings"]
+        await _send_video_file(
+            context.bot,
+            item.chat_id,
+            video_path,
+            output_filename,
+            reply_markup=_proposal_keyboard(_job_number(job)) if settings.proposal_enabled else None,
+        )
         fun_visual_sent = await _send_fun_visual_if_present(
             context.bot,
             item.chat_id,
@@ -3058,6 +3182,22 @@ def _resume_keyboard(job_dir: Path) -> Any:
 
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("Продолжить задачу", callback_data=f"resume:{job_dir.name}")]]
+    )
+
+
+def _proposal_keyboard(job_number: str) -> Any:
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Отправить в предложку", callback_data=f"proposal:submit:{job_number}")]]
+    )
+
+
+def _proposal_submitted_keyboard(submission_id: int) -> Any:
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Отправлено в предложку", callback_data=f"proposal:submitted:{submission_id}")]]
     )
 
 

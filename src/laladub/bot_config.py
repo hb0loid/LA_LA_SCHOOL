@@ -23,6 +23,8 @@ class BotSettings:
     paid_users_file: Path
     admin_users: frozenset[int]
     admin_users_file: Path
+    proposal_enabled: bool
+    proposal_db: Path
     max_active_jobs: int
     max_active_jobs_per_user: int
     watermark_text: str
@@ -160,6 +162,8 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         paid_users_file=paid_users_file,
         admin_users=frozenset(admin_users),
         admin_users_file=admin_users_file,
+        proposal_enabled=_parse_bool(os.environ.get("LALADUB_PROPOSAL_ENABLED", "1")),
+        proposal_db=Path(os.environ.get("LALADUB_PROPOSAL_DB", "runs/proposal/proposals.sqlite3")),
         max_active_jobs=max(1, int(os.environ.get("LALADUB_MAX_ACTIVE_JOBS", "2"))),
         max_active_jobs_per_user=max(1, int(os.environ.get("LALADUB_MAX_ACTIVE_JOBS_PER_USER", "1"))),
         watermark_text=os.environ.get("LALADUB_WATERMARK_TEXT", "La La Local Dub"),

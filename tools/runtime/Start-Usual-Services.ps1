@@ -49,6 +49,10 @@ Invoke-ServiceLauncher `
   -Name "La La School release bot" `
   -Script (Join-Path $Root "tools\runtime\Start-Bot.ps1")
 
+Invoke-ServiceLauncher `
+  -Name "La La School proposal bot" `
+  -Script (Join-Path $Root "tools\runtime\Start-Proposal-Bot.ps1")
+
 $tgAllRoot = "C:\Users\HBoloid\Documents\TG ALL BOT"
 if (
   (Test-Path -LiteralPath (Join-Path $tgAllRoot ".env")) -and

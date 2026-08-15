@@ -27,6 +27,7 @@ dev = []
 [project.scripts]
 laladub = "laladub.cli:main"
 laladub-bot = "laladub.bot:main"
+laladub-proposal-bot = "laladub.proposal_bot:main"
 laladub-worker = "laladub.worker:main"
 
 [tool.setuptools.packages.find]
