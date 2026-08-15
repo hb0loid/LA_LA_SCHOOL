@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from laladub.proposal_bot import _author_caption, _moderation_keyboard
+from laladub.proposal_bot import _author_caption, _karma_tag, _moderation_keyboard
 from laladub.proposal_store import ProposalStore, Submission
 
 
@@ -63,6 +63,8 @@ class ProposalStoreTests(unittest.TestCase):
         self.assertEqual(delta, 4)
         self.assertEqual(updated.karma_award, 5)
         self.assertEqual(self.store.karma_total(123), 5)
+        self.assertEqual(self.store.karma_summary(123), (5, 2))
+        self.assertEqual(self.store.karma_users(), [123])
 
     def test_author_message_outbox(self) -> None:
         submission, _created = self.store.create_submission(
@@ -115,6 +117,10 @@ class ProposalUiTests(unittest.TestCase):
                 ["Не публиковать"],
             ],
         )
+
+    def test_karma_tag_fits_telegram_limit(self) -> None:
+        self.assertEqual(_karma_tag(6), "Карма: 6")
+        self.assertLessEqual(len(_karma_tag(12345678901234567890)), 16)
 
 
 if __name__ == "__main__":

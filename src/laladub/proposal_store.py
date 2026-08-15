@@ -356,12 +356,29 @@ class ProposalStore:
             )
 
     def karma_total(self, user_id: int) -> int:
+        total, _event_count = self.karma_summary(user_id)
+        return total
+
+    def karma_summary(self, user_id: int) -> tuple[int, int]:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT COALESCE(SUM(delta), 0) AS total FROM karma_events WHERE user_id = ?",
+                """
+                SELECT COALESCE(SUM(delta), 0) AS total, COUNT(*) AS event_count
+                FROM karma_events
+                WHERE user_id = ?
+                """,
                 (user_id,),
             ).fetchone()
-        return int(row["total"] if row is not None else 0)
+        if row is None:
+            return 0, 0
+        return int(row["total"] or 0), int(row["event_count"] or 0)
+
+    def karma_users(self) -> list[int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT user_id FROM karma_events ORDER BY user_id"
+            ).fetchall()
+        return [int(row["user_id"]) for row in rows]
 
 
 def _submission_from_row(row: sqlite3.Row) -> Submission:

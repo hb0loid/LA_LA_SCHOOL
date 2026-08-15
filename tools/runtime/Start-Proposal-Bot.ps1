@@ -71,6 +71,7 @@ try {
   $env:LALADUB_PROPOSAL_MODERATORS = "631551040,7123813884"
   $env:LALADUB_PROPOSAL_MAIN_CHANNEL = "@elevenlabss"
   $env:LALADUB_PROPOSAL_SHAME_CHANNEL = "@ghienmigo"
+  $env:LALADUB_PROPOSAL_KARMA_CHAT = "@lalaschoo"
   $env:PYTHONPATH = (Join-Path $Root "src")
   $env:PYTHONIOENCODING = "utf-8"
 

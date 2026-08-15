@@ -19,6 +19,7 @@ class ProposalBotSettings:
     moderator_ids: frozenset[int]
     main_channel: str
     shame_channel: str
+    karma_chat: str
 
 
 def load_settings() -> ProposalBotSettings:
@@ -34,13 +35,21 @@ def load_settings() -> ProposalBotSettings:
         moderator_ids=moderator_ids,
         main_channel=os.environ.get("LALADUB_PROPOSAL_MAIN_CHANNEL", "@elevenlabss").strip() or "@elevenlabss",
         shame_channel=os.environ.get("LALADUB_PROPOSAL_SHAME_CHANNEL", "@ghienmigo").strip() or "@ghienmigo",
+        karma_chat=os.environ.get("LALADUB_PROPOSAL_KARMA_CHAT", "@lalaschoo").strip() or "@lalaschoo",
     )
 
 
 def main() -> None:
     try:
         from telegram import Update
-        from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+        from telegram.ext import (
+            Application,
+            CallbackQueryHandler,
+            ChatMemberHandler,
+            CommandHandler,
+            MessageHandler,
+            filters,
+        )
     except ImportError as exc:
         raise RuntimeError("Install bot dependencies first: python -m pip install -e .[bot]") from exc
 
@@ -49,7 +58,7 @@ def main() -> None:
     print(
         "La La School Proposal Bot starting "
         f"database={settings.database} moderators={len(settings.moderator_ids)} "
-        f"channels={settings.main_channel},{settings.shame_channel}",
+        f"channels={settings.main_channel},{settings.shame_channel} karma_chat={settings.karma_chat}",
         flush=True,
     )
     application = Application.builder().token(settings.token).post_init(_post_init).build()
@@ -61,11 +70,15 @@ def main() -> None:
     application.add_handler(CommandHandler("pending", pending, filters=private_chat))
     application.add_handler(CommandHandler("cancel", cancel, filters=private_chat))
     application.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^mod:"))
+    application.add_handler(ChatMemberHandler(karma_member_changed, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(MessageHandler(private_chat & filters.TEXT & ~filters.COMMAND, relay_message))
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
 async def _post_init(application: Any) -> None:
+    settings: ProposalBotSettings = application.bot_data["settings"]
+    karma_chat = await application.bot.get_chat(settings.karma_chat)
+    application.bot_data["karma_chat_id"] = int(karma_chat.id)
     commands = [
         ("start", "Открыть предложку"),
         ("pending", "Проверить новые видео"),
@@ -73,6 +86,7 @@ async def _post_init(application: Any) -> None:
     ]
     await application.bot.set_my_commands(commands)
     asyncio.create_task(_delivery_loop(application))
+    asyncio.create_task(_sync_all_karma_tags(application))
 
 
 async def _error_handler(update: object, context: Any) -> None:
@@ -258,9 +272,64 @@ async def moderation_callback(update: Any, context: Any) -> None:
         with contextlib.suppress(Exception):
             await context.bot.delete_message(claimed.publication_chat_id, claimed.publication_message_id)
 
+    tag_updated = await _sync_karma_tag(context.bot, settings, store, updated.user_id)
     await _refresh_moderator_messages(context.bot, store, updated)
     delta_text = f"Карма: {delta:+d}" if delta else "Карма без изменений"
-    await query.message.reply_text(f"Решение применено. {delta_text}.")
+    tag_text = " Тег в группе обновлён." if tag_updated else ""
+    await query.message.reply_text(f"Решение применено. {delta_text}.{tag_text}")
+
+
+async def karma_member_changed(update: Any, context: Any) -> None:
+    event = update.chat_member
+    if event is None or int(event.chat.id) != context.application.bot_data.get("karma_chat_id"):
+        return
+    member = event.new_chat_member
+    user = member.user
+    if user.is_bot or str(member.status) != "member":
+        return
+    settings: ProposalBotSettings = context.application.bot_data["settings"]
+    store: ProposalStore = context.application.bot_data["store"]
+    await _sync_karma_tag(context.bot, settings, store, int(user.id))
+
+
+async def _sync_all_karma_tags(application: Any) -> None:
+    settings: ProposalBotSettings = application.bot_data["settings"]
+    store: ProposalStore = application.bot_data["store"]
+    user_ids = await asyncio.to_thread(store.karma_users)
+    for user_id in user_ids:
+        await _sync_karma_tag(application.bot, settings, store, user_id)
+
+
+async def _sync_karma_tag(
+    bot: Any,
+    settings: ProposalBotSettings,
+    store: ProposalStore,
+    user_id: int,
+) -> bool:
+    total, event_count = await asyncio.to_thread(store.karma_summary, user_id)
+    if event_count <= 0:
+        return False
+    try:
+        await bot.set_chat_member_tag(
+            chat_id=settings.karma_chat,
+            user_id=user_id,
+            tag=_karma_tag(total),
+        )
+        print(f"Karma tag updated user={user_id} total={total}", flush=True)
+        return True
+    except Exception as exc:
+        print(
+            f"Karma tag update skipped user={user_id} total={total}: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return False
+
+
+def _karma_tag(total: int) -> str:
+    primary = f"Карма: {int(total)}"
+    if len(primary) <= 16:
+        return primary
+    return f"К: {int(total)}"[:16]
 
 
 async def _publish_to_channel(bot: Any, target_chat: str, submission: Submission) -> Any:
