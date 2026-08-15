@@ -220,6 +220,24 @@ async def moderation_callback(update: Any, context: Any) -> None:
         )
         return
 
+    if action == "subtitles":
+        subtitles = _find_submission_subtitles(submission)
+        if subtitles is None:
+            await query.answer("Субтитры этой работы не найдены.", show_alert=True)
+            return
+        await query.answer("Отправляю субтитры…")
+        try:
+            with subtitles.open("rb") as document:
+                await context.bot.send_document(
+                    chat_id=query.message.chat_id,
+                    document=document,
+                    filename=f"work_{submission.job_number}_subtitles{subtitles.suffix}",
+                    caption=f"Субтитры работы №{submission.job_number}",
+                )
+        except Exception as exc:
+            await query.message.reply_text(f"Не удалось отправить субтитры: {type(exc).__name__}: {exc}")
+        return
+
     decisions = {
         "main": ("main", settings.main_channel),
         "shame": ("shame", settings.shame_channel),
@@ -371,7 +389,11 @@ async def _refresh_moderator_messages(bot: Any, store: ProposalStore, submission
                 message_id=message_id,
                 caption=_moderation_caption(submission),
                 parse_mode="HTML",
-                reply_markup=_moderation_keyboard(submission.id),
+                reply_markup=(
+                    _moderation_keyboard(submission.id)
+                    if submission.status == "pending"
+                    else None
+                ),
             )
 
 
@@ -408,7 +430,7 @@ def _moderation_keyboard(submission_id: int) -> Any:
                 InlineKeyboardButton("В Ghien Mi Go", callback_data=f"mod:shame:{submission_id}"),
             ],
             [InlineKeyboardButton("Передать сообщение", callback_data=f"mod:message:{submission_id}")],
-            [InlineKeyboardButton("Не публиковать", callback_data=f"mod:reject:{submission_id}")],
+            [InlineKeyboardButton("Посмотреть субтитры", callback_data=f"mod:subtitles:{submission_id}")],
         ]
     )
 
@@ -416,8 +438,8 @@ def _moderation_keyboard(submission_id: int) -> Any:
 def _moderation_caption(submission: Submission) -> str:
     status_labels = {
         "pending": "Ожидает решения",
-        "published": "Опубликовано",
-        "rejected": "Не опубликовано",
+        "published": "✅ Опубликовано",
+        "rejected": "✅ Не опубликовано",
     }
     destination_labels = {
         "main": "La La School",
@@ -443,6 +465,21 @@ def _author_caption(submission: Submission) -> str:
     else:
         href = f"tg://user?id={submission.user_id}"
     return f'Прислал <a href="{href}">{name}</a>'
+
+
+def _find_submission_subtitles(submission: Submission) -> Path | None:
+    job_dir = Path(submission.video_path).parent
+    candidates = [
+        job_dir / "work" / "translated.srt",
+        *sorted(job_dir.glob("*_transcript_lalaschool.txt")),
+    ]
+    work_dir = job_dir / "work"
+    if work_dir.is_dir():
+        candidates.extend(sorted(work_dir.glob("input_*.srt")))
+    for candidate in candidates:
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate
+    return None
 
 
 def _parse_ids(raw: str) -> set[int]:

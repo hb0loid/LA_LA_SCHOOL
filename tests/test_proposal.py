@@ -10,7 +10,13 @@ from laladub.karma import (
     level_for_karma,
     visible_karma,
 )
-from laladub.proposal_bot import _author_caption, _karma_tag, _moderation_keyboard
+from laladub.proposal_bot import (
+    _author_caption,
+    _find_submission_subtitles,
+    _karma_tag,
+    _moderation_caption,
+    _moderation_keyboard,
+)
 from laladub.proposal_store import ProposalStore, Submission
 
 
@@ -138,9 +144,58 @@ class ProposalUiTests(unittest.TestCase):
             [
                 ["В La La School", "В Ghien Mi Go"],
                 ["Передать сообщение"],
-                ["Не публиковать"],
+                ["Посмотреть субтитры"],
             ],
         )
+
+    def test_subtitle_button_prefers_translated_srt(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            job_dir = Path(tempdir)
+            work_dir = job_dir / "work"
+            work_dir.mkdir()
+            translated = work_dir / "translated.srt"
+            translated.write_text("1\n00:00:00,000 --> 00:00:01,000\nТест\n", encoding="utf-8")
+            submission = Submission(
+                id=1,
+                job_number="2",
+                user_id=123,
+                chat_id=123,
+                author_name="Тест",
+                author_username=None,
+                video_path=str(job_dir / "dubbed.mp4"),
+                output_filename="dubbed.mp4",
+                status="pending",
+                destination=None,
+                karma_milli=0,
+                duration_ms=0,
+                publication_chat_id=None,
+                publication_message_id=None,
+                created_at=0,
+                updated_at=0,
+            )
+            self.assertEqual(_find_submission_subtitles(submission), translated)
+
+    def test_published_caption_is_marked_with_check(self) -> None:
+        submission = Submission(
+            id=1,
+            job_number="2",
+            user_id=123,
+            chat_id=123,
+            author_name="Тест",
+            author_username=None,
+            video_path="dubbed.mp4",
+            output_filename="dubbed.mp4",
+            status="published",
+            destination="main",
+            karma_milli=1_500,
+            duration_ms=15_000,
+            publication_chat_id=-1001,
+            publication_message_id=5,
+            created_at=0,
+            updated_at=0,
+        )
+        self.assertIn("Статус: ✅ Опубликовано", _moderation_caption(submission))
+        self.assertIn("Решение: La La School", _moderation_caption(submission))
 
     def test_karma_tag_fits_telegram_limit(self) -> None:
         self.assertEqual(_karma_tag(6_999), "Карма: 6")
