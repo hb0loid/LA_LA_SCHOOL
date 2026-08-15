@@ -163,7 +163,14 @@ class KarmaRulesTests(unittest.TestCase):
     def test_levels_use_visible_whole_karma(self) -> None:
         self.assertEqual(level_for_karma(4_999).name, "Новичок")
         self.assertEqual(level_for_karma(5_000).name, "Участник")
-        self.assertEqual(level_for_karma(500_000).daily_minutes, 50)
+        self.assertEqual(level_for_karma(0).daily_minutes, 3)
+        self.assertEqual(level_for_karma(5_000).daily_minutes, 5)
+        self.assertEqual(level_for_karma(25_000).daily_minutes, 10)
+        self.assertEqual(level_for_karma(75_000).daily_minutes, 15)
+        self.assertEqual(level_for_karma(150_000).daily_minutes, 20)
+        self.assertEqual(level_for_karma(300_000).daily_minutes, 30)
+        self.assertEqual(level_for_karma(500_000).daily_minutes, 40)
+        self.assertEqual(level_for_karma(1_000_000).daily_minutes, 50)
         self.assertEqual(format_karma_milli(1_234), "1,234")
 
 
