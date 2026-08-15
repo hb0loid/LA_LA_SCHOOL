@@ -19,8 +19,8 @@ try {
 $allProcesses = @(Get-CimInstance Win32_Process)
 $rootProcesses = @($allProcesses | Where-Object {
   (
-    $_.CommandLine -like "*tools\runtime\Watchdog.ps1*" -or
-    $_.CommandLine -like "*Run-Bot-Watchdog.ps1*" -or
+    ($_.CommandLine -like "*tools\runtime\Watchdog.ps1*" -and $_.CommandLine -like "*-Instance release*") -or
+    ($_.CommandLine -like "*Run-Bot-Watchdog.ps1*" -and $_.CommandLine -like "*-Instance release*") -or
     ($_.CommandLine -like "*laladub.bot*" -and $_.CommandLine -like "*--instance release*")
   ) -and $_.CommandLine -like "*$Root*"
 })
