@@ -270,6 +270,9 @@ def _run_lease(client: CoordinatorClient, lease: dict[str, Any], workdir: Path) 
         job["input_path"] = str(input_path)
         save_job_snapshot(job_dir, job, status="running")
         settings = load_bot_settings(require_token=False)
+        if str(job.get("remote_stage") or "").strip().lower() == "preprocess" and _cuda_available():
+            settings.artifact_whisper_device = "cuda"
+            print("Worker preprocessing acceleration: artifact Whisper uses CUDA.", flush=True)
         reporter = ProgressReporter(client, job_id)
         reporter("Worker started", 1, 100, f"input={job.get('source_lang') or 'auto'}")
         result = execute_job(job, settings, progress_callback=reporter)
@@ -294,6 +297,15 @@ def _lease_heartbeat_loop(client: CoordinatorClient, job_id: str, stop: threadin
             client.heartbeat(job_id)
         except Exception as exc:
             print(f"Worker heartbeat failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
 
 
 def _upload_result_files(client: CoordinatorClient, job_id: str, result: Any) -> None:
