@@ -13,6 +13,7 @@ from laladub.job_runner import JobDocument, JobExecutionResult, result_manifest
 class SplitWorkerTests(unittest.TestCase):
     def test_moss_job_uses_remote_preprocessing(self) -> None:
         self.assertEqual(_remote_stage_for_job({"mode": "dub", "tts_provider": "moss"}), "preprocess")
+        self.assertEqual(_remote_stage_for_job({"mode": "dub"}), "preprocess")
         self.assertEqual(_remote_stage_for_job({"mode": "dub", "tts_provider": "f5"}), "complete")
         self.assertEqual(_remote_stage_for_job({"mode": "raw_text", "tts_provider": "moss"}), "complete")
 

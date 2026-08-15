@@ -167,7 +167,16 @@ function Invoke-WorkerUpdate {
     if ($name -in @("worker_config.json", "runs", "updates", ".worker_state.json")) {
       return
     }
-    Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $Root $name) -Recurse -Force
+    $destination = Join-Path $Root $name
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $destinationFull = [IO.Path]::GetFullPath($destination)
+    if (-not $destinationFull.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+      throw "Refusing to install worker update outside worker root: $destinationFull"
+    }
+    if ($_.PSIsContainer -and (Test-Path -LiteralPath $destination)) {
+      Remove-Item -LiteralPath $destination -Recurse -Force
+    }
+    Copy-Item -LiteralPath $_.FullName -Destination $destination -Recurse -Force
   }
   @{
     build_id = $remoteBuild

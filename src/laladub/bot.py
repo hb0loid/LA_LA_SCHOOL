@@ -1797,6 +1797,7 @@ class _QueuedJob:
         self.progress: _ProgressState | None = None
         self.progress_task: asyncio.Task[Any] | None = None
         self.remote_last_seen_at: float | None = None
+        self.remote_heartbeat_seen = False
 
 
 class _JobScheduler:
@@ -1929,7 +1930,8 @@ class _JobScheduler:
                     item
                     for item in self._leased.values()
                     if item.execution_kind == "remote_preprocess"
-                    and now - float(item.remote_last_seen_at or 0.0) > 90.0
+                    and now - float(item.remote_last_seen_at or 0.0)
+                    > (90.0 if item.remote_heartbeat_seen else 1200.0)
                 ]
                 await self._dispatch_locked(context)
             for item in stale:
@@ -1956,6 +1958,7 @@ class _JobScheduler:
             item.worker_id = worker_id
             item.execution_kind = "remote_preprocess" if remote_stage == "preprocess" else "remote"
             item.remote_last_seen_at = time.time()
+            item.remote_heartbeat_seen = False
             item.job.setdefault("started_at", time.time())
             item.job["worker_id"] = worker_id
             item.job["is_paid"] = self._settings.is_paid(item.user_id)
@@ -2011,7 +2014,10 @@ class _JobScheduler:
             item.remote_last_seen_at = time.time()
             if item.worker_id:
                 self._mark_remote_worker_locked(item.worker_id, active_job_id=item.job_id)
-            if payload.get("heartbeat_only") or item.progress is None:
+            if payload.get("heartbeat_only"):
+                item.remote_heartbeat_seen = True
+                return
+            if item.progress is None:
                 return
             item.progress.update(
                 str(payload.get("stage") or ""),
@@ -2376,7 +2382,7 @@ def _remote_job_payload(job: dict[str, Any]) -> dict[str, Any]:
 def _remote_stage_for_job(job: dict[str, Any]) -> str:
     if str(job.get("mode") or "dub") == "raw_text":
         return "complete"
-    provider = _tts_provider_value(job.get("tts_provider"))
+    provider = _tts_provider_value(job.get("tts_provider")) or "moss"
     return "preprocess" if provider in {"qwen3", "cosyvoice", "moss"} else "complete"
 
 
