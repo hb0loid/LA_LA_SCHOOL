@@ -10,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
@@ -129,6 +130,13 @@ class CoordinatorClient:
             },
         )
 
+    def heartbeat(self, job_id: str) -> None:
+        self._request_json(
+            "POST",
+            f"/api/v1/jobs/{urllib.parse.quote(job_id)}/progress",
+            {"heartbeat_only": True},
+        )
+
     def upload_file(self, job_id: str, kind: str, path: Path) -> None:
         query = urllib.parse.urlencode({"filename": path.name})
         request_path = f"/api/v1/jobs/{urllib.parse.quote(job_id)}/result/{urllib.parse.quote(kind)}?{query}"
@@ -246,6 +254,15 @@ def _run_lease(client: CoordinatorClient, lease: dict[str, Any], workdir: Path) 
     input_path = job_dir / _safe_name(input_filename)
     print(f"Leased job {job_id}: downloading {input_filename}", flush=True)
 
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_lease_heartbeat_loop,
+        args=(client, job_id, heartbeat_stop),
+        name=f"laladub-heartbeat-{_safe_name(job_id)}",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+
     try:
         client.download_input(job_id, input_path)
         job = dict(remote_job)
@@ -266,6 +283,17 @@ def _run_lease(client: CoordinatorClient, lease: dict[str, Any], workdir: Path) 
         print(traceback_text, flush=True)
         save_job_snapshot(job_dir, remote_job, status="failed", error=str(exc))
         client.fail(job_id, "".join(traceback.format_exception_only(type(exc), exc)).strip(), traceback_text)
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=2.0)
+
+
+def _lease_heartbeat_loop(client: CoordinatorClient, job_id: str, stop: threading.Event) -> None:
+    while not stop.wait(10.0):
+        try:
+            client.heartbeat(job_id)
+        except Exception as exc:
+            print(f"Worker heartbeat failed: {type(exc).__name__}: {exc}", flush=True)
 
 
 def _upload_result_files(client: CoordinatorClient, job_id: str, result: Any) -> None:

@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import traceback
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -451,6 +452,7 @@ async def _setup_bot_commands(application: Any) -> None:
     asyncio.create_task(_recover_interrupted_jobs(application))
     asyncio.create_task(_cleanup_finished_jobs_loop(application))
     asyncio.create_task(_maintenance_watch_loop(application))
+    asyncio.create_task(application.bot_data["job_scheduler"].watch_remote_leases(_ApplicationContext(application)))
     if settings.proposal_enabled:
         asyncio.create_task(_proposal_outbox_loop(application))
 
@@ -1794,6 +1796,7 @@ class _QueuedJob:
         self.execution_kind: str | None = None
         self.progress: _ProgressState | None = None
         self.progress_task: asyncio.Task[Any] | None = None
+        self.remote_last_seen_at: float | None = None
 
 
 class _JobScheduler:
@@ -1917,6 +1920,25 @@ class _JobScheduler:
             await self._dispatch_locked(context)
             await self._refresh_pending_locked()
 
+    async def watch_remote_leases(self, context: Any) -> None:
+        while True:
+            await asyncio.sleep(15.0)
+            now = time.time()
+            async with self._lock:
+                stale = [
+                    item
+                    for item in self._leased.values()
+                    if item.execution_kind == "remote_preprocess"
+                    and now - float(item.remote_last_seen_at or 0.0) > 90.0
+                ]
+                await self._dispatch_locked(context)
+            for item in stale:
+                print(
+                    f"Remote preprocessing heartbeat timed out job={item.job_id} worker={item.worker_id}",
+                    flush=True,
+                )
+                await self._fallback_remote_preprocess(context, item, "worker heartbeat timed out")
+
     async def lease_remote(self, context: Any, worker_id: str) -> dict[str, Any] | None:
         async with self._lock:
             if self._settings.executor_mode not in {"remote", "hybrid"}:
@@ -1930,11 +1952,15 @@ class _JobScheduler:
             self._active_total += 1
             if item.user_id is not None:
                 self._active_by_user[item.user_id] = self._active_by_user.get(item.user_id, 0) + 1
+            remote_stage = _remote_stage_for_job(item.job)
             item.worker_id = worker_id
-            item.execution_kind = "remote"
-            item.job["started_at"] = time.time()
+            item.execution_kind = "remote_preprocess" if remote_stage == "preprocess" else "remote"
+            item.remote_last_seen_at = time.time()
+            item.job.setdefault("started_at", time.time())
             item.job["worker_id"] = worker_id
             item.job["is_paid"] = self._settings.is_paid(item.user_id)
+            if remote_stage == "preprocess":
+                item.job["remote_preprocess_started_at"] = time.time()
             _save_job_snapshot(Path(item.job["job_dir"]), item.job, status="running")
             item.progress = _ProgressState(
                 "Raw Whisper" if item.job.get("mode") == "raw_text" else "Full dubbing",
@@ -1945,8 +1971,11 @@ class _JobScheduler:
             self._leased[item.job_id] = item
             self._mark_remote_worker_locked(worker_id, active_job_id=item.job_id)
             await _safe_edit_status(item.status_message, item.progress.render())
+            await self._dispatch_locked(context)
             await self._refresh_pending_locked()
             payload = _remote_job_payload(item.job)
+            if remote_stage == "preprocess":
+                payload["remote_stage"] = "preprocess"
             return {
                 "job_id": item.job_id,
                 "job": payload,
@@ -1977,7 +2006,12 @@ class _JobScheduler:
     async def remote_progress(self, job_id: str, payload: dict[str, Any]) -> None:
         async with self._lock:
             item = self._leased.get(job_id)
-            if item is None or item.progress is None:
+            if item is None:
+                return
+            item.remote_last_seen_at = time.time()
+            if item.worker_id:
+                self._mark_remote_worker_locked(item.worker_id, active_job_id=item.job_id)
+            if payload.get("heartbeat_only") or item.progress is None:
                 return
             item.progress.update(
                 str(payload.get("stage") or ""),
@@ -1994,9 +2028,13 @@ class _JobScheduler:
             item = self._leased.get(job_id)
             if item is None:
                 raise RuntimeError(f"Unknown leased job: {job_id}")
+            item.remote_last_seen_at = time.time()
             if item.worker_id:
                 self._mark_remote_worker_locked(item.worker_id, active_job_id=None)
-            context.application.create_task(self._finalize_remote_item(context, item, manifest))
+            if item.execution_kind == "remote_preprocess":
+                context.application.create_task(self._finalize_remote_preprocess(context, item, manifest))
+            else:
+                context.application.create_task(self._finalize_remote_item(context, item, manifest))
 
     async def fail_remote(self, context: Any, job_id: str, payload: dict[str, Any]) -> None:
         async with self._lock:
@@ -2005,7 +2043,81 @@ class _JobScheduler:
                 raise RuntimeError(f"Unknown leased job: {job_id}")
             if item.worker_id:
                 self._mark_remote_worker_locked(item.worker_id, active_job_id=None)
-            context.application.create_task(self._fail_remote_item(context, item, payload))
+            if item.execution_kind == "remote_preprocess":
+                details = str(payload.get("error") or "Remote preprocessing failed")
+                context.application.create_task(
+                    self._fallback_remote_preprocess(context, item, f"worker error: {details}")
+                )
+            else:
+                context.application.create_task(self._fail_remote_item(context, item, payload))
+
+    async def _finalize_remote_preprocess(
+        self,
+        context: Any,
+        item: _QueuedJob,
+        manifest: dict[str, Any],
+    ) -> None:
+        try:
+            preprocess_info = manifest.get("preprocess")
+            if not isinstance(preprocess_info, dict):
+                raise RuntimeError("Worker completed preprocessing without an artifact package.")
+            archive = _remote_result_file(
+                Path(str(item.job["job_dir"])),
+                "documents",
+                str(preprocess_info.get("filename") or ""),
+            )
+            await asyncio.to_thread(_install_preprocess_bundle, archive, Path(str(item.job["job_dir"])))
+            completed_at = time.time()
+            item.job["remote_preprocess_completed_at"] = completed_at
+            item.job["remote_preprocess_seconds"] = float(
+                manifest.get("preprocess_seconds")
+                or max(0.0, completed_at - float(item.job.get("remote_preprocess_started_at") or completed_at))
+            )
+            item.job["remote_preprocess_worker"] = item.worker_id
+            await self._requeue_after_remote_preprocess(context, item, fallback=False)
+        except Exception as exc:
+            print("Remote preprocessing import failed:\n" + traceback.format_exc(), flush=True)
+            await self._fallback_remote_preprocess(
+                context,
+                item,
+                f"artifact import failed: {type(exc).__name__}: {exc}",
+            )
+
+    async def _fallback_remote_preprocess(self, context: Any, item: _QueuedJob, reason: str) -> None:
+        item.job["remote_preprocess_fallback"] = reason
+        item.job["force_local"] = True
+        await self._requeue_after_remote_preprocess(context, item, fallback=True)
+
+    async def _requeue_after_remote_preprocess(
+        self,
+        context: Any,
+        item: _QueuedJob,
+        *,
+        fallback: bool,
+    ) -> None:
+        async with self._lock:
+            if self._leased.pop(item.job_id, None) is None:
+                return
+            if item.worker_id:
+                self._mark_remote_worker_locked(item.worker_id, active_job_id=None)
+            self._active_total = max(0, self._active_total - 1)
+            if item.user_id is not None:
+                current = self._active_by_user.get(item.user_id, 0) - 1
+                if current > 0:
+                    self._active_by_user[item.user_id] = current
+                else:
+                    self._active_by_user.pop(item.user_id, None)
+            if item.progress_task is not None:
+                item.progress_task.cancel()
+            item.progress_task = None
+            item.progress = None
+            item.execution_kind = None
+            item.remote_last_seen_at = None
+            heapq.heappush(self._pending, (item.priority, item.sequence, item))
+            detail = "ноут недоступен, продолжаю локально" if fallback else "подготовка с ноутбука получена"
+            _save_job_snapshot(Path(item.job["job_dir"]), item.job, status="queued", split_stage=detail)
+            await self._dispatch_locked(context)
+            await self._refresh_pending_locked()
 
     async def _finalize_remote_item(self, context: Any, item: _QueuedJob, manifest: dict[str, Any]) -> None:
         try:
@@ -2046,7 +2158,9 @@ class _JobScheduler:
             if item.user_id is not None:
                 self._active_by_user[item.user_id] = self._active_by_user.get(item.user_id, 0) + 1
             item.execution_kind = "local"
-            item.job["started_at"] = time.time()
+            item.job.setdefault("started_at", time.time())
+            if item.job.get("remote_preprocess_completed_at"):
+                item.job["local_continuation_started_at"] = time.time()
             _save_job_snapshot(Path(item.job["job_dir"]), item.job, status="starting")
             title = "Сырой Whisper" if item.job.get("mode") == "raw_text" else "Полноценный дубляж"
             item.progress = _ProgressState(title, _job_number(item.job))
@@ -2081,9 +2195,18 @@ class _JobScheduler:
             return False
         if execution_kind == "remote" and _target_lang_value(item.job.get("target_lang")) != "ru":
             return False
-        if execution_kind == "remote" and _tts_provider_value(item.job.get("tts_provider")) in {
-            "qwen3", "cosyvoice", "moss"
-        }:
+        if execution_kind == "remote" and (
+            item.job.get("force_local") or item.job.get("remote_preprocess_completed_at")
+        ):
+            return False
+        if (
+            execution_kind == "local"
+            and self._settings.executor_mode == "hybrid"
+            and not item.job.get("force_local")
+            and not item.job.get("remote_preprocess_completed_at")
+            and _remote_stage_for_job(item.job) == "preprocess"
+            and self._remote_worker_counts_locked()["idle"] > 0
+        ):
             return False
         if item.user_id is None:
             return True
@@ -2103,6 +2226,23 @@ class _JobScheduler:
                 progress_state=item.progress,
             )
             snapshot = _load_job_snapshot(Path(str(item.job["job_dir"])))
+            if (
+                snapshot is not None
+                and str(snapshot.get("status") or "") == "done"
+                and item.job.get("remote_preprocess_completed_at")
+            ):
+                finished_at = time.time()
+                snapshot["split_completed_at"] = finished_at
+                snapshot["local_continuation_seconds"] = max(
+                    0.0,
+                    finished_at - float(item.job.get("local_continuation_started_at") or finished_at),
+                )
+                snapshot["split_total_seconds"] = max(
+                    0.0,
+                    finished_at - float(item.job.get("remote_preprocess_started_at") or finished_at),
+                )
+                item.job.update(snapshot)
+                _save_job_snapshot(Path(str(item.job["job_dir"])), snapshot, status="done")
             if snapshot is not None and str(snapshot.get("status") or "") == "failed":
                 await _release_daily_allowance(context, item.user_id, item.job)
         finally:
@@ -2231,6 +2371,13 @@ def _remote_job_payload(job: dict[str, Any]) -> dict[str, Any]:
     payload = {key: value for key, value in job.items() if key not in blocked}
     payload["target_lang"] = _target_lang_value(job.get("target_lang"))
     return payload
+
+
+def _remote_stage_for_job(job: dict[str, Any]) -> str:
+    if str(job.get("mode") or "dub") == "raw_text":
+        return "complete"
+    provider = _tts_provider_value(job.get("tts_provider"))
+    return "preprocess" if provider in {"qwen3", "cosyvoice", "moss"} else "complete"
 
 
 def _safe_upload_name(value: str) -> str:
@@ -3131,6 +3278,43 @@ def _remote_result_file(job_dir: Path, kind: str, filename: str) -> Path:
     if not path.exists():
         raise RuntimeError(f"Worker result file is missing: {path}")
     return path
+
+
+def _install_preprocess_bundle(archive_path: Path, job_dir: Path) -> None:
+    job_dir = job_dir.resolve()
+    incoming = job_dir / ".preprocess-incoming"
+    backup = job_dir / ".preprocess-backup"
+    workdir = job_dir / "work"
+    shutil.rmtree(incoming, ignore_errors=True)
+    shutil.rmtree(backup, ignore_errors=True)
+    incoming.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            for info in archive.infolist():
+                relative = Path(info.filename.replace("\\", "/"))
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise RuntimeError(f"Unsafe preprocessing archive member: {info.filename}")
+                destination = (incoming / relative).resolve()
+                try:
+                    destination.relative_to(incoming.resolve())
+                except ValueError as exc:
+                    raise RuntimeError(f"Unsafe preprocessing archive member: {info.filename}") from exc
+            archive.extractall(incoming)
+        required = (incoming / "translated.srt", incoming / "source_16k.wav", incoming / "resume_state.json")
+        missing = [path.name for path in required if not path.is_file() or path.stat().st_size == 0]
+        if missing:
+            raise RuntimeError("Preprocessing package is incomplete: " + ", ".join(missing))
+
+        if workdir.exists():
+            workdir.replace(backup)
+        incoming.replace(workdir)
+        shutil.rmtree(backup, ignore_errors=True)
+    except Exception:
+        if not workdir.exists() and backup.exists():
+            backup.replace(workdir)
+        raise
+    finally:
+        shutil.rmtree(incoming, ignore_errors=True)
 
 
 def _job_snapshot_path(job_dir: Path) -> Path:

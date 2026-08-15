@@ -985,6 +985,17 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     print(f"      Dub segments: {len(segments)}")
     _report_progress(config, "Перевод подготовлен", 62, 100, f"реплик: {len(segments)}")
 
+    if config.preprocess_only:
+        _save_resume_state(
+            config,
+            preprocess_complete=True,
+            translated=True,
+            segment_count=len(segments),
+        )
+        _report_progress(config, "Подготовка на ноутбуке завершена", 64, 100, f"реплик: {len(segments)}")
+        print("[preprocess] Translation package is ready; TTS remains on the coordinator")
+        return translated_srt_path
+
     tts_already_fit = config.resume and _tts_fit_complete(segments, config)
 
     if not tts_already_fit and _needs_speaker_references(config) and config.speaker_wav is None:

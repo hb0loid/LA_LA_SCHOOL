@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import time
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -57,6 +59,7 @@ class JobExecutionResult:
     transcript_filename: str | None = None
     transcript_text: str = ""
     documents: list[JobDocument] = field(default_factory=list)
+    preprocess_seconds: float | None = None
 
 
 def execute_job(
@@ -82,6 +85,9 @@ def _execute_job(
     input_path = Path(str(job["input_path"]))
     job_dir.mkdir(parents=True, exist_ok=True)
     output_path = job_dir / "dubbed.mp4"
+
+    if str(job.get("remote_stage") or "").strip().lower() == "preprocess":
+        return _execute_preprocess_job(job, settings, output_path, progress_callback)
 
     if job.get("mode") == "raw_text":
         return _execute_raw_text_job(job, settings, output_path, progress_callback)
@@ -140,7 +146,46 @@ def result_manifest(result: JobExecutionResult) -> dict[str, Any]:
             }
             for document in result.documents
         ]
+    if result.mode == "preprocess" and result.documents:
+        data["preprocess"] = {"filename": result.documents[0].path.name}
+        data["preprocess_seconds"] = result.preprocess_seconds
     return data
+
+
+def _execute_preprocess_job(
+    job: dict[str, Any],
+    settings: BotSettings,
+    output_path: Path,
+    progress_callback: ProgressCallback | None,
+) -> JobExecutionResult:
+    job_dir = Path(str(job["job_dir"]))
+    input_path = Path(str(job["input_path"]))
+    workdir = job_dir / "work"
+    if workdir.exists():
+        shutil.rmtree(workdir)
+
+    config = _build_dub_config(job, settings, output_path)
+    config.progress_callback = progress_callback
+    config.resume = True
+    config.preprocess_only = True
+    started_at = time.monotonic()
+    run_dub(input_path, config)
+    elapsed = time.monotonic() - started_at
+
+    archive_path = job_dir / "preprocess_bundle.zip"
+    archive_path.unlink(missing_ok=True)
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+        for path in sorted(workdir.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(workdir).as_posix())
+    if not archive_path.is_file() or archive_path.stat().st_size < 1024:
+        raise RuntimeError("Remote preprocessing created an empty artifact package.")
+
+    return JobExecutionResult(
+        mode="preprocess",
+        documents=[JobDocument(archive_path, archive_path.name, "Prepared dubbing artifacts")],
+        preprocess_seconds=elapsed,
+    )
 
 
 def _execute_raw_text_job(

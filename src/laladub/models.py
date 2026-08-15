@@ -136,4 +136,5 @@ class DubConfig:
     fit_to_segments: bool = True
     keep_workdir: bool = True
     resume: bool = True
+    preprocess_only: bool = False
     progress_callback: Callable[[str, int | None, int | None, str | None], None] | None = None
