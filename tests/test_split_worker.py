@@ -55,7 +55,11 @@ class SplitWorkerTests(unittest.TestCase):
 
 
 class _DummyStatus:
+    def __init__(self) -> None:
+        self.text = ""
+
     async def edit_text(self, _text: str) -> None:
+        self.text = _text
         return None
 
 
@@ -67,7 +71,65 @@ class _DummySettings(SimpleNamespace):
         return False
 
 
+class _FreeSettings(_DummySettings):
+    def is_paid(self, _user_id: int | None) -> bool:
+        return False
+
+
+class _ZeroKarmaStore:
+    def karma_total(self, _user_id: int) -> int:
+        return 0
+
+
 class SplitSchedulerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_free_user_cannot_exceed_level_queue_limit(self) -> None:
+        import asyncio
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            settings = _FreeSettings(
+                executor_mode="local",
+                max_active_jobs=0,
+                max_active_jobs_per_user=1,
+                max_local_jobs=0,
+                workdir=root,
+                tts="moss",
+                maintenance=False,
+            )
+            scheduler = _JobScheduler(settings)
+            application = SimpleNamespace(
+                bot=SimpleNamespace(),
+                bot_data={"job_scheduler": scheduler, "proposal_store": _ZeroKarmaStore()},
+                create_task=asyncio.create_task,
+            )
+            context = _ApplicationContext(application)
+            first_dir = root / "first"
+            second_dir = root / "second"
+            first_dir.mkdir()
+            second_dir.mkdir()
+            first_status = _DummyStatus()
+            second_status = _DummyStatus()
+
+            accepted = await scheduler.enqueue(
+                context,
+                chat_id=1,
+                user_id=123,
+                job={"job_dir": str(first_dir), "mode": "dub", "tts_provider": "moss"},
+                status_message=first_status,
+            )
+            rejected = await scheduler.enqueue(
+                context,
+                chat_id=1,
+                user_id=123,
+                job={"job_dir": str(second_dir), "mode": "dub", "tts_provider": "moss"},
+                status_message=second_status,
+            )
+
+            self.assertTrue(accepted)
+            self.assertFalse(rejected)
+            self.assertIn("Лимит задач в очереди", second_status.text)
+            self.assertEqual((await scheduler.snapshot())["pending_total"], 1)
+
     async def test_preprocessed_job_returns_to_local_queue(self) -> None:
         import asyncio
 

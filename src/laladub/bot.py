@@ -612,6 +612,7 @@ async def me(update: Any, context: Any) -> None:
                 f"Сегодня использовано: {_format_duration_ms(used_ms)} из {_format_duration_ms(limit_ms)}",
                 f"Осталось сегодня: {_format_duration_ms(max(0, limit_ms - used_ms))}",
                 f"Приоритет в очереди: {'обычный' if level.priority_bonus == 0 else f'+{level.priority_bonus}'}",
+                f"Лимит задач в очереди: {level.queue_limit}",
             ]
         )
 
@@ -1497,13 +1498,16 @@ async def _enqueue_job(update: Any, context: Any, job: dict[str, Any], status_me
         _save_job_snapshot(Path(job["job_dir"]), job, status="rejected", error="daily_limit")
         return
 
-    await scheduler.enqueue(
+    enqueued = await scheduler.enqueue(
         context,
         chat_id=chat.id,
         user_id=user.id if user else None,
         job=job,
         status_message=status_message,
     )
+    if not enqueued:
+        await _release_daily_allowance(context, user.id if user else None, job)
+        _save_job_snapshot(Path(job["job_dir"]), job, status="rejected", error="queue_limit")
 
 
 async def _reserve_daily_allowance(
@@ -1831,6 +1835,7 @@ class _QueuedJob:
         status_message: Any,
         enqueued_at: float,
         premium: bool,
+        queue_limit: int | None,
     ) -> None:
         self.key = key
         self.priority = priority
@@ -1841,6 +1846,7 @@ class _QueuedJob:
         self.status_message = status_message
         self.enqueued_at = enqueued_at
         self.premium = premium
+        self.queue_limit = queue_limit
         self.job_id = _remote_job_id(job)
         self.worker_id: str | None = None
         self.execution_kind: str | None = None
@@ -1910,23 +1916,35 @@ class _JobScheduler:
         user_id: int | None,
         job: dict[str, Any],
         status_message: Any,
-    ) -> None:
+    ) -> bool:
         key = _job_queue_key(job)
         async with self._lock:
             if key in self._known_jobs:
                 await self._reattach_locked(context, key, job, status_message)
-                return
+                return True
 
             self._sequence += 1
             premium = self._settings.is_paid(user_id) or self._settings.is_admin(user_id)
             priority_bonus = 0
             level_name = "Новичок"
+            queue_limit: int | None = None
             if not premium and user_id is not None:
                 store: ProposalStore | None = context.application.bot_data.get("proposal_store")
                 karma_milli = await asyncio.to_thread(store.karma_total, user_id) if store is not None else 0
                 level = level_for_karma(karma_milli)
                 priority_bonus = level.priority_bonus
                 level_name = level.name
+                queue_limit = level.queue_limit
+                queued_for_user = sum(
+                    1 for existing in self._items_by_key.values() if existing.user_id == user_id
+                )
+                if not job.get("recovered_at") and queued_for_user >= queue_limit:
+                    await _safe_edit_status(
+                        status_message,
+                        f"Лимит задач в очереди для уровня «{level_name}»: {queue_limit}.\n"
+                        "Дождись завершения одной из своих задач и попробуй снова.",
+                    )
+                    return False
             item = _QueuedJob(
                 key=key,
                 priority=0 if premium else 100 - priority_bonus,
@@ -1937,6 +1955,7 @@ class _JobScheduler:
                 status_message=status_message,
                 enqueued_at=time.time(),
                 premium=premium,
+                queue_limit=queue_limit,
             )
             job["queued_at"] = item.enqueued_at
             job["queue_priority"] = "premium" if premium else f"karma_{priority_bonus}"
@@ -1949,6 +1968,7 @@ class _JobScheduler:
             _save_job_snapshot(Path(job["job_dir"]), job, status="queued")
             await self._dispatch_locked(context)
             await self._refresh_pending_locked()
+            return True
 
     async def finish(self, context: Any, item: _QueuedJob) -> None:
         async with self._lock:
@@ -2339,6 +2359,11 @@ class _JobScheduler:
             f"Сейчас выполняется: {self._active_total}/{self._settings.max_active_jobs}",
             f"У тебя выполняется: {active_for_user}/{self._settings.max_active_jobs_per_user}",
         ]
+        if item.queue_limit is not None and item.user_id is not None:
+            jobs_for_user = sum(
+                1 for existing in self._items_by_key.values() if existing.user_id == item.user_id
+            )
+            lines.append(f"Твоих задач в системе: {jobs_for_user}/{item.queue_limit}")
         if item.job.get("daily_trimmed"):
             lines.append(
                 "Обрезано по дневному лимиту: "

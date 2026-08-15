@@ -12,17 +12,18 @@ class KarmaLevel:
     name: str
     daily_minutes: int
     priority_bonus: int
+    queue_limit: int
 
 
 KARMA_LEVELS = (
-    KarmaLevel(0, "Новичок", 3, 0),
-    KarmaLevel(5, "Участник", 5, 0),
-    KarmaLevel(25, "Автор", 10, 1),
-    KarmaLevel(75, "Проверенный автор", 15, 2),
-    KarmaLevel(150, "Любимчик редакции", 20, 3),
-    KarmaLevel(300, "Ветеран", 30, 4),
-    KarmaLevel(500, "Легенда", 40, 5),
-    KarmaLevel(1000, "Классика La La School", 50, 6),
+    KarmaLevel(0, "Новичок", 1, 0, 1),
+    KarmaLevel(6, "Участник", 1, 0, 1),
+    KarmaLevel(60, "Автор", 5, 1, 1),
+    KarmaLevel(360, "Проверенный автор", 10, 2, 2),
+    KarmaLevel(720, "Любимчик редакции", 15, 3, 2),
+    KarmaLevel(1440, "Ветеран", 20, 4, 3),
+    KarmaLevel(2880, "Алмазный подписчик", 25, 5, 3),
+    KarmaLevel(5760, "Легенда La La School", 30, 6, 3),
 )
 
 

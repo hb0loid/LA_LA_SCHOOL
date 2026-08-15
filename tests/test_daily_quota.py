@@ -35,8 +35,8 @@ class DailyQuotaTrimTests(unittest.IsolatedAsyncioTestCase):
                 user_id=123,
                 job_number="previous",
                 day_key=_today_key(),
-                duration_ms=120_000,
-                limit_ms=180_000,
+                duration_ms=30_000,
+                limit_ms=60_000,
             )
             input_path = root / "job" / "input.mp4"
             input_path.parent.mkdir()
@@ -73,9 +73,9 @@ class DailyQuotaTrimTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(accepted)
             self.assertTrue(job["daily_trimmed"])
             self.assertEqual(job["daily_original_duration_ms"], 120_000)
-            self.assertEqual(job["daily_trimmed_duration_ms"], 60_000)
-            self.assertEqual(job["quota_duration_ms"], 60_000)
-            self.assertEqual(store.daily_usage_ms(123, _today_key()), 180_000)
+            self.assertEqual(job["daily_trimmed_duration_ms"], 30_000)
+            self.assertEqual(job["quota_duration_ms"], 30_000)
+            self.assertEqual(store.daily_usage_ms(123, _today_key()), 60_000)
             self.assertTrue(Path(job["input_path"]).is_file())
             trim_mock.assert_called_once()
             self.assertTrue(any("В работу пойдёт" in message for message in status.messages))

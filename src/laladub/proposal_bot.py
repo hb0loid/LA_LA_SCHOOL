@@ -386,6 +386,7 @@ def _level_up_message(before_milli: int, after_milli: int) -> str | None:
         f"Теперь твой уровень — {new_level.name}.\n"
         f"Доступно: {new_level.daily_minutes} минут перевода в сутки.\n"
         f"Приоритет в очереди: {priority}.\n"
+        f"Лимит задач в очереди: {new_level.queue_limit}.\n"
         "Лимита на длину одного видео нет — учитывается общий суточный лимит."
     )
 

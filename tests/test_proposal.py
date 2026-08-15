@@ -199,13 +199,14 @@ class ProposalUiTests(unittest.TestCase):
         self.assertIn("Решение: La La School", _moderation_caption(submission))
 
     def test_level_up_message_lists_new_privileges(self) -> None:
-        message = _level_up_message(4_900, 5_100)
+        message = _level_up_message(5_900, 6_100)
         self.assertIsNotNone(message)
         self.assertIn("Участник", message)
-        self.assertIn("5 минут", message)
+        self.assertIn("1 минут", message)
         self.assertIn("Приоритет в очереди: обычный", message)
-        self.assertIsNone(_level_up_message(5_100, 5_900))
-        self.assertIsNone(_level_up_message(25_100, 5_100))
+        self.assertIn("Лимит задач в очереди: 1", message)
+        self.assertIsNone(_level_up_message(6_100, 6_900))
+        self.assertIsNone(_level_up_message(60_100, 6_100))
 
     def test_karma_tag_fits_telegram_limit(self) -> None:
         self.assertEqual(_karma_tag(6_999), "Карма: 6")
@@ -226,16 +227,11 @@ class KarmaRulesTests(unittest.TestCase):
         self.assertEqual(karma_milli_for_duration(40_000, "shame"), 800)
 
     def test_levels_use_visible_whole_karma(self) -> None:
-        self.assertEqual(level_for_karma(4_999).name, "Новичок")
-        self.assertEqual(level_for_karma(5_000).name, "Участник")
-        self.assertEqual(level_for_karma(0).daily_minutes, 3)
-        self.assertEqual(level_for_karma(5_000).daily_minutes, 5)
-        self.assertEqual(level_for_karma(25_000).daily_minutes, 10)
-        self.assertEqual(level_for_karma(75_000).daily_minutes, 15)
-        self.assertEqual(level_for_karma(150_000).daily_minutes, 20)
-        self.assertEqual(level_for_karma(300_000).daily_minutes, 30)
-        self.assertEqual(level_for_karma(500_000).daily_minutes, 40)
-        self.assertEqual(level_for_karma(1_000_000).daily_minutes, 50)
+        self.assertEqual(level_for_karma(5_999).name, "Новичок")
+        self.assertEqual(level_for_karma(6_000).name, "Участник")
+        thresholds = (0, 6_000, 60_000, 360_000, 720_000, 1_440_000, 2_880_000, 5_760_000)
+        self.assertEqual([level_for_karma(value).daily_minutes for value in thresholds], [1, 1, 5, 10, 15, 20, 25, 30])
+        self.assertEqual([level_for_karma(value).queue_limit for value in thresholds], [1, 1, 1, 2, 2, 3, 3, 3])
         self.assertEqual(format_karma_milli(1_234), "1,234")
 
 
