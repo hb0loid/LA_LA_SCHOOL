@@ -985,7 +985,7 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     print(f"      Dub segments: {len(segments)}")
     _report_progress(config, "Перевод подготовлен", 62, 100, f"реплик: {len(segments)}")
 
-    if config.preprocess_only:
+    if getattr(config, "preprocess_only", False):
         _save_resume_state(
             config,
             preprocess_complete=True,
