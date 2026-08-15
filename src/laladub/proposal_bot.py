@@ -55,12 +55,13 @@ def main() -> None:
     application = Application.builder().token(settings.token).post_init(_post_init).build()
     application.bot_data["settings"] = settings
     application.bot_data["store"] = store
+    private_chat = filters.ChatType.PRIVATE
     application.add_error_handler(_error_handler)
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("pending", pending))
-    application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CommandHandler("start", start, filters=private_chat))
+    application.add_handler(CommandHandler("pending", pending, filters=private_chat))
+    application.add_handler(CommandHandler("cancel", cancel, filters=private_chat))
     application.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^mod:"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, relay_message))
+    application.add_handler(MessageHandler(private_chat & filters.TEXT & ~filters.COMMAND, relay_message))
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
