@@ -13,12 +13,14 @@ import sys
 import threading
 import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .bot_config import BotSettings, load_bot_settings
 from .download import download_video_url, extract_url, has_video_and_audio
-from .ffmpeg import compress_video_for_telegram, make_audio_visual_video, probe_duration, trim_video
+from .ffmpeg import compress_video_for_telegram, make_audio_visual_video, probe_duration
+from .karma import KARMA_SCALE, level_for_karma, next_level_for_karma, visible_karma
 from .asr import clear_openai_whisper_cache
 from .models import DubConfig
 from .pipeline import run_dub, run_transcript
@@ -165,7 +167,7 @@ def main() -> None:
         f"paid_users={len(settings.paid_users)}/{settings.paid_users_file} "
         f"admin_users={len(settings.admin_users)}/{settings.admin_users_file} "
         f"proposal={settings.proposal_enabled}/{settings.proposal_db} "
-        f"duration_limits=free:{settings.free_max_duration_seconds}/paid:{settings.paid_max_duration_seconds} "
+        "duration_limits=daily-karma/no-per-video "
         f"collapse_repetitions={settings.collapse_repetitions}/"
         f"{settings.max_phrase_repeats}/{settings.max_word_repeats} "
         f"inject_artifacts={settings.inject_artifacts}/"
@@ -187,8 +189,7 @@ def main() -> None:
     application = Application.builder().token(settings.token).post_init(_setup_bot_commands).build()
     application.bot_data["settings"] = settings
     application.bot_data["job_scheduler"] = _JobScheduler(settings)
-    if settings.proposal_enabled:
-        application.bot_data["proposal_store"] = ProposalStore(settings.proposal_db)
+    application.bot_data["proposal_store"] = ProposalStore(settings.proposal_db)
     private_chat = filters.ChatType.PRIVATE
     application.add_error_handler(_telegram_error_handler)
     application.add_handler(MessageHandler(private_chat, maintenance_message_gate), group=-1)
@@ -434,7 +435,7 @@ async def _setup_bot_commands(application: Any) -> None:
         ("queue", "Показать очередь задач"),
         ("resume", "Продолжить задачу по номеру"),
         ("censored", "Experimental censor 0..100"),
-        ("me", "Показать Telegram ID"),
+        ("me", "Показать профиль и карму"),
         ("cancel", "Сбросить текущую задачу"),
     ]
     await application.bot.set_my_commands(commands)
@@ -565,14 +566,13 @@ async def maintenance(update: Any, context: Any) -> None:
 
 
 async def start(update: Any, context: Any) -> None:
-    settings: BotSettings = context.application.bot_data["settings"]
-    free_limit = settings.free_max_duration_seconds if settings.free_max_duration_seconds > 0 else None
-    limit_text = _format_duration(free_limit) if free_limit is not None else "без лимита"
     await update.effective_message.reply_text(
         "Пришли видео или аудио. Я попрошу выбрать видеоряд, input-язык, количество голосов и язык озвучки.\n\n"
         "Input-язык используется как промежуточный язык перевода и источник Whisper-артефактов.\n"
         "Номер работы будет указан в статусе. Для принудительного восстановления: /resume НОМЕР.\n"
-        f"У бесплатных пользователей лимит: {limit_text}. На итоговом видео будет водяной знак.",
+        "У новых пользователей доступно 5 минут перевода в сутки. Лимит растёт вместе с кармой; "
+        "ограничения на длину одного видео нет. Профиль: /me.\n"
+        "На итоговом видео будет водяной знак.",
         reply_markup=_remove_reply_keyboard(),
     )
 
@@ -580,11 +580,45 @@ async def start(update: Any, context: Any) -> None:
 async def me(update: Any, context: Any) -> None:
     settings: BotSettings = context.application.bot_data["settings"]
     user = update.effective_user
-    status = "оплачен" if settings.is_paid(user.id if user else None) else "бесплатный"
-    await update.effective_message.reply_text(
-        f"Твой Telegram ID: {user.id}\nСтатус: {status}",
-        reply_markup=_remove_reply_keyboard(),
-    )
+    if user is None:
+        return
+    store: ProposalStore | None = context.application.bot_data.get("proposal_store")
+    karma_milli = await asyncio.to_thread(store.karma_total, user.id) if store is not None else 0
+    level = level_for_karma(karma_milli)
+    privileged = settings.is_paid(user.id) or settings.is_admin(user.id)
+    lines = [
+        "👤 Твой профиль",
+        f"Telegram ID: {user.id}",
+        f"Уровень: {level.name}",
+        f"Карма: {visible_karma(karma_milli)}",
+    ]
+    next_level = next_level_for_karma(karma_milli)
+    if next_level is None:
+        lines.append("Достигнут максимальный уровень.")
+    else:
+        remaining = max(0, next_level.minimum * KARMA_SCALE - karma_milli)
+        lines.append(f"До уровня «{next_level.name}»: {(remaining + KARMA_SCALE - 1) // KARMA_SCALE}")
+
+    if privileged:
+        lines.extend(["", "Лимит перевода: без ограничений", "Приоритет: премиум"])
+    else:
+        used_ms = await asyncio.to_thread(store.daily_usage_ms, user.id, _today_key()) if store is not None else 0
+        limit_ms = level.daily_minutes * 60_000
+        lines.extend(
+            [
+                "",
+                f"Сегодня использовано: {_format_duration_ms(used_ms)} из {_format_duration_ms(limit_ms)}",
+                f"Осталось сегодня: {_format_duration_ms(max(0, limit_ms - used_ms))}",
+                f"Приоритет в очереди: {'обычный' if level.priority_bonus == 0 else f'+{level.priority_bonus}'}",
+            ]
+        )
+
+    if store is not None:
+        publications = await asyncio.to_thread(store.publication_summary, user.id)
+        main_count, _main_ms = publications.get("main", (0, 0))
+        shame_count, _shame_ms = publications.get("shame", (0, 0))
+        lines.extend(["", "Опубликовано:", f"La La School — {main_count}", f"Ghien Mi Go — {shame_count}"])
+    await update.effective_message.reply_text("\n".join(lines), reply_markup=_remove_reply_keyboard())
 
 
 async def censored(update: Any, context: Any) -> None:
@@ -772,6 +806,7 @@ async def proposal_callback(update: Any, context: Any) -> None:
     author_username = str(getattr(user, "username", "") or "").strip() or None
     store: ProposalStore = context.application.bot_data["proposal_store"]
     try:
+        duration_ms = max(0, round(await asyncio.to_thread(probe_duration, video_path) * 1000))
         submission, created = await asyncio.to_thread(
             store.create_submission,
             job_number=value,
@@ -781,6 +816,7 @@ async def proposal_callback(update: Any, context: Any) -> None:
             author_username=author_username,
             video_path=video_path,
             output_filename=output_filename,
+            duration_ms=duration_ms,
         )
     except Exception as exc:
         print("Proposal submission failed:\n" + traceback.format_exc(), flush=True)
@@ -936,16 +972,7 @@ async def _prepare_input_audio_as_video(
         return None
 
     target_duration = duration
-    limit = _duration_limit_seconds(settings, user_id)
-    if limit is not None and duration > limit + 0.5:
-        target_duration = limit
-        await _safe_edit_status(
-            status,
-            f"Аудио длиннее лимита: {_format_duration(duration)}.\n"
-            f"Взял первые {_format_duration(limit)} и собираю видеоряд."
-        )
-    else:
-        await _safe_edit_status(status, "Собираю случайный видеоряд для аудио...")
+    await _safe_edit_status(status, "Собираю случайный видеоряд для аудио...")
 
     source_roots = _trusted_visual_source_roots(settings)
     output_path = job_dir / "input_audio_visual.mp4"
@@ -1020,48 +1047,8 @@ async def _prepare_input_video_duration(
     user_id: int | None,
     input_path: Path,
 ) -> Path | None:
-    limit = _duration_limit_seconds(settings, user_id)
-    if limit is None:
-        return input_path
-
-    try:
-        duration = await asyncio.to_thread(probe_duration, input_path)
-    except Exception as exc:
-        print(f"Video duration check skipped: {type(exc).__name__}: {exc}", flush=True)
-        return input_path
-
-    if not _duration_limit_exceeded(settings, user_id, duration):
-        return input_path
-
-    trimmed_path = input_path.with_name(f"{input_path.stem}_trimmed{input_path.suffix or '.mp4'}")
-    await status.edit_text(_duration_trim_text(settings, user_id, duration))
-    try:
-        await asyncio.to_thread(trim_video, input_path, trimmed_path, limit)
-    except Exception as exc:
-        print(f"Video trim failed: {type(exc).__name__}: {exc}", flush=True)
-        await status.edit_text(
-            "Видео длиннее лимита, и не удалось автоматически обрезать его.\n"
-            f"{type(exc).__name__}: {exc}"
-        )
-        return None
-
-    if not trimmed_path.exists() or trimmed_path.stat().st_size < 1024:
-        await status.edit_text("Не удалось обрезать видео: получился пустой файл.")
-        return None
-
-    try:
-        trimmed_duration = await asyncio.to_thread(probe_duration, trimmed_path)
-        print(
-            f"Video trimmed for duration limit: {duration:.2f}s -> {trimmed_duration:.2f}s ({trimmed_path})",
-            flush=True,
-        )
-    except Exception as exc:
-        print(f"Trimmed video duration check skipped: {type(exc).__name__}: {exc}", flush=True)
-
-    await status.edit_text(
-        f"Видео длиннее лимита. Взял первые {_format_duration(limit)} и продолжаю."
-    )
-    return trimmed_path
+    # Per-video limits were replaced by the karma-based daily allowance.
+    return input_path
 
 
 def _trusted_visual_source_roots(settings: BotSettings) -> list[Path]:
@@ -1124,41 +1111,6 @@ def _download_meta_url(job_dir: Path) -> str | None:
     return str(value) if value else None
 
 
-def _duration_limit_seconds(settings: BotSettings, user_id: int | None) -> float | None:
-    value = settings.paid_max_duration_seconds if settings.is_paid(user_id) else settings.free_max_duration_seconds
-    if value <= 0:
-        return None
-    return value
-
-
-def _duration_limit_exceeded(settings: BotSettings, user_id: int | None, duration: float) -> bool:
-    limit = _duration_limit_seconds(settings, user_id)
-    return limit is not None and duration > limit + 0.5
-
-
-def _duration_limit_text(settings: BotSettings, user_id: int | None, duration: float) -> str:
-    limit = _duration_limit_seconds(settings, user_id)
-    tier = "платной" if settings.is_paid(user_id) else "бесплатной"
-    if limit is None:
-        return "Видео принято."
-    return (
-        f"В {tier} версии лимит видео: {_format_duration(limit)}.\n"
-        f"Это видео: {_format_duration(duration)}."
-    )
-
-
-def _duration_trim_text(settings: BotSettings, user_id: int | None, duration: float) -> str:
-    limit = _duration_limit_seconds(settings, user_id)
-    tier = "платной" if settings.is_paid(user_id) else "бесплатной"
-    if limit is None:
-        return "Видео принято."
-    return (
-        f"В {tier} версии лимит видео: {_format_duration(limit)}.\n"
-        f"Это видео: {_format_duration(duration)}.\n"
-        "Обрезаю и возьму начало видео."
-    )
-
-
 def _format_duration(seconds: float) -> str:
     seconds = max(0, int(round(seconds)))
     minutes, seconds = divmod(seconds, 60)
@@ -1166,6 +1118,14 @@ def _format_duration(seconds: float) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{seconds:02d}"
     return f"{minutes}:{seconds:02d}"
+
+
+def _format_duration_ms(duration_ms: int) -> str:
+    return _format_duration(max(0, int(duration_ms)) / 1000)
+
+
+def _today_key() -> str:
+    return datetime.now().astimezone().date().isoformat()
 
 
 def _format_mb(size_bytes: int) -> str:
@@ -1526,6 +1486,15 @@ async def _enqueue_job(update: Any, context: Any, job: dict[str, Any], status_me
                 job["input_path"] = str(visual_path)
                 _save_job_snapshot(job_dir, job, status="queued", random_visual=True)
 
+    if not await _reserve_daily_allowance(
+        context,
+        status_message=status_message,
+        user_id=user.id if user else None,
+        job=job,
+    ):
+        _save_job_snapshot(Path(job["job_dir"]), job, status="rejected", error="daily_limit")
+        return
+
     await scheduler.enqueue(
         context,
         chat_id=chat.id,
@@ -1533,6 +1502,63 @@ async def _enqueue_job(update: Any, context: Any, job: dict[str, Any], status_me
         job=job,
         status_message=status_message,
     )
+
+
+async def _reserve_daily_allowance(
+    context: Any,
+    *,
+    status_message: Any,
+    user_id: int | None,
+    job: dict[str, Any],
+) -> bool:
+    settings: BotSettings = context.application.bot_data["settings"]
+    if user_id is None or settings.is_paid(user_id) or settings.is_admin(user_id):
+        return True
+    store: ProposalStore | None = context.application.bot_data.get("proposal_store")
+    if store is None:
+        await _safe_edit_status(status_message, "Не удалось проверить суточный лимит. Попробуй ещё раз позже.")
+        return False
+    input_path = Path(str(job.get("input_path") or ""))
+    try:
+        duration_ms = max(0, round(await asyncio.to_thread(probe_duration, input_path) * 1000))
+    except Exception as exc:
+        print(f"Daily quota duration failed: {type(exc).__name__}: {exc}", flush=True)
+        await _safe_edit_status(status_message, "Не смог определить длительность видео для суточного лимита.")
+        return False
+    karma_milli = await asyncio.to_thread(store.karma_total, user_id)
+    level = level_for_karma(karma_milli)
+    limit_ms = level.daily_minutes * 60_000
+    accepted, used_ms = await asyncio.to_thread(
+        store.reserve_daily_usage,
+        user_id=user_id,
+        job_number=_job_number(job),
+        day_key=_today_key(),
+        duration_ms=duration_ms,
+        limit_ms=limit_ms,
+    )
+    job["quota_duration_ms"] = duration_ms
+    job["quota_day"] = _today_key()
+    if accepted:
+        job["daily_used_ms_after_enqueue"] = used_ms
+        return True
+    remaining_ms = max(0, limit_ms - used_ms)
+    await _safe_edit_status(
+        status_message,
+        "Суточного лимита не хватает для этого видео.\n"
+        f"Уровень: {level.name}. Лимит: {_format_duration_ms(limit_ms)}.\n"
+        f"Сегодня использовано: {_format_duration_ms(used_ms)}. Осталось: {_format_duration_ms(remaining_ms)}.\n"
+        f"Длительность видео: {_format_duration_ms(duration_ms)}. Видео не обрезано — его можно отправить после обновления лимита.",
+    )
+    return False
+
+
+async def _release_daily_allowance(context: Any, user_id: int | None, job: dict[str, Any]) -> None:
+    if user_id is None:
+        return
+    store: ProposalStore | None = context.application.bot_data.get("proposal_store")
+    if store is None:
+        return
+    await asyncio.to_thread(store.release_daily_usage, user_id, _job_number(job))
 
 
 async def _recover_interrupted_jobs(application: Any) -> None:
@@ -1838,10 +1864,18 @@ class _JobScheduler:
                 return
 
             self._sequence += 1
-            premium = self._settings.is_paid(user_id)
+            premium = self._settings.is_paid(user_id) or self._settings.is_admin(user_id)
+            priority_bonus = 0
+            level_name = "Новичок"
+            if not premium and user_id is not None:
+                store: ProposalStore | None = context.application.bot_data.get("proposal_store")
+                karma_milli = await asyncio.to_thread(store.karma_total, user_id) if store is not None else 0
+                level = level_for_karma(karma_milli)
+                priority_bonus = level.priority_bonus
+                level_name = level.name
             item = _QueuedJob(
                 key=key,
-                priority=0 if premium else 10,
+                priority=0 if premium else 100 - priority_bonus,
                 sequence=self._sequence,
                 chat_id=chat_id,
                 user_id=user_id,
@@ -1851,7 +1885,10 @@ class _JobScheduler:
                 premium=premium,
             )
             job["queued_at"] = item.enqueued_at
-            job["queue_priority"] = "premium" if premium else "normal"
+            job["queue_priority"] = "premium" if premium else f"karma_{priority_bonus}"
+            job["queue_priority_label"] = (
+                "премиум" if premium else "обычный" if priority_bonus == 0 else f"+{priority_bonus} ({level_name})"
+            )
             self._known_jobs.add(key)
             self._items_by_key[key] = item
             heapq.heappush(self._pending, (item.priority, item.sequence, item))
@@ -1991,6 +2028,7 @@ class _JobScheduler:
                 text=f"Task failed:\n{details}",
                 reply_markup=_resume_keyboard(job_dir),
             )
+            await _release_daily_allowance(context, item.user_id, item.job)
         finally:
             async with self._lock:
                 self._leased.pop(item.job_id, None)
@@ -2064,6 +2102,9 @@ class _JobScheduler:
                 item.status_message,
                 progress_state=item.progress,
             )
+            snapshot = _load_job_snapshot(Path(str(item.job["job_dir"])))
+            if snapshot is not None and str(snapshot.get("status") or "") == "failed":
+                await _release_daily_allowance(context, item.user_id, item.job)
         finally:
             await self.finish(context, item)
 
@@ -2092,7 +2133,7 @@ class _JobScheduler:
                 ]
             )
         active_for_user = self._active_by_user.get(item.user_id, 0) if item.user_id is not None else 0
-        tier = "премиум" if item.premium else "обычный"
+        tier = str(item.job.get("queue_priority_label") or ("премиум" if item.premium else "обычный"))
         target_label = _target_lang_label(item.job.get("target_lang"))
         tts_label = _tts_method_label(item.job.get("tts_provider") or self._settings.tts)
         return "\n".join(

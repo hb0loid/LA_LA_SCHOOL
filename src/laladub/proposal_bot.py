@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .ffmpeg import probe_duration
+from .karma import format_karma_milli, karma_milli_for_duration, visible_karma
 from .proposal_store import ProposalStore, Submission
 
 
@@ -219,15 +221,15 @@ async def moderation_callback(update: Any, context: Any) -> None:
         return
 
     decisions = {
-        "main": ("main", 5, settings.main_channel),
-        "shame": ("shame", 1, settings.shame_channel),
-        "reject": ("rejected", 0, None),
+        "main": ("main", settings.main_channel),
+        "shame": ("shame", settings.shame_channel),
+        "reject": ("rejected", None),
     }
     decision = decisions.get(action)
     if decision is None:
         await query.answer("Неизвестное действие.", show_alert=True)
         return
-    destination, award, target_chat = decision
+    destination, target_chat = decision
     if submission.destination == destination and (
         destination == "rejected" or submission.publication_message_id is not None
     ):
@@ -242,6 +244,11 @@ async def moderation_callback(update: Any, context: Any) -> None:
     await query.answer("Публикую…" if target_chat else "Отмечаю…")
     new_message = None
     try:
+        duration_ms = claimed.duration_ms
+        if duration_ms <= 0 and Path(claimed.video_path).is_file():
+            duration_ms = max(0, round(await asyncio.to_thread(probe_duration, Path(claimed.video_path)) * 1000))
+            claimed = await asyncio.to_thread(store.set_submission_duration, claimed.id, duration_ms)
+        award_milli = karma_milli_for_duration(duration_ms, destination)
         if target_chat is not None:
             new_message = await _publish_to_channel(context.bot, target_chat, claimed)
         updated, delta = await asyncio.to_thread(
@@ -249,7 +256,7 @@ async def moderation_callback(update: Any, context: Any) -> None:
             submission_id=submission_id,
             moderator_id=int(moderator_id),
             destination=destination,
-            award=award,
+            award_milli=award_milli,
             publication_chat_id=int(new_message.chat_id) if new_message is not None else None,
             publication_message_id=int(new_message.message_id) if new_message is not None else None,
         )
@@ -274,7 +281,7 @@ async def moderation_callback(update: Any, context: Any) -> None:
 
     tag_updated = await _sync_karma_tag(context.bot, settings, store, updated.user_id)
     await _refresh_moderator_messages(context.bot, store, updated)
-    delta_text = f"Карма: {delta:+d}" if delta else "Карма без изменений"
+    delta_text = f"Карма: {format_karma_milli(delta, signed=True)}" if delta else "Карма без изменений"
     tag_text = " Тег в группе обновлён." if tag_updated else ""
     await query.message.reply_text(f"Решение применено. {delta_text}.{tag_text}")
 
@@ -306,27 +313,28 @@ async def _sync_karma_tag(
     store: ProposalStore,
     user_id: int,
 ) -> bool:
-    total, event_count = await asyncio.to_thread(store.karma_summary, user_id)
+    total_milli, event_count = await asyncio.to_thread(store.karma_summary, user_id)
     if event_count <= 0:
         return False
     try:
         await bot.set_chat_member_tag(
             chat_id=settings.karma_chat,
             user_id=user_id,
-            tag=_karma_tag(total),
+            tag=_karma_tag(total_milli),
         )
-        print(f"Karma tag updated user={user_id} total={total}", flush=True)
+        print(f"Karma tag updated user={user_id} total_milli={total_milli}", flush=True)
         return True
     except Exception as exc:
         print(
-            f"Karma tag update skipped user={user_id} total={total}: {type(exc).__name__}: {exc}",
+            f"Karma tag update skipped user={user_id} total_milli={total_milli}: {type(exc).__name__}: {exc}",
             flush=True,
         )
         return False
 
 
-def _karma_tag(total: int) -> str:
-    primary = f"Карма: {int(total)}"
+def _karma_tag(total_milli: int) -> str:
+    total = visible_karma(total_milli)
+    primary = f"Карма: {total}"
     if len(primary) <= 16:
         return primary
     return f"К: {int(total)}"[:16]
@@ -424,7 +432,7 @@ def _moderation_caption(submission: Submission) -> str:
     ]
     if submission.destination:
         lines.append(f"Решение: {destination_labels.get(submission.destination, html.escape(submission.destination))}")
-        lines.append(f"Карма за работу: {submission.karma_award:+d}")
+        lines.append(f"Карма за работу: {format_karma_milli(submission.karma_milli, signed=True)}")
     return "\n".join(lines)
 
 

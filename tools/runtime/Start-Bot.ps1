@@ -202,8 +202,6 @@ $env:LALADUB_TTS = "moss"
 $env:LALADUB_TRANSLATOR = "hybrid"
 $env:LALADUB_MAX_ACTIVE_JOBS = "2"
 $env:LALADUB_MAX_ACTIVE_JOBS_PER_USER = "1"
-$env:LALADUB_FREE_MAX_DURATION_SECONDS = "60"
-$env:LALADUB_PAID_MAX_DURATION_SECONDS = "0"
 $env:LALADUB_WATERMARK_IMAGE = (Join-Path $Root "assets")
 $trustedVisualSource = "F:\FFOutput\La La School\video_files"
 if (-not (Test-Path -LiteralPath $trustedVisualSource -PathType Container)) {

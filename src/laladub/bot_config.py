@@ -30,8 +30,6 @@ class BotSettings:
     watermark_text: str
     watermark_image: Path | None
     max_file_mb: int
-    free_max_duration_seconds: float
-    paid_max_duration_seconds: float
     translator: str
     tts: str
     voice: str | None
@@ -169,8 +167,6 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         watermark_text=os.environ.get("LALADUB_WATERMARK_TEXT", "La La Local Dub"),
         watermark_image=_optional_path(os.environ.get("LALADUB_WATERMARK_IMAGE")),
         max_file_mb=int(os.environ.get("LALADUB_MAX_FILE_MB", "200")),
-        free_max_duration_seconds=float(os.environ.get("LALADUB_FREE_MAX_DURATION_SECONDS", "60")),
-        paid_max_duration_seconds=float(os.environ.get("LALADUB_PAID_MAX_DURATION_SECONDS", "0")),
         translator=os.environ.get("LALADUB_TRANSLATOR", "hybrid"),
         tts=os.environ.get("LALADUB_TTS", "moss"),
         voice=_empty_to_none(os.environ.get("LALADUB_VOICE", "Microsoft Irina Desktop")),

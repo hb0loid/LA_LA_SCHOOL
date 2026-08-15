@@ -20,7 +20,8 @@ class Submission:
     output_filename: str
     status: str
     destination: str | None
-    karma_award: int
+    karma_milli: int
+    duration_ms: int
     publication_chat_id: int | None
     publication_message_id: int | None
     created_at: float
@@ -62,6 +63,7 @@ class ProposalStore:
                     status TEXT NOT NULL DEFAULT 'pending',
                     destination TEXT,
                     karma_award INTEGER NOT NULL DEFAULT 0,
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
                     publication_chat_id INTEGER,
                     publication_message_id INTEGER,
                     processing_by INTEGER,
@@ -104,14 +106,44 @@ class ProposalStore:
                     delivered_at REAL
                 );
 
+                CREATE TABLE IF NOT EXISTS daily_usage (
+                    user_id INTEGER NOT NULL,
+                    job_number TEXT NOT NULL,
+                    day_key TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(user_id, job_number)
+                );
+
+                CREATE TABLE IF NOT EXISTS store_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_submissions_status
                     ON submissions(status, created_at);
                 CREATE INDEX IF NOT EXISTS idx_karma_events_user
                     ON karma_events(user_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_author_outbox_status
                     ON author_outbox(status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_daily_usage_user_day
+                    ON daily_usage(user_id, day_key);
                 """
             )
+            columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(submissions)")}
+            if "duration_ms" not in columns:
+                connection.execute("ALTER TABLE submissions ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0")
+            migrated = connection.execute(
+                "SELECT value FROM store_metadata WHERE key = 'karma_milli_v1'"
+            ).fetchone()
+            if migrated is None:
+                connection.execute("UPDATE submissions SET karma_award = karma_award * 1000")
+                connection.execute(
+                    "UPDATE karma_events SET delta = delta * 1000, old_award = old_award * 1000, new_award = new_award * 1000"
+                )
+                connection.execute(
+                    "INSERT INTO store_metadata(key, value) VALUES ('karma_milli_v1', '1')"
+                )
 
     def create_submission(
         self,
@@ -123,6 +155,7 @@ class ProposalStore:
         author_username: str | None,
         video_path: Path,
         output_filename: str,
+        duration_ms: int = 0,
     ) -> tuple[Submission, bool]:
         now = time.time()
         with self._connect() as connection:
@@ -130,8 +163,8 @@ class ProposalStore:
                 """
                 INSERT OR IGNORE INTO submissions (
                     job_number, user_id, chat_id, author_name, author_username,
-                    video_path, output_filename, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    video_path, output_filename, duration_ms, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_number,
@@ -141,6 +174,7 @@ class ProposalStore:
                     author_username,
                     str(video_path),
                     output_filename,
+                    max(0, int(duration_ms)),
                     now,
                     now,
                 ),
@@ -151,7 +185,9 @@ class ProposalStore:
                     """
                     UPDATE submissions
                     SET author_name = ?, author_username = ?, video_path = ?,
-                        output_filename = ?, updated_at = ?
+                        output_filename = ?,
+                        duration_ms = CASE WHEN ? > 0 THEN ? ELSE duration_ms END,
+                        updated_at = ?
                     WHERE user_id = ? AND job_number = ?
                     """,
                     (
@@ -159,6 +195,8 @@ class ProposalStore:
                         author_username,
                         str(video_path),
                         output_filename,
+                        max(0, int(duration_ms)),
+                        max(0, int(duration_ms)),
                         now,
                         user_id,
                         job_number,
@@ -257,7 +295,7 @@ class ProposalStore:
         submission_id: int,
         moderator_id: int,
         destination: str,
-        award: int,
+        award_milli: int,
         publication_chat_id: int | None,
         publication_message_id: int | None,
     ) -> tuple[Submission, int]:
@@ -271,7 +309,7 @@ class ProposalStore:
             if row["processing_by"] != moderator_id:
                 raise RuntimeError("Submission decision lock was lost")
             old_award = int(row["karma_award"] or 0)
-            delta = int(award) - old_award
+            delta = int(award_milli) - old_award
             connection.execute(
                 """
                 UPDATE submissions
@@ -283,7 +321,7 @@ class ProposalStore:
                 (
                     status,
                     destination,
-                    int(award),
+                    int(award_milli),
                     publication_chat_id,
                     publication_message_id,
                     now,
@@ -303,7 +341,7 @@ class ProposalStore:
                         int(row["user_id"]),
                         delta,
                         old_award,
-                        int(award),
+                        int(award_milli),
                         destination,
                         moderator_id,
                         now,
@@ -359,6 +397,107 @@ class ProposalStore:
         total, _event_count = self.karma_summary(user_id)
         return total
 
+    def set_submission_duration(self, submission_id: int, duration_ms: int) -> Submission:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE submissions SET duration_ms = ?, updated_at = ? WHERE id = ?",
+                (max(0, int(duration_ms)), time.time(), submission_id),
+            )
+            row = connection.execute("SELECT * FROM submissions WHERE id = ?", (submission_id,)).fetchone()
+        if row is None:
+            raise KeyError(submission_id)
+        return _submission_from_row(row)
+
+    def revalue_submission(self, submission_id: int, *, duration_ms: int, award_milli: int) -> int:
+        """Adjust an existing decision without reposting it (used by migrations)."""
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM submissions WHERE id = ?", (submission_id,)).fetchone()
+            if row is None:
+                raise KeyError(submission_id)
+            old_award = int(row["karma_award"] or 0)
+            new_award = max(0, int(award_milli))
+            delta = new_award - old_award
+            connection.execute(
+                "UPDATE submissions SET duration_ms = ?, karma_award = ?, updated_at = ? WHERE id = ?",
+                (max(0, int(duration_ms)), new_award, now, submission_id),
+            )
+            if delta:
+                connection.execute(
+                    """
+                    INSERT INTO karma_events (
+                        submission_id, user_id, delta, old_award, new_award,
+                        reason, moderator_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, 'duration_migration', 0, ?)
+                    """,
+                    (submission_id, int(row["user_id"]), delta, old_award, new_award, now),
+                )
+        return delta
+
+    def reserve_daily_usage(
+        self,
+        *,
+        user_id: int,
+        job_number: str,
+        day_key: str,
+        duration_ms: int,
+        limit_ms: int,
+    ) -> tuple[bool, int]:
+        duration_ms = max(0, int(duration_ms))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT duration_ms FROM daily_usage WHERE user_id = ? AND job_number = ?",
+                (user_id, job_number),
+            ).fetchone()
+            used_row = connection.execute(
+                "SELECT COALESCE(SUM(duration_ms), 0) AS used FROM daily_usage WHERE user_id = ? AND day_key = ?",
+                (user_id, day_key),
+            ).fetchone()
+            used_ms = int(used_row["used"] or 0) if used_row is not None else 0
+            if existing is not None:
+                return True, used_ms
+            if used_ms + duration_ms > max(0, int(limit_ms)):
+                return False, used_ms
+            connection.execute(
+                "INSERT INTO daily_usage(user_id, job_number, day_key, duration_ms, created_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, str(job_number), day_key, duration_ms, time.time()),
+            )
+            return True, used_ms + duration_ms
+
+    def daily_usage_ms(self, user_id: int, day_key: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(SUM(duration_ms), 0) AS used FROM daily_usage WHERE user_id = ? AND day_key = ?",
+                (user_id, day_key),
+            ).fetchone()
+        return int(row["used"] or 0) if row is not None else 0
+
+    def release_daily_usage(self, user_id: int, job_number: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM daily_usage WHERE user_id = ? AND job_number = ?",
+                (user_id, str(job_number)),
+            )
+
+    def publication_summary(self, user_id: int) -> dict[str, tuple[int, int]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT destination, COUNT(*) AS item_count,
+                       COALESCE(SUM(duration_ms), 0) AS duration_ms
+                FROM submissions
+                WHERE user_id = ? AND status = 'published'
+                GROUP BY destination
+                """,
+                (user_id,),
+            ).fetchall()
+        return {
+            str(row["destination"]): (int(row["item_count"]), int(row["duration_ms"] or 0))
+            for row in rows
+        }
+
     def karma_summary(self, user_id: int) -> tuple[int, int]:
         with self._connect() as connection:
             row = connection.execute(
@@ -393,7 +532,8 @@ def _submission_from_row(row: sqlite3.Row) -> Submission:
         output_filename=str(row["output_filename"]),
         status=str(row["status"]),
         destination=str(row["destination"]) if row["destination"] else None,
-        karma_award=int(row["karma_award"] or 0),
+        karma_milli=int(row["karma_award"] or 0),
+        duration_ms=int(row["duration_ms"] or 0),
         publication_chat_id=int(row["publication_chat_id"]) if row["publication_chat_id"] is not None else None,
         publication_message_id=(
             int(row["publication_message_id"]) if row["publication_message_id"] is not None else None
