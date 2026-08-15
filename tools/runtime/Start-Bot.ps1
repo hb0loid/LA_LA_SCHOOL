@@ -175,6 +175,14 @@ try {
   Add-Content -LiteralPath $ErrLog -Value "$(Get-Date -Format s) Could not ensure worker API firewall rule: $($_.Exception.Message)" -ErrorAction SilentlyContinue
 }
 $env:LALADUB_WORKER_API_TOKEN = $workerToken
+$workerApiTokenPath = Join-Path $Root ".secrets\Worker-Api-Token.txt"
+if (-not (Test-Path -LiteralPath $workerApiTokenPath)) {
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $workerApiTokenPath) | Out-Null
+  $generatedWorkerToken = ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N"))
+  Set-Content -LiteralPath $workerApiTokenPath -Value $generatedWorkerToken -Encoding ASCII -NoNewline
+}
+$env:LALADUB_WORKER_API_TOKEN = (Get-Content -LiteralPath $workerApiTokenPath -Raw).Trim()
+if (-not $env:LALADUB_WORKER_API_TOKEN) { throw "Worker API token file is empty: $workerApiTokenPath" }
 $env:LALADUB_WORKER_PACKAGE_PATH = (Join-Path $Root "dist\LaLaDubWorker-update.zip")
 $env:LALADUB_WORKER_PACKAGE_MANIFEST = (Join-Path $Root "dist\LaLaDubWorker-update.manifest.json")
 $env:LALADUB_DOWNLOAD_CACHE_DIR = (Join-Path $Root "runs\cache\downloads")
