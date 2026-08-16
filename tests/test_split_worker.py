@@ -3,14 +3,26 @@ from __future__ import annotations
 import tempfile
 import unittest
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from laladub.bot import _ApplicationContext, _JobScheduler, _install_preprocess_bundle, _remote_stage_for_job
+from laladub.bot_config import load_bot_settings
 from laladub.job_runner import JobDocument, JobExecutionResult, result_manifest
+from laladub.worker import _settings_for_worker_job
 
 
 class SplitWorkerTests(unittest.TestCase):
+    def test_worker_cuda_override_keeps_frozen_settings_immutable(self) -> None:
+        settings = replace(load_bot_settings(require_token=False), artifact_whisper_device="cpu")
+        with patch("laladub.worker._cuda_available", return_value=True):
+            accelerated = _settings_for_worker_job(settings, {"remote_stage": "preprocess"})
+        self.assertIsNot(accelerated, settings)
+        self.assertEqual(accelerated.artifact_whisper_device, "cuda")
+        self.assertEqual(settings.artifact_whisper_device, "cpu")
+
     def test_moss_job_uses_remote_preprocessing(self) -> None:
         self.assertEqual(_remote_stage_for_job({"mode": "dub", "tts_provider": "moss"}), "preprocess")
         self.assertEqual(_remote_stage_for_job({"mode": "dub"}), "preprocess")

@@ -16,10 +16,11 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .bot_config import load_bot_settings
+from .bot_config import BotSettings, load_bot_settings
 from .job_runner import execute_job, result_manifest, save_job_snapshot
 
 
@@ -269,9 +270,8 @@ def _run_lease(client: CoordinatorClient, lease: dict[str, Any], workdir: Path) 
         job["job_dir"] = str(job_dir)
         job["input_path"] = str(input_path)
         save_job_snapshot(job_dir, job, status="running")
-        settings = load_bot_settings(require_token=False)
-        if str(job.get("remote_stage") or "").strip().lower() == "preprocess" and _cuda_available():
-            settings.artifact_whisper_device = "cuda"
+        settings = _settings_for_worker_job(load_bot_settings(require_token=False), job)
+        if settings.artifact_whisper_device == "cuda" and str(job.get("remote_stage") or "").strip().lower() == "preprocess":
             print("Worker preprocessing acceleration: artifact Whisper uses CUDA.", flush=True)
         reporter = ProgressReporter(client, job_id)
         reporter("Worker started", 1, 100, f"input={job.get('source_lang') or 'auto'}")
@@ -289,6 +289,12 @@ def _run_lease(client: CoordinatorClient, lease: dict[str, Any], workdir: Path) 
     finally:
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=2.0)
+
+
+def _settings_for_worker_job(settings: BotSettings, job: dict[str, Any]) -> BotSettings:
+    if str(job.get("remote_stage") or "").strip().lower() != "preprocess" or not _cuda_available():
+        return settings
+    return replace(settings, artifact_whisper_device="cuda")
 
 
 def _lease_heartbeat_loop(client: CoordinatorClient, job_id: str, stop: threading.Event) -> None:
