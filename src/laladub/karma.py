@@ -16,14 +16,13 @@ class KarmaLevel:
 
 
 KARMA_LEVELS = (
-    KarmaLevel(0, "Новичок", 1, 0, 1),
-    KarmaLevel(6, "Участник", 1, 0, 1),
-    KarmaLevel(60, "Автор", 5, 1, 1),
-    KarmaLevel(360, "Проверенный автор", 10, 2, 2),
-    KarmaLevel(720, "Любимчик редакции", 15, 3, 2),
-    KarmaLevel(1440, "Ветеран", 20, 4, 3),
-    KarmaLevel(2880, "Алмазный подписчик", 25, 5, 3),
-    KarmaLevel(5760, "Легенда La La School", 30, 6, 3),
+    KarmaLevel(0, "Участник", 1, 0, 1),
+    KarmaLevel(6, "Автор", 5, 1, 1),
+    KarmaLevel(60, "Проверенный автор", 10, 2, 2),
+    KarmaLevel(360, "Любимчик редакции", 15, 3, 2),
+    KarmaLevel(720, "Ветеран", 20, 4, 3),
+    KarmaLevel(1440, "Алмазный подписчик", 25, 5, 3),
+    KarmaLevel(2880, "Легенда La La School", 30, 6, 3),
 )
 
 

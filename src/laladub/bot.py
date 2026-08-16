@@ -1926,7 +1926,7 @@ class _JobScheduler:
             self._sequence += 1
             premium = self._settings.is_paid(user_id) or self._settings.is_admin(user_id)
             priority_bonus = 0
-            level_name = "Новичок"
+            level_name = "Участник"
             queue_limit: int | None = None
             if not premium and user_id is not None:
                 store: ProposalStore | None = context.application.bot_data.get("proposal_store")
