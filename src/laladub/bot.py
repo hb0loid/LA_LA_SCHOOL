@@ -199,6 +199,7 @@ def main() -> None:
     application.add_handler(CommandHandler("me", me, filters=private_chat))
     application.add_handler(CommandHandler("queue", queue_status, filters=private_chat))
     application.add_handler(CommandHandler("resume", resume, filters=private_chat))
+    application.add_handler(CommandHandler("send", send_to_proposal, filters=private_chat))
     application.add_handler(CommandHandler("censored", censored, filters=private_chat))
     application.add_handler(CommandHandler("cancel", cancel, filters=private_chat))
     application.add_handler(CommandHandler("maintenance", maintenance, filters=private_chat))
@@ -435,6 +436,7 @@ async def _setup_bot_commands(application: Any) -> None:
         ("start", "Инструкция"),
         ("queue", "Показать очередь задач"),
         ("resume", "Продолжить задачу по номеру"),
+        ("send", "Отправить старую работу в предложку"),
         ("censored", "Experimental censor 0..100"),
         ("me", "Показать профиль и карму"),
         ("cancel", "Сбросить текущую задачу"),
@@ -763,6 +765,58 @@ async def resume_callback(update: Any, context: Any) -> None:
     await _enqueue_job(update, context, job, query.message)
 
 
+async def send_to_proposal(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    user = update.effective_user
+    chat = update.effective_chat
+    message = update.effective_message
+    if user is None or chat is None or message is None:
+        return
+    requested_number = str(context.args[0]).strip() if context.args else ""
+    if len(context.args) != 1 or not requested_number.isdigit():
+        await message.reply_text("Использование: /send НОМЕР_РАБОТЫ")
+        return
+    if not settings.proposal_enabled or "proposal_store" not in context.application.bot_data:
+        await message.reply_text("Предложка сейчас отключена.")
+        return
+
+    job_number = str(int(requested_number))
+    job_dir = settings.workdir / str(user.id) / job_number
+    job = _load_job_snapshot(job_dir)
+    if not isinstance(job, dict):
+        await message.reply_text(f"Не нашёл твою работу №{job_number}. Возможно, её файлы уже удалены.")
+        return
+    owner_id = _coerce_int(job.get("user_id"))
+    if owner_id is not None and owner_id != user.id:
+        await message.reply_text("Эта работа принадлежит другому пользователю.")
+        return
+    if str(job.get("status") or "") not in {"ready", "done"}:
+        await message.reply_text(f"Работа №{job_number} ещё не завершена.")
+        return
+
+    video_path = _find_proposal_video_path(job_dir, job)
+    if video_path is None:
+        await message.reply_text(f"Итоговый видеофайл работы №{job_number} уже не найден.")
+        return
+    try:
+        submission, created = await _create_proposal_submission(
+            context,
+            job=job,
+            job_number=job_number,
+            user=user,
+            chat_id=int(chat.id),
+            video_path=video_path,
+        )
+    except Exception as exc:
+        print("Forced proposal submission failed:\n" + traceback.format_exc(), flush=True)
+        await message.reply_text(f"Не удалось отправить работу №{job_number}: {type(exc).__name__}")
+        return
+    if created:
+        await message.reply_text(f"Работа №{job_number} отправлена в предложку.")
+    else:
+        await message.reply_text(f"Работа №{job_number} уже находится в предложке.")
+
+
 async def proposal_callback(update: Any, context: Any) -> None:
     query = update.callback_query
     settings: BotSettings = context.application.bot_data["settings"]
@@ -800,26 +854,18 @@ async def proposal_callback(update: Any, context: Any) -> None:
         await query.answer("Работа ещё не завершена.", show_alert=True)
         return
 
-    video_path = Path(str(job.get("proposal_video_path") or ""))
-    if not video_path.is_file():
+    video_path = _find_proposal_video_path(job_dir, job)
+    if video_path is None:
         await query.answer("Итоговый видеофайл уже не найден.", show_alert=True)
         return
-    output_filename = str(job.get("proposal_output_filename") or video_path.name).strip() or video_path.name
-    author_name = str(getattr(user, "full_name", "") or getattr(user, "username", "") or user.id).strip()
-    author_username = str(getattr(user, "username", "") or "").strip() or None
-    store: ProposalStore = context.application.bot_data["proposal_store"]
     try:
-        duration_ms = max(0, round(await asyncio.to_thread(probe_duration, video_path) * 1000))
-        submission, created = await asyncio.to_thread(
-            store.create_submission,
+        submission, created = await _create_proposal_submission(
+            context,
+            job=job,
             job_number=value,
-            user_id=user.id,
+            user=user,
             chat_id=int(update.effective_chat.id),
-            author_name=author_name,
-            author_username=author_username,
             video_path=video_path,
-            output_filename=output_filename,
-            duration_ms=duration_ms,
         )
     except Exception as exc:
         print("Proposal submission failed:\n" + traceback.format_exc(), flush=True)
@@ -829,6 +875,59 @@ async def proposal_callback(update: Any, context: Any) -> None:
     with contextlib.suppress(Exception):
         await query.edit_message_reply_markup(reply_markup=_proposal_submitted_keyboard(submission.id))
     await query.answer("Отправлено в предложку." if created else "Видео уже находится в предложке.")
+
+
+def _find_proposal_video_path(job_dir: Path, job: dict[str, Any]) -> Path | None:
+    candidates = [
+        Path(str(job.get("proposal_video_path") or "")),
+        job_dir / "dubbed_watermarked.mp4",
+        job_dir / "dubbed.mp4",
+    ]
+    remote_video_dir = job_dir / "remote_result" / "video"
+    if remote_video_dir.is_dir():
+        candidates.extend(
+            sorted(
+                (path for path in remote_video_dir.iterdir() if path.is_file()),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        )
+    for path in candidates:
+        if path.is_file() and path.stat().st_size > 0:
+            return path
+    return None
+
+
+async def _create_proposal_submission(
+    context: Any,
+    *,
+    job: dict[str, Any],
+    job_number: str,
+    user: Any,
+    chat_id: int,
+    video_path: Path,
+) -> tuple[Any, bool]:
+    output_filename = str(job.get("proposal_output_filename") or "").strip()
+    if not output_filename:
+        output_filename = _lalaschool_filename(
+            job.get("source_title") or video_path.stem,
+            video_path.suffix,
+        )
+    author_name = str(getattr(user, "full_name", "") or getattr(user, "username", "") or user.id).strip()
+    author_username = str(getattr(user, "username", "") or "").strip() or None
+    duration_ms = max(0, round(await asyncio.to_thread(probe_duration, video_path) * 1000))
+    store: ProposalStore = context.application.bot_data["proposal_store"]
+    return await asyncio.to_thread(
+        store.create_submission,
+        job_number=job_number,
+        user_id=user.id,
+        chat_id=chat_id,
+        author_name=author_name,
+        author_username=author_username,
+        video_path=video_path,
+        output_filename=output_filename,
+        duration_ms=duration_ms,
+    )
 
 
 async def receive_video(update: Any, context: Any) -> None:

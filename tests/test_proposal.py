@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from laladub.bot import _find_proposal_video_path
 from laladub.karma import (
     format_karma_milli,
     karma_milli_for_duration,
@@ -115,6 +116,25 @@ class ProposalStoreTests(unittest.TestCase):
 
 
 class ProposalUiTests(unittest.TestCase):
+    def test_old_job_uses_watermarked_video_for_forced_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            job_dir = Path(tempdir)
+            (job_dir / "dubbed.mp4").write_bytes(b"plain")
+            watermarked = job_dir / "dubbed_watermarked.mp4"
+            watermarked.write_bytes(b"watermarked")
+            self.assertEqual(_find_proposal_video_path(job_dir, {"status": "done"}), watermarked)
+
+    def test_stale_saved_proposal_path_falls_back_to_old_job_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            job_dir = Path(tempdir)
+            fallback = job_dir / "dubbed.mp4"
+            fallback.write_bytes(b"video")
+            selected = _find_proposal_video_path(
+                job_dir,
+                {"proposal_video_path": str(job_dir / "missing.mp4")},
+            )
+            self.assertEqual(selected, fallback)
+
     def test_author_caption_is_clickable_and_escaped(self) -> None:
         submission = Submission(
             id=1,
