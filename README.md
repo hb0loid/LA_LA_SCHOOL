@@ -177,7 +177,7 @@ laladub-bot
 - `LALADUB_F5_DEVICE` - `auto`, `cpu` или `cuda`; по умолчанию `auto`.
 - `LALADUB_F5_SPEED` - скорость F5-TTS, по умолчанию `1.0`.
 - `LALADUB_SEPARATION` - `demucs` или `none`.
-- `LALADUB_AUDIO_BED` - `instrumental`, `original` или `dub-only`.
+- `LALADUB_AUDIO_BED` - `instrumental`, `original`, `dub-only` или `multitrack`. `multitrack` не смешивает оригинал и дубляж в одну дорожку: в итоговом видео оригинальная аудиодорожка сохраняется отдельно от дублированной (с языковыми метаданными), и плеер может переключаться между ними; если также включён `--separation demucs`, дублированная дорожка получает инструментал под собой.
 - `LALADUB_WHISPER_MODEL` - модель faster-whisper, по умолчанию `small`.
 - `LALADUB_ASR_BACKEND` - backend обычного дубляжа, по умолчанию `faster-whisper`.
 - `LALADUB_WHISPER_ONLY_MODEL` - модель для режима bug hunt и artifact-hunt, по умолчанию `turbo`.

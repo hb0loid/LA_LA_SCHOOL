@@ -918,3 +918,88 @@ def combine_video_audio(
             str(output_path),
         ]
     _run_mux_with_video_fallback(cmd)
+
+
+# ISO 639-2/B tags for the language codes this project's UI exposes. Falls
+# back to "und" (undefined) so an unmapped code never breaks the mux.
+_MP4_LANGUAGE_TAGS = {
+    "ru": "rus",
+    "en": "eng",
+    "uk": "ukr",
+    "vi": "vie",
+    "ko": "kor",
+    "ja": "jpn",
+    "zh": "zho",
+    "th": "tha",
+    "de": "deu",
+    "es": "spa",
+    "fr": "fra",
+}
+
+
+def mp4_language_tag(code: str | None) -> str:
+    if not code:
+        return "und"
+    return _MP4_LANGUAGE_TAGS.get(code.strip().lower(), "und")
+
+
+def combine_video_audio_multitrack(
+    video_path: Path,
+    original_audio_path: Path,
+    dub_path: Path,
+    output_path: Path,
+    dub_volume: float,
+    bed_path: Path | None = None,
+    original_lang: str | None = None,
+    dub_lang: str | None = None,
+) -> None:
+    """Mux video with two separate audio streams instead of pre-mixing them:
+    the untouched original audio and the dub (optionally laid over the
+    instrumental bed). A player can then switch tracks instead of only ever
+    hearing one fixed mix.
+    """
+    ffmpeg = require_tool("ffmpeg")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [ffmpeg, "-y", "-i", str(video_path), "-i", str(original_audio_path), "-i", str(dub_path)]
+    if bed_path is not None:
+        cmd.extend(["-i", str(bed_path)])
+        filter_complex = (
+            f"[2:a]volume={dub_volume:.3f}[dubv];"
+            "[3:a][dubv]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+            "alimiter=limit=0.95[dubout]"
+        )
+    else:
+        filter_complex = f"[2:a]volume={dub_volume:.3f}[dubout]"
+
+    cmd.extend(
+        [
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-map",
+            "[dubout]",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            "-metadata:s:a:0",
+            f"language={mp4_language_tag(original_lang)}",
+            "-metadata:s:a:0",
+            "title=Original",
+            "-metadata:s:a:1",
+            f"language={mp4_language_tag(dub_lang)}",
+            "-metadata:s:a:1",
+            "title=Dub",
+            "-disposition:a:0",
+            "0",
+            "-disposition:a:1",
+            "default",
+            str(output_path),
+        ]
+    )
+    _run_mux_with_video_fallback(cmd)

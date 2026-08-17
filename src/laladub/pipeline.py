@@ -18,6 +18,7 @@ from .asr import clear_openai_whisper_cache, transcribe
 from .censor import apply_censor_to_segments
 from .ffmpeg import (
     combine_video_audio,
+    combine_video_audio_multitrack,
     concat_wavs,
     delayed_mix,
     extract_audio,
@@ -698,7 +699,11 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     mix_audio = config.workdir / "source_mix.wav"
     separation_result = None
     bed_path = None
-    if config.separation != "none" or config.audio_bed == "instrumental":
+    # multitrack needs the untouched original mix as its own audio track even
+    # when the user didn't ask for Demucs separation.
+    needs_mix_audio = config.separation != "none" or config.audio_bed in {"instrumental", "multitrack"}
+    needs_separation = config.separation != "none" or config.audio_bed == "instrumental"
+    if needs_mix_audio:
         _report_progress(config, "Разделяю голос и фон", 10, 100, f"provider={config.separation}")
         if config.resume and _file_ready(mix_audio):
             print(f"      Resume: using existing mix audio {mix_audio}")
@@ -707,21 +712,22 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         else:
             extract_audio_track(video_path, mix_audio)
             _store_cached_file(media_cache, mix_audio, "source_mix.wav")
-        separation_result = _existing_separation_result(mix_audio, config) if config.resume else None
-        if separation_result is not None:
-            print(f"      Resume: using existing separation {separation_result.vocals_path.parent}")
-        else:
-            separation_result = _restore_cached_separation(media_cache, mix_audio, config)
+        if needs_separation:
+            separation_result = _existing_separation_result(mix_audio, config) if config.resume else None
             if separation_result is not None:
-                print(f"      Media cache: restored separation {separation_result.vocals_path.parent}")
+                print(f"      Resume: using existing separation {separation_result.vocals_path.parent}")
             else:
-                print(f"      Separating audio provider={config.separation}")
-                separation_result = separate_audio(mix_audio, config.workdir / "separated", config)
-                _store_cached_separation(media_cache, separation_result, config)
-        if separation_result and config.audio_bed == "instrumental":
-            bed_path = separation_result.instrumental_path
-        elif config.audio_bed == "instrumental":
-            raise RuntimeError("audio_bed=instrumental needs --separation demucs")
+                separation_result = _restore_cached_separation(media_cache, mix_audio, config)
+                if separation_result is not None:
+                    print(f"      Media cache: restored separation {separation_result.vocals_path.parent}")
+                else:
+                    print(f"      Separating audio provider={config.separation}")
+                    separation_result = separate_audio(mix_audio, config.workdir / "separated", config)
+                    _store_cached_separation(media_cache, separation_result, config)
+            if separation_result and config.audio_bed in {"instrumental", "multitrack"}:
+                bed_path = separation_result.instrumental_path
+            elif config.audio_bed == "instrumental":
+                raise RuntimeError("audio_bed=instrumental needs --separation demucs")
     _save_resume_state(config, audio=True, separation=separation_result is not None)
     source_duration = probe_duration(source_audio)
     _report_progress(config, "Аудио подготовлено", 20, 100, None)
@@ -1108,6 +1114,17 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     final_original_volume = 0.0 if config.audio_bed == "dub-only" else config.original_volume
     if config.resume and _file_ready(config.output, min_size=4096):
         print(f"      Resume: using existing final video {config.output}")
+    elif config.audio_bed == "multitrack":
+        combine_video_audio_multitrack(
+            video_path=video_path,
+            original_audio_path=mix_audio,
+            dub_path=dub_track,
+            output_path=config.output,
+            dub_volume=config.dub_volume,
+            bed_path=bed_path,
+            original_lang=config.source_lang,
+            dub_lang=config.target_lang,
+        )
     else:
         combine_video_audio(
             video_path=video_path,

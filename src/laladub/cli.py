@@ -218,8 +218,9 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument(
         "--audio-bed",
         default="original",
-        choices=["original", "instrumental", "dub-only"],
-        help="Final audio bed behind the dub.",
+        choices=["original", "instrumental", "dub-only", "multitrack"],
+        help="Final audio bed behind the dub. multitrack keeps the original audio and "
+        "the dub as two separate selectable tracks instead of mixing them.",
     )
     dub.add_argument(
         "--glitch-profile",
