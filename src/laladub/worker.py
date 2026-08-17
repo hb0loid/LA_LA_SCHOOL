@@ -26,6 +26,7 @@ from .job_runner import execute_job, result_manifest, save_job_snapshot
 
 DEFAULT_CONFIG_PATH = Path("worker_config.json")
 LOCAL_VERSION_PATH = Path("worker_version.json")
+LOCAL_STATE_PATH = Path(".worker_state.json")
 UPDATE_EXIT_CODE = 42
 
 
@@ -418,18 +419,24 @@ def _remote_update_available(client: CoordinatorClient) -> bool:
 
 
 def _local_version_candidates() -> list[Path]:
-    """Where worker_version.json can live.
+    """Every file that can tell us which build this worker is running.
 
-    The launcher chdirs to the worker root, so the plain relative path normally
-    works, but a worker started any other way would silently read nothing - and
-    an unknown local build disables updating entirely. Fall back to the package
-    root, which is where the build actually writes the file.
+    worker_version.json ships inside the package, but the launcher records the
+    build it just installed in .worker_state.json instead - so the file the
+    updater writes and the file this check reads were not the same one. Read
+    both, from the working directory and from the package root, since a worker
+    started without the launcher's chdir would otherwise see neither. An unknown
+    local build makes the update check below answer "no" forever, which is how a
+    worker ends up stuck on old code with nothing in its log.
     """
-    candidates = [LOCAL_VERSION_PATH]
-    package_root = Path(__file__).resolve().parents[2]
-    fallback = package_root / LOCAL_VERSION_PATH.name
-    if fallback != LOCAL_VERSION_PATH.resolve():
-        candidates.append(fallback)
+    names = [LOCAL_VERSION_PATH.name, LOCAL_STATE_PATH.name]
+    roots = [Path.cwd(), Path(__file__).resolve().parents[2]]
+    candidates: list[Path] = []
+    for name in names:
+        for root in roots:
+            path = root / name
+            if path not in candidates:
+                candidates.append(path)
     return candidates
 
 

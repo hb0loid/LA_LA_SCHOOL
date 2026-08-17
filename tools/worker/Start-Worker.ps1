@@ -112,9 +112,15 @@ function Read-JsonFile($Path) {
 }
 
 function Get-LocalBuildId {
-  $version = Read-JsonFile $VersionPath
-  if ($version.ContainsKey("build_id")) { return [string]$version["build_id"] }
-  if ($version.ContainsKey("sha256")) { return [string]$version["sha256"] }
+  # Check both files: worker_version.json ships in the package, while the update
+  # below records what it installed in .worker_state.json. Reading only the
+  # first meant a worker missing that file reported no build at all, and an
+  # unknown build makes the update check treat every remote build as "same".
+  foreach ($path in @($VersionPath, $StatePath)) {
+    $data = Read-JsonFile $path
+    if ($data.ContainsKey("build_id") -and [string]$data["build_id"]) { return [string]$data["build_id"] }
+    if ($data.ContainsKey("sha256") -and [string]$data["sha256"]) { return [string]$data["sha256"] }
+  }
   return ""
 }
 
@@ -178,11 +184,16 @@ function Invoke-WorkerUpdate {
     }
     Copy-Item -LiteralPath $_.FullName -Destination $destination -Recurse -Force
   }
-  @{
+  $installed = @{
     build_id = $remoteBuild
     sha256 = [string]$manifest.sha256
     updated_at = (Get-Date).ToString("o")
-  } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+  } | ConvertTo-Json -Depth 4
+  $installed | Set-Content -LiteralPath $StatePath -Encoding UTF8
+  # Record it in worker_version.json as well. The package ships that file, but
+  # if it is ever missing the worker reports no build at all and then never
+  # updates again - the exact state this recovers from.
+  $installed | Set-Content -LiteralPath $VersionPath -Encoding UTF8
   Write-Host "Worker updated to $remoteBuild"
 }
 
