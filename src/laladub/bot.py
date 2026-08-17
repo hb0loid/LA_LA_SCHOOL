@@ -21,10 +21,11 @@ from typing import Any
 from .bot_config import BotSettings, load_bot_settings
 from .download import download_video_url, extract_url, has_video_and_audio
 from .ffmpeg import compress_video_for_telegram, make_audio_visual_video, probe_duration, trim_video
-from .karma import KARMA_SCALE, level_for_karma, next_level_for_karma, visible_karma
+from .karma import KARMA_SCALE, PREMIUM_LEVEL, KarmaLevel, level_for_karma, next_level_for_karma, visible_karma
 from .asr import clear_openai_whisper_cache
 from .models import DubConfig
 from .pipeline import run_dub, run_transcript
+from .premium_store import PremiumStore, Subscription
 from .proposal_store import ProposalStore
 from .tts import clear_tts_model_caches
 from .watermark import add_watermark
@@ -130,7 +131,14 @@ class _ApplicationContext:
 def main() -> None:
     try:
         from telegram import Update
-        from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+        from telegram.ext import (
+            Application,
+            CallbackQueryHandler,
+            CommandHandler,
+            MessageHandler,
+            PreCheckoutQueryHandler,
+            filters,
+        )
     except ImportError as exc:
         raise RuntimeError("Install bot dependencies first: python -m pip install -e .[bot]") from exc
 
@@ -191,6 +199,7 @@ def main() -> None:
     application.bot_data["settings"] = settings
     application.bot_data["job_scheduler"] = _JobScheduler(settings)
     application.bot_data["proposal_store"] = ProposalStore(settings.proposal_db)
+    application.bot_data["premium_store"] = PremiumStore(settings.premium_db)
     private_chat = filters.ChatType.PRIVATE
     application.add_error_handler(_telegram_error_handler)
     application.add_handler(MessageHandler(private_chat, maintenance_message_gate), group=-1)
@@ -203,6 +212,14 @@ def main() -> None:
     application.add_handler(CommandHandler("censored", censored, filters=private_chat))
     application.add_handler(CommandHandler("cancel", cancel, filters=private_chat))
     application.add_handler(CommandHandler("maintenance", maintenance, filters=private_chat))
+    application.add_handler(CommandHandler("premium", premium_command, filters=private_chat))
+    application.add_handler(CommandHandler("paysupport", paysupport_command, filters=private_chat))
+    application.add_handler(CommandHandler("grant_premium", admin_grant_premium, filters=private_chat))
+    application.add_handler(CommandHandler("revoke_premium", admin_revoke_premium, filters=private_chat))
+    application.add_handler(CommandHandler("refund_premium", admin_refund_premium, filters=private_chat))
+    application.add_handler(CallbackQueryHandler(premium_buy_callback, pattern=r"^premium_buy$"))
+    application.add_handler(PreCheckoutQueryHandler(premium_precheckout))
+    application.add_handler(MessageHandler(private_chat & filters.SUCCESSFUL_PAYMENT, premium_successful_payment))
     application.add_handler(MessageHandler(private_chat & (filters.VIDEO | filters.Document.VIDEO), receive_video))
     application.add_handler(
         MessageHandler(private_chat & (filters.AUDIO | filters.VOICE | filters.Document.AUDIO), receive_audio)
@@ -441,6 +458,9 @@ async def _setup_bot_commands(application: Any) -> None:
         ("me", "Показать профиль и карму"),
         ("cancel", "Сбросить текущую задачу"),
     ]
+    # /premium and /paysupport stay unlisted for now (soft launch) - their
+    # CommandHandlers in main() still work if typed directly, matching how
+    # /maintenance is already hidden from this same menu.
     await application.bot.set_my_commands(commands)
     with contextlib.suppress(Exception):
         from telegram import BotCommandScopeAllPrivateChats, BotCommandScopeDefault
@@ -569,6 +589,168 @@ async def maintenance(update: Any, context: Any) -> None:
     await update.effective_message.reply_text(f"Режим технических работ {state}.\n{details}")
 
 
+async def premium_command(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
+    user = update.effective_user
+    if user is None:
+        return
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    if settings.is_paid(user.id) or settings.is_admin(user.id):
+        await update.effective_message.reply_text(
+            "У тебя уже безлимитный доступ, платная подписка не нужна.",
+            reply_markup=_remove_reply_keyboard(),
+        )
+        return
+
+    subscription = (
+        await asyncio.to_thread(premium_store.active_subscription, user.id) if premium_store is not None else None
+    )
+    lines = [
+        "⭐ Премиум подписка",
+        f"{PREMIUM_LEVEL.daily_minutes} минут в сутки, приоритет в очереди +{PREMIUM_LEVEL.priority_bonus}, "
+        f"до {PREMIUM_LEVEL.queue_limit} задач одновременно.",
+        f"Цена: {settings.premium_price_stars} ⭐ за {settings.premium_days} дней.",
+    ]
+    if subscription is not None:
+        expiry = datetime.fromtimestamp(subscription.expires_at).strftime("%d.%m.%Y")
+        lines.extend(["", f"Уже активна, действует до {expiry}.", "Оплата продлит её ещё на срок подписки."])
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"Оформить премиум за {settings.premium_price_stars} ⭐", callback_data="premium_buy")]]
+    )
+    await update.effective_message.reply_text("\n".join(lines), reply_markup=keyboard)
+
+
+async def premium_buy_callback(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    query = update.callback_query
+    user = update.effective_user
+    if query is None or user is None:
+        return
+    await query.answer()
+    from telegram import LabeledPrice
+
+    await context.bot.send_invoice(
+        chat_id=user.id,
+        title="Премиум La La School",
+        description=(
+            f"{PREMIUM_LEVEL.daily_minutes} минут в сутки, приоритет в очереди +{PREMIUM_LEVEL.priority_bonus}, "
+            f"до {PREMIUM_LEVEL.queue_limit} задач одновременно, на {settings.premium_days} дней."
+        ),
+        payload=f"premium:{user.id}",
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(f"Премиум {settings.premium_days} дней", settings.premium_price_stars)],
+    )
+
+
+async def premium_precheckout(update: Any, context: Any) -> None:
+    query = update.pre_checkout_query
+    if query is None:
+        return
+    user = update.effective_user
+    if user is None or query.invoice_payload != f"premium:{user.id}":
+        await query.answer(ok=False, error_message="Не удалось проверить платёж, попробуй оформить заново через /premium.")
+        return
+    await query.answer(ok=True)
+
+
+async def premium_successful_payment(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
+    user = update.effective_user
+    payment = update.message.successful_payment if update.message is not None else None
+    if user is None or payment is None or premium_store is None:
+        return
+    subscription = await asyncio.to_thread(
+        premium_store.record_payment,
+        user_id=user.id,
+        telegram_payment_charge_id=payment.telegram_payment_charge_id,
+        stars_amount=int(payment.total_amount),
+        days=settings.premium_days,
+    )
+    if subscription is None:
+        return
+    expiry = datetime.fromtimestamp(subscription.expires_at).strftime("%d.%m.%Y")
+    await update.effective_message.reply_text(
+        f"Спасибо! Премиум активен до {expiry}.\nПосмотреть статус: /me",
+        reply_markup=_remove_reply_keyboard(),
+    )
+
+
+async def paysupport_command(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    await update.effective_message.reply_text(
+        "По вопросам оплаты премиума (включая возврат звёзд) "
+        f"{settings.paysupport_contact}.",
+        reply_markup=_remove_reply_keyboard(),
+    )
+
+
+async def admin_grant_premium(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
+    user = update.effective_user
+    if user is None or not settings.is_admin(user.id):
+        await update.effective_message.reply_text("Команда доступна только администратору.")
+        return
+    args = context.args or []
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.effective_message.reply_text("Использование: /grant_premium <user_id> [дней]")
+        return
+    target_id = int(args[0])
+    days = int(args[1]) if len(args) > 1 and args[1].isdigit() else settings.premium_days
+    subscription = await asyncio.to_thread(
+        premium_store.grant_manual, user_id=target_id, days=days, admin_id=user.id
+    )
+    expiry = datetime.fromtimestamp(subscription.expires_at).strftime("%d.%m.%Y")
+    await update.effective_message.reply_text(f"Премиум для {target_id} выдан до {expiry}.")
+
+
+async def admin_revoke_premium(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
+    user = update.effective_user
+    if user is None or not settings.is_admin(user.id):
+        await update.effective_message.reply_text("Команда доступна только администратору.")
+        return
+    args = context.args or []
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.effective_message.reply_text("Использование: /revoke_premium <user_id>")
+        return
+    target_id = int(args[0])
+    revoked = await asyncio.to_thread(premium_store.revoke, target_id, status="admin_revoked")
+    await update.effective_message.reply_text(
+        f"Премиум для {target_id} отключён." if revoked else f"У {target_id} нет активной подписки."
+    )
+
+
+async def admin_refund_premium(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
+    user = update.effective_user
+    if user is None or not settings.is_admin(user.id):
+        await update.effective_message.reply_text("Команда доступна только администратору.")
+        return
+    args = context.args or []
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.effective_message.reply_text("Использование: /refund_premium <user_id>")
+        return
+    target_id = int(args[0])
+    charge_id = await asyncio.to_thread(premium_store.latest_charge_id, target_id)
+    if charge_id is None or charge_id.startswith("manual-"):
+        await update.effective_message.reply_text(f"У {target_id} нет оплаченной звёздами подписки для возврата.")
+        return
+    try:
+        await context.bot.refund_star_payment(user_id=target_id, telegram_payment_charge_id=charge_id)
+    except Exception as exc:
+        await update.effective_message.reply_text(f"Возврат не удался: {type(exc).__name__}: {exc}")
+        return
+    await asyncio.to_thread(premium_store.revoke, target_id, status="refunded")
+    await update.effective_message.reply_text(f"Звёзды возвращены, премиум для {target_id} отключён.")
+
+
 async def start(update: Any, context: Any) -> None:
     await update.effective_message.reply_text(
         "Пришли видео или аудио. Я попрошу выбрать видеоряд, input-язык, количество голосов и язык озвучки.\n\n"
@@ -581,20 +763,32 @@ async def start(update: Any, context: Any) -> None:
     )
 
 
+def _effective_level(
+    premium_store: PremiumStore | None, user_id: int | None, karma_milli: int
+) -> tuple[KarmaLevel, Subscription | None]:
+    """Karma-tier level, unless a capped Stars subscription is active - that one wins instead."""
+    if premium_store is not None and user_id is not None:
+        subscription = premium_store.active_subscription(user_id)
+        if subscription is not None:
+            return PREMIUM_LEVEL, subscription
+    return level_for_karma(karma_milli), None
+
+
 async def me(update: Any, context: Any) -> None:
     settings: BotSettings = context.application.bot_data["settings"]
     user = update.effective_user
     if user is None:
         return
     store: ProposalStore | None = context.application.bot_data.get("proposal_store")
+    premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
     karma_milli = await asyncio.to_thread(store.karma_total, user.id) if store is not None else 0
-    level = level_for_karma(karma_milli)
     privileged = settings.is_paid(user.id) or settings.is_admin(user.id)
+    level, subscription = await asyncio.to_thread(_effective_level, premium_store, user.id, karma_milli)
     lines = [
         "👤 Твой профиль",
         f"Telegram ID: {user.id}",
         f"Уровень: {level.name}",
-        f"Карма: {visible_karma(karma_milli)}",
+        f"Карма: {visible_karma(karma_milli)}{' ∞' if subscription is not None else ''}",
     ]
     next_level = next_level_for_karma(karma_milli)
     if next_level is None:
@@ -617,6 +811,9 @@ async def me(update: Any, context: Any) -> None:
                 f"Лимит задач в очереди: {level.queue_limit}",
             ]
         )
+        if subscription is not None:
+            expiry = datetime.fromtimestamp(subscription.expires_at).strftime("%d.%m.%Y")
+            lines.append(f"Премиум активен до: {expiry}")
 
     if store is not None:
         publications = await asyncio.to_thread(store.publication_summary, user.id)
@@ -1631,7 +1828,8 @@ async def _reserve_daily_allowance(
         await _safe_edit_status(status_message, "Не смог определить длительность видео для суточного лимита.")
         return False
     karma_milli = await asyncio.to_thread(store.karma_total, user_id)
-    level = level_for_karma(karma_milli)
+    premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
+    level, _subscription = await asyncio.to_thread(_effective_level, premium_store, user_id, karma_milli)
     limit_ms = level.daily_minutes * 60_000
     accepted, used_ms = await asyncio.to_thread(
         store.reserve_daily_usage,
@@ -2029,8 +2227,9 @@ class _JobScheduler:
             queue_limit: int | None = None
             if not premium and user_id is not None:
                 store: ProposalStore | None = context.application.bot_data.get("proposal_store")
+                premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
                 karma_milli = await asyncio.to_thread(store.karma_total, user_id) if store is not None else 0
-                level = level_for_karma(karma_milli)
+                level, _subscription = await asyncio.to_thread(_effective_level, premium_store, user_id, karma_milli)
                 priority_bonus = level.priority_bonus
                 level_name = level.name
                 queue_limit = level.queue_limit

@@ -25,6 +25,10 @@ class BotSettings:
     admin_users_file: Path
     proposal_enabled: bool
     proposal_db: Path
+    premium_db: Path
+    premium_price_stars: int
+    premium_days: int
+    paysupport_contact: str
     max_active_jobs: int
     max_active_jobs_per_user: int
     watermark_text: str
@@ -166,6 +170,11 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         admin_users_file=admin_users_file,
         proposal_enabled=_parse_bool(os.environ.get("LALADUB_PROPOSAL_ENABLED", "1")),
         proposal_db=Path(os.environ.get("LALADUB_PROPOSAL_DB", "runs/proposal/proposals.sqlite3")),
+        premium_db=Path(os.environ.get("LALADUB_PREMIUM_DB", "runs/premium/subscriptions.sqlite3")),
+        premium_price_stars=max(1, int(os.environ.get("LALADUB_PREMIUM_PRICE_STARS", "250"))),
+        premium_days=max(1, int(os.environ.get("LALADUB_PREMIUM_DAYS", "30"))),
+        paysupport_contact=os.environ.get("LALADUB_PAYSUPPORT_CONTACT", "свяжись с администратором бота").strip()
+        or "свяжись с администратором бота",
         max_active_jobs=max(1, int(os.environ.get("LALADUB_MAX_ACTIVE_JOBS", "2"))),
         max_active_jobs_per_user=max(1, int(os.environ.get("LALADUB_MAX_ACTIVE_JOBS_PER_USER", "1"))),
         watermark_text=os.environ.get("LALADUB_WATERMARK_TEXT", "La La Local Dub"),

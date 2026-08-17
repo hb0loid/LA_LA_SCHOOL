@@ -25,6 +25,12 @@ KARMA_LEVELS = (
     KarmaLevel(2880, "Легенда La La School", 30, 6, 3),
 )
 
+# Granted by an active Telegram Stars subscription, independent of the karma
+# ladder above - `minimum` is unused here since it's applied by subscription
+# state rather than a karma threshold, but keeping the same dataclass shape
+# lets every existing karma-level consumer accept it without a new branch.
+PREMIUM_LEVEL = KarmaLevel(0, "Премиум подписка", 60, 10, 5)
+
 
 def karma_milli_for_duration(duration_ms: int, destination: str) -> int:
     """Return thousandths of karma for a published video.

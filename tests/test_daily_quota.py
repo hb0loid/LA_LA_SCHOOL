@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from laladub.bot import _reserve_daily_allowance, _today_key
+from laladub.premium_store import PremiumStore
 from laladub.proposal_store import ProposalStore
 
 
@@ -79,6 +80,43 @@ class DailyQuotaTrimTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(Path(job["input_path"]).is_file())
             trim_mock.assert_called_once()
             self.assertTrue(any("В работу пойдёт" in message for message in status.messages))
+
+
+class PremiumQuotaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_active_subscription_uses_capped_premium_limit_not_karma_level(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            store = ProposalStore(root / "proposal.sqlite3")
+            premium_store = PremiumStore(root / "premium.sqlite3")
+            premium_store.record_payment(
+                user_id=123, telegram_payment_charge_id="c1", stars_amount=250, days=30
+            )
+            input_path = root / "job" / "input.mp4"
+            input_path.parent.mkdir()
+            input_path.write_bytes(b"source")
+            job = {"job_dir": str(input_path.parent), "input_path": str(input_path)}
+            context = SimpleNamespace(
+                application=SimpleNamespace(
+                    bot_data={
+                        "settings": _Settings(),
+                        "proposal_store": store,
+                        "premium_store": premium_store,
+                    }
+                )
+            )
+            status = _Status()
+
+            # A karma level-0 user is normally capped at 1 minute/day; a 40-minute
+            # video would be rejected/trimmed on that tier but fits the premium
+            # tier's 60 minutes/day, so it should be accepted untrimmed.
+            with patch("laladub.bot.probe_duration", return_value=40 * 60.0):
+                accepted = await _reserve_daily_allowance(
+                    context, status_message=status, user_id=123, job=job
+                )
+
+            self.assertTrue(accepted)
+            self.assertNotIn("daily_trimmed", job)
+            self.assertEqual(store.daily_usage_ms(123, _today_key()), 40 * 60 * 1000)
 
 
 if __name__ == "__main__":
