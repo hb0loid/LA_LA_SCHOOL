@@ -132,6 +132,10 @@ class DubConfig:
     moss_timeout_seconds: int = 1800
     separation: str = "none"
     separation_device: str = "cpu"
+    bsroformer_python: Path | None = None
+    bsroformer_model_dir: Path = Path("models/audio-separator")
+    bsroformer_model_file: str = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+    bsroformer_timeout_seconds: int = 600
     demucs_model: str = "htdemucs"
     audio_bed: str = "original"
     glitch_profile: str = "faithful"

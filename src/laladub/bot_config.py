@@ -94,6 +94,10 @@ class BotSettings:
     separation: str
     separation_device: str
     demucs_model: str
+    bsroformer_python: Path | None
+    bsroformer_model_dir: Path
+    bsroformer_model_file: str
+    bsroformer_timeout_seconds: int
     audio_bed: str
     asr_backend: str
     default_asr_method: str
@@ -251,9 +255,17 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
             os.environ.get("LALADUB_DIARIZATION_TOKEN_FILE", ".secrets\\HuggingFace-Token.txt")
         ),
         diarization_timeout_seconds=int(os.environ.get("LALADUB_DIARIZATION_TIMEOUT_SECONDS", "1800")),
-        separation=os.environ.get("LALADUB_SEPARATION", "demucs"),
+        separation=os.environ.get("LALADUB_SEPARATION", "bsroformer"),
         separation_device=os.environ.get("LALADUB_SEPARATION_DEVICE", "cpu"),
         demucs_model=os.environ.get("LALADUB_DEMUCS_MODEL", "htdemucs"),
+        bsroformer_python=_optional_path(
+            os.environ.get("LALADUB_BSROFORMER_PYTHON", ".venv-bsroformer\\Scripts\\python.exe")
+        ),
+        bsroformer_model_dir=Path(os.environ.get("LALADUB_BSROFORMER_MODEL_DIR", "models/audio-separator")),
+        bsroformer_model_file=os.environ.get(
+            "LALADUB_BSROFORMER_MODEL_FILE", "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+        ),
+        bsroformer_timeout_seconds=int(os.environ.get("LALADUB_BSROFORMER_TIMEOUT_SECONDS", "600")),
         audio_bed=os.environ.get("LALADUB_AUDIO_BED", "instrumental"),
         asr_backend=os.environ.get("LALADUB_ASR_BACKEND", "faster-whisper"),
         default_asr_method=os.environ.get("LALADUB_DEFAULT_ASR_METHOD", "ow-large-v3-chaos-backbone").strip().lower(),

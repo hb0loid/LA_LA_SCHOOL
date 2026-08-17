@@ -85,6 +85,10 @@ def main(argv: list[str] | None = None) -> None:
             separation=args.separation,
             separation_device=args.separation_device,
             demucs_model=args.demucs_model,
+            bsroformer_python=args.bsroformer_python,
+            bsroformer_model_dir=args.bsroformer_model_dir,
+            bsroformer_model_file=args.bsroformer_model_file,
+            bsroformer_timeout_seconds=args.bsroformer_timeout_seconds,
             audio_bed=args.audio_bed,
             glitch_profile=args.glitch_profile,
             ghost_gap_seconds=args.ghost_gap_seconds,
@@ -212,9 +216,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=3.5,
         help="Seconds of source vocals to use as per-segment XTTS speaker reference.",
     )
-    dub.add_argument("--separation", default="none", choices=["none", "demucs"], help="Vocal separation provider.")
-    dub.add_argument("--separation-device", default="cpu", choices=["cpu", "cuda"], help="Separation device.")
+    dub.add_argument(
+        "--separation",
+        default="none",
+        choices=["none", "demucs", "bsroformer"],
+        help="Vocal separation provider.",
+    )
+    dub.add_argument("--separation-device", default="cpu", choices=["cpu", "cuda", "auto"], help="Separation device.")
     dub.add_argument("--demucs-model", default="htdemucs", help="Demucs model name.")
+    dub.add_argument("--bsroformer-python", type=Path, default=Path(".venv-bsroformer") / "Scripts" / "python.exe")
+    dub.add_argument("--bsroformer-model-dir", type=Path, default=Path("models/audio-separator"))
+    dub.add_argument("--bsroformer-model-file", default="model_bs_roformer_ep_317_sdr_12.9755.ckpt")
+    dub.add_argument("--bsroformer-timeout-seconds", type=int, default=600)
     dub.add_argument(
         "--audio-bed",
         default="original",

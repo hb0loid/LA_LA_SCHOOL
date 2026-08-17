@@ -5,6 +5,7 @@
 .venv-cosyvoice/
 .venv-separator/
 .venv-diarization/
+.venv-bsroformer/
 .secrets/
 paid_users.txt
 admins.txt
