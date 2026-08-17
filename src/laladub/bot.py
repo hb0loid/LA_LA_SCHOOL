@@ -474,6 +474,7 @@ async def _setup_bot_commands(application: Any) -> None:
     asyncio.create_task(_recover_interrupted_jobs(application))
     asyncio.create_task(_cleanup_finished_jobs_loop(application))
     asyncio.create_task(_maintenance_watch_loop(application))
+    asyncio.create_task(_daily_quota_reminder_loop(application))
     asyncio.create_task(application.bot_data["job_scheduler"].watch_remote_leases(_ApplicationContext(application)))
     if settings.proposal_enabled:
         asyncio.create_task(_proposal_outbox_loop(application))
@@ -494,6 +495,42 @@ async def _maintenance_watch_loop(application: Any) -> None:
             await scheduler.maintenance_changed(_ApplicationContext(application))
         except Exception:
             print(traceback.format_exc(), flush=True)
+
+
+async def _daily_quota_reminder_loop(application: Any) -> None:
+    """The daily quota is a rolling 24h window, so there's no shared reset moment
+    to announce - instead, poll everyone with recent usage and DM whoever's usage
+    just dropped back below their limit (i.e. they were fully capped and now aren't)."""
+    settings: BotSettings = application.bot_data["settings"]
+    capped_users: set[int] = set()
+    while True:
+        await asyncio.sleep(180.0)
+        try:
+            store: ProposalStore | None = application.bot_data.get("proposal_store")
+            premium_store: PremiumStore | None = application.bot_data.get("premium_store")
+            if store is None:
+                continue
+            now = time.time()
+            candidates = await asyncio.to_thread(store.users_with_recent_usage, now - 86400.0)
+            still_capped: set[int] = set()
+            for user_id in candidates:
+                if settings.is_paid(user_id) or settings.is_admin(user_id):
+                    continue
+                karma_milli = await asyncio.to_thread(store.karma_total, user_id)
+                level, _subscription = await asyncio.to_thread(_effective_level, premium_store, user_id, karma_milli)
+                limit_ms = level.daily_minutes * 60_000
+                used_ms = await asyncio.to_thread(store.daily_usage_ms, user_id, now)
+                if used_ms >= limit_ms:
+                    still_capped.add(user_id)
+                elif user_id in capped_users:
+                    with contextlib.suppress(Exception):
+                        await application.bot.send_message(
+                            chat_id=user_id,
+                            text="✅ Суточный лимит на видео снова доступен, можно присылать новые работы.",
+                        )
+            capped_users = still_capped
+        except Exception:
+            print("Daily quota reminder loop failed:\n" + traceback.format_exc(), flush=True)
 
 
 async def _proposal_outbox_loop(application: Any) -> None:
@@ -800,17 +837,20 @@ async def me(update: Any, context: Any) -> None:
     if privileged:
         lines.extend(["", "Лимит перевода: без ограничений", "Приоритет: премиум"])
     else:
-        used_ms = await asyncio.to_thread(store.daily_usage_ms, user.id, _today_key()) if store is not None else 0
+        used_ms = await asyncio.to_thread(store.daily_usage_ms, user.id) if store is not None else 0
         limit_ms = level.daily_minutes * 60_000
         lines.extend(
             [
                 "",
-                f"Сегодня использовано: {_format_duration_ms(used_ms)} из {_format_duration_ms(limit_ms)}",
-                f"Осталось сегодня: {_format_duration_ms(max(0, limit_ms - used_ms))}",
+                f"Использовано за последние 24ч: {_format_duration_ms(used_ms)} из {_format_duration_ms(limit_ms)}",
+                f"Осталось: {_format_duration_ms(max(0, limit_ms - used_ms))}",
                 f"Приоритет в очереди: {'обычный' if level.priority_bonus == 0 else f'+{level.priority_bonus}'}",
                 f"Лимит задач в очереди: {level.queue_limit}",
             ]
         )
+        free_at = await asyncio.to_thread(store.next_usage_free_at, user.id) if store is not None else None
+        if free_at is not None:
+            lines.append(f"Начнёт освобождаться: {datetime.fromtimestamp(free_at).strftime('%H:%M %d.%m')}")
         if subscription is not None:
             expiry = datetime.fromtimestamp(subscription.expires_at).strftime("%d.%m.%Y")
             lines.append(f"Премиум активен до: {expiry}")
@@ -1423,10 +1463,6 @@ def _format_duration_ms(duration_ms: int) -> str:
     return _format_duration(max(0, int(duration_ms)) / 1000)
 
 
-def _today_key() -> str:
-    return datetime.now().astimezone().date().isoformat()
-
-
 def _format_mb(size_bytes: int) -> str:
     return f"{size_bytes / (1024 * 1024):.0f} МБ"
 
@@ -1835,12 +1871,10 @@ async def _reserve_daily_allowance(
         store.reserve_daily_usage,
         user_id=user_id,
         job_number=_job_number(job),
-        day_key=_today_key(),
         duration_ms=duration_ms,
         limit_ms=limit_ms,
     )
     job["quota_duration_ms"] = duration_ms
-    job["quota_day"] = _today_key()
     if accepted:
         job["daily_used_ms_after_enqueue"] = used_ms
         return True
@@ -1873,7 +1907,6 @@ async def _reserve_daily_allowance(
             store.reserve_daily_usage,
             user_id=user_id,
             job_number=_job_number(job),
-            day_key=_today_key(),
             duration_ms=remaining_ms,
             limit_ms=limit_ms,
         )
@@ -1895,12 +1928,18 @@ async def _reserve_daily_allowance(
         used_ms = used_after_trim_ms
         remaining_ms = max(0, limit_ms - used_ms)
 
+    free_at = await asyncio.to_thread(store.next_usage_free_at, user_id)
+    when_text = (
+        f"Часть лимита освободится {datetime.fromtimestamp(free_at).strftime('%H:%M %d.%m')}."
+        if free_at is not None
+        else "Лимит обновится в течение суток."
+    )
     await _safe_edit_status(
         status_message,
-        "Суточный лимит на сегодня уже израсходован.\n"
+        "Суточный лимит уже израсходован (считается скользящим окном за последние 24 часа).\n"
         f"Уровень: {level.name}. Лимит: {_format_duration_ms(limit_ms)}.\n"
-        f"Сегодня использовано: {_format_duration_ms(used_ms)}. Осталось: {_format_duration_ms(remaining_ms)}.\n"
-        "Новую задачу можно отправить после обновления лимита.",
+        f"Использовано: {_format_duration_ms(used_ms)}. Осталось: {_format_duration_ms(remaining_ms)}.\n"
+        f"{when_text}",
     )
     return False
 

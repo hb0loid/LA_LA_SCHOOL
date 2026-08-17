@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from laladub.bot import _reserve_daily_allowance, _today_key
+from laladub.bot import _reserve_daily_allowance
 from laladub.premium_store import PremiumStore
 from laladub.proposal_store import ProposalStore
 
@@ -35,7 +35,6 @@ class DailyQuotaTrimTests(unittest.IsolatedAsyncioTestCase):
             store.reserve_daily_usage(
                 user_id=123,
                 job_number="previous",
-                day_key=_today_key(),
                 duration_ms=30_000,
                 limit_ms=60_000,
             )
@@ -76,7 +75,7 @@ class DailyQuotaTrimTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(job["daily_original_duration_ms"], 120_000)
             self.assertEqual(job["daily_trimmed_duration_ms"], 30_000)
             self.assertEqual(job["quota_duration_ms"], 30_000)
-            self.assertEqual(store.daily_usage_ms(123, _today_key()), 60_000)
+            self.assertEqual(store.daily_usage_ms(123), 60_000)
             self.assertTrue(Path(job["input_path"]).is_file())
             trim_mock.assert_called_once()
             self.assertTrue(any("В работу пойдёт" in message for message in status.messages))
@@ -116,7 +115,7 @@ class PremiumQuotaTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(accepted)
             self.assertNotIn("daily_trimmed", job)
-            self.assertEqual(store.daily_usage_ms(123, _today_key()), 40 * 60 * 1000)
+            self.assertEqual(store.daily_usage_ms(123), 40 * 60 * 1000)
 
 
 if __name__ == "__main__":

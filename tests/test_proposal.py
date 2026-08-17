@@ -99,20 +99,56 @@ class ProposalStoreTests(unittest.TestCase):
 
     def test_daily_usage_is_atomic_and_idempotent(self) -> None:
         accepted, used = self.store.reserve_daily_usage(
-            user_id=123, job_number="1", day_key="2026-08-15", duration_ms=200_000, limit_ms=300_000
+            user_id=123, job_number="1", duration_ms=200_000, limit_ms=300_000
         )
         self.assertTrue(accepted)
         self.assertEqual(used, 200_000)
         accepted_again, used_again = self.store.reserve_daily_usage(
-            user_id=123, job_number="1", day_key="2026-08-15", duration_ms=200_000, limit_ms=300_000
+            user_id=123, job_number="1", duration_ms=200_000, limit_ms=300_000
         )
         self.assertTrue(accepted_again)
         self.assertEqual(used_again, 200_000)
         rejected, used_after = self.store.reserve_daily_usage(
-            user_id=123, job_number="2", day_key="2026-08-15", duration_ms=101_000, limit_ms=300_000
+            user_id=123, job_number="2", duration_ms=101_000, limit_ms=300_000
         )
         self.assertFalse(rejected)
         self.assertEqual(used_after, 200_000)
+
+    def test_daily_usage_is_a_rolling_24h_window_not_a_calendar_day(self) -> None:
+        day = 86400.0
+        now = 1_800_000_000.0
+        # Usage from just over 24h ago must not count anymore...
+        self.store.reserve_daily_usage(
+            user_id=1, job_number="old", duration_ms=250_000, limit_ms=300_000, now=now - day - 1
+        )
+        self.assertEqual(self.store.daily_usage_ms(1, now=now), 0)
+        self.assertIsNone(self.store.next_usage_free_at(1, now=now))
+        # ...but usage from just under 24h ago still does.
+        self.store.reserve_daily_usage(
+            user_id=2, job_number="recent", duration_ms=250_000, limit_ms=300_000, now=now - day + 1
+        )
+        self.assertEqual(self.store.daily_usage_ms(2, now=now), 250_000)
+        self.assertAlmostEqual(self.store.next_usage_free_at(2, now=now), now + 1, delta=1)
+        rejected, _used = self.store.reserve_daily_usage(
+            user_id=2, job_number="recent-2", duration_ms=60_000, limit_ms=300_000, now=now
+        )
+        self.assertFalse(rejected)
+        # Once that old usage ages out (at now + 1, i.e. 24h after it happened), the
+        # same request fits again.
+        accepted, used = self.store.reserve_daily_usage(
+            user_id=2, job_number="recent-2", duration_ms=60_000, limit_ms=300_000, now=now + 2
+        )
+        self.assertTrue(accepted)
+        self.assertEqual(used, 60_000)
+
+    def test_users_with_recent_usage(self) -> None:
+        day = 86400.0
+        now = 1_800_000_000.0
+        self.store.reserve_daily_usage(user_id=1, job_number="a", duration_ms=1_000, limit_ms=999_999, now=now)
+        self.store.reserve_daily_usage(
+            user_id=2, job_number="b", duration_ms=1_000, limit_ms=999_999, now=now - day - 10
+        )
+        self.assertEqual(self.store.users_with_recent_usage(now - day), [1])
 
 
 class ProposalUiTests(unittest.TestCase):

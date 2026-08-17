@@ -440,11 +440,16 @@ class ProposalStore:
         *,
         user_id: int,
         job_number: str,
-        day_key: str,
         duration_ms: int,
         limit_ms: int,
+        now: float | None = None,
     ) -> tuple[bool, int]:
+        """Rolling 24h quota: usage counts against the limit for exactly 24h after it
+        happened, then ages out on its own - there is no shared reset moment, each
+        user's window empties out at their own pace as their own old usage expires."""
         duration_ms = max(0, int(duration_ms))
+        now = time.time() if now is None else now
+        cutoff = now - 86400.0
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
@@ -452,8 +457,8 @@ class ProposalStore:
                 (user_id, job_number),
             ).fetchone()
             used_row = connection.execute(
-                "SELECT COALESCE(SUM(duration_ms), 0) AS used FROM daily_usage WHERE user_id = ? AND day_key = ?",
-                (user_id, day_key),
+                "SELECT COALESCE(SUM(duration_ms), 0) AS used FROM daily_usage WHERE user_id = ? AND created_at >= ?",
+                (user_id, cutoff),
             ).fetchone()
             used_ms = int(used_row["used"] or 0) if used_row is not None else 0
             if existing is not None:
@@ -462,17 +467,38 @@ class ProposalStore:
                 return False, used_ms
             connection.execute(
                 "INSERT INTO daily_usage(user_id, job_number, day_key, duration_ms, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, str(job_number), day_key, duration_ms, time.time()),
+                (user_id, str(job_number), time.strftime("%Y-%m-%d", time.localtime(now)), duration_ms, now),
             )
             return True, used_ms + duration_ms
 
-    def daily_usage_ms(self, user_id: int, day_key: str) -> int:
+    def daily_usage_ms(self, user_id: int, now: float | None = None) -> int:
+        now = time.time() if now is None else now
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT COALESCE(SUM(duration_ms), 0) AS used FROM daily_usage WHERE user_id = ? AND day_key = ?",
-                (user_id, day_key),
+                "SELECT COALESCE(SUM(duration_ms), 0) AS used FROM daily_usage WHERE user_id = ? AND created_at >= ?",
+                (user_id, now - 86400.0),
             ).fetchone()
         return int(row["used"] or 0) if row is not None else 0
+
+    def next_usage_free_at(self, user_id: int, now: float | None = None) -> float | None:
+        """When the oldest usage still counted against the rolling window will age out
+        (freeing up whatever it was holding). None if the user has no usage in-window."""
+        now = time.time() if now is None else now
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT MIN(created_at) AS oldest FROM daily_usage WHERE user_id = ? AND created_at >= ?",
+                (user_id, now - 86400.0),
+            ).fetchone()
+        oldest = row["oldest"] if row is not None else None
+        return float(oldest) + 86400.0 if oldest is not None else None
+
+    def users_with_recent_usage(self, cutoff: float) -> list[int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT user_id FROM daily_usage WHERE created_at >= ?",
+                (cutoff,),
+            ).fetchall()
+        return [int(row["user_id"]) for row in rows]
 
     def release_daily_usage(self, user_id: int, job_number: str) -> None:
         with self._connect() as connection:
