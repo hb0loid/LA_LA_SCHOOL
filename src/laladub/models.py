@@ -80,6 +80,11 @@ class DubConfig:
     translator: str = "identity"
     libretranslate_url: str = "http://127.0.0.1:5000/translate"
     libretranslate_api_key: str | None = None
+    llm_base_url: str = "http://127.0.0.1:1234/v1"
+    llm_api_key: str | None = None
+    llm_model: str = "openai/gpt-oss-20b"
+    llm_temperature: float = 0.9
+    llm_timeout_seconds: int = 180
     tts: str = "sapi"
     voice: str | None = None
     sapi_rate: int = 0

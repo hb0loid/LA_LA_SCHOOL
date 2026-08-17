@@ -37,6 +37,9 @@ def translate_segments(segments: list[Segment], config: DubConfig) -> list[Segme
     if provider == "libretranslate":
         return _translate_libretranslate(segments, config)
 
+    if provider == "llm":
+        return _translate_llm(segments, config)
+
     raise TranslationError(f"Unknown translator provider: {config.translator}")
 
 
@@ -63,6 +66,9 @@ def translate_text(text: str, source_lang: str, target_lang: str, config: DubCon
 
     if provider == "libretranslate":
         return _translate_libretranslate_text(text, source_lang, target_lang, config)
+
+    if provider == "llm":
+        return _translate_llm_texts([text], target_lang, config)[0]
 
     raise TranslationError(f"Unknown translator provider: {config.translator}")
 
@@ -411,6 +417,135 @@ def _translate_libretranslate_text(
         return _postprocess_translated_text(data["translatedText"], target_lang)
     except KeyError as exc:
         raise TranslationError(f"Unexpected LibreTranslate response: {data}") from exc
+
+
+def _translate_llm(segments: list[Segment], config: DubConfig) -> list[Segment]:
+    texts = [segment.text.strip() for segment in segments]
+    translated = _translate_llm_texts(texts, config.target_lang, config)
+    for segment, text in zip(segments, translated):
+        segment.translated_text = _postprocess_translated_text(text, config.target_lang)
+    return segments
+
+
+def _translate_llm_texts(texts: list[str], target_lang: str, config: DubConfig) -> list[str]:
+    if not texts:
+        return []
+
+    numbered = "\n".join(f"{index + 1}. {text}" for index, text in enumerate(texts))
+    system_prompt = (
+        "You are dubbing a video into "
+        f"{target_lang}. You will receive a numbered list of rough, possibly mis-heard or "
+        "nonsensical speech-to-text transcript lines. Rewrite them as one natural, fluent "
+        f"{target_lang} narration. If a line is unclear or meaningless on its own, improvise "
+        "something that flows naturally with the lines around it rather than leaving it "
+        "broken, blank, or translated word-for-word. Some lines may be boilerplate "
+        "hallucinated by imperfect speech-to-text rather than real speech - subtitle credits, "
+        "requests to subscribe to a channel, 'thanks for watching', channel/website names. "
+        "Treat these exactly like any other unclear line: rewrite them naturally in your own "
+        "words as part of the flow instead of preserving them literally, dropping them, or "
+        "using a fixed template.\n"
+        "Every input line, even ones that look identical or near-identical to another line "
+        "(e.g. a repeated jingle or catchphrase), corresponds to a separate moment in the "
+        "video and MUST get its own output line - never merge, skip, or collapse repeated "
+        "lines into fewer lines. You may (and should) still vary the wording between repeats "
+        "so they don't sound robotic.\n"
+        "Reply with strict JSON only, no commentary, no markdown fences, one object per input "
+        'line, tagging each with its original line number: {"lines": [{"i": 1, "text": '
+        '"..."}, {"i": 2, "text": "..."}]}'
+    )
+    payload = {
+        "model": config.llm_model,
+        "temperature": max(0.0, min(2.0, config.llm_temperature)),
+        "max_tokens": min(16000, max(2000, len(texts) * 120)),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": numbered},
+        ],
+    }
+    headers = {"Content-Type": "application/json"}
+    if config.llm_api_key:
+        headers["Authorization"] = f"Bearer {config.llm_api_key}"
+
+    request = urllib.request.Request(
+        f"{config.llm_base_url.rstrip('/')}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=config.llm_timeout_seconds) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise TranslationError(f"Unexpected LLM response: {data!r}") from exc
+
+    by_index = _extract_llm_indexed_lines(content)
+    result: list[str] = []
+    missing = 0
+    for position, original in enumerate(texts, start=1):
+        text = by_index.get(position)
+        if text:
+            result.append(text)
+        else:
+            missing += 1
+            result.append(original)
+    if missing:
+        print(f"      LLM translation: {missing}/{len(texts)} lines missing from response, kept original text")
+    return result
+
+
+def _extract_llm_indexed_lines(content: str) -> dict[int, str]:
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    if not match:
+        return {}
+    blob = match.group(0)
+
+    try:
+        parsed = json.loads(blob)
+        items = parsed.get("lines")
+        if isinstance(items, list) and items:
+            return _index_llm_line_items(items)
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    # Small local models sometimes emit near-JSON with a stray ":" instead of
+    # "," between object separators on long outputs. Salvage by pulling every
+    # {"i": N, "text": "..."} shaped object out with a regex instead of
+    # giving up on the whole response.
+    key_match = re.search(r'"lines"\s*:\s*\[', blob)
+    search_area = blob[key_match.end():] if key_match else blob
+    pairs = re.findall(
+        r'"i"\s*:\s*(\d+)\s*,\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"',
+        search_area,
+    )
+    return {
+        int(index): _unescape_json_fragment(text)
+        for index, text in pairs
+        if _unescape_json_fragment(text)
+    }
+
+
+def _index_llm_line_items(items: list) -> dict[int, str]:
+    result: dict[int, str] = {}
+    for position, item in enumerate(items, start=1):
+        if isinstance(item, dict):
+            index = item.get("i")
+            text = str(item.get("text", "")).strip()
+            try:
+                index = int(index)
+            except (TypeError, ValueError):
+                index = position
+        else:
+            index = position
+            text = str(item).strip()
+        if text:
+            result[index] = text
+    return result
+
+
+def _unescape_json_fragment(value: str) -> str:
+    return value.replace('\\"', '"').replace("\\n", " ").replace("\\t", " ").replace("\\\\", "\\").strip()
 
 
 _VI_SUBSCRIBE_RE = re.compile(

@@ -34,6 +34,11 @@ def main(argv: list[str] | None = None) -> None:
             translator=args.translator,
             libretranslate_url=args.libretranslate_url,
             libretranslate_api_key=args.libretranslate_api_key,
+            llm_base_url=args.llm_base_url,
+            llm_api_key=args.llm_api_key,
+            llm_model=args.llm_model,
+            llm_temperature=args.llm_temperature,
+            llm_timeout_seconds=args.llm_timeout_seconds,
             tts=args.tts,
             voice=args.voice,
             sapi_rate=args.sapi_rate,
@@ -139,11 +144,17 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument(
         "--translator",
         default="identity",
-        choices=["identity", "hybrid", "googleweb", "mymemory", "argos", "libretranslate"],
-        help="Translation provider.",
+        choices=["identity", "hybrid", "googleweb", "mymemory", "argos", "libretranslate", "llm"],
+        help="Translation provider. llm sends the whole transcript to an OpenAI-compatible "
+        "chat completions endpoint (local LM Studio/Ollama, OpenAI, DeepSeek, ...) in one pass.",
     )
     dub.add_argument("--libretranslate-url", default="http://127.0.0.1:5000/translate")
     dub.add_argument("--libretranslate-api-key", default=None)
+    dub.add_argument("--llm-base-url", default="http://127.0.0.1:1234/v1", help="OpenAI-compatible API base URL.")
+    dub.add_argument("--llm-api-key", default=None, help="API key, if the endpoint needs one.")
+    dub.add_argument("--llm-model", default="openai/gpt-oss-20b", help="Model name/id to request.")
+    dub.add_argument("--llm-temperature", type=float, default=0.9, help="Sampling temperature.")
+    dub.add_argument("--llm-timeout-seconds", type=int, default=180)
     dub.add_argument(
         "--tts",
         default="sapi",
