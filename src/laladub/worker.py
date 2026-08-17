@@ -417,14 +417,41 @@ def _remote_update_available(client: CoordinatorClient) -> bool:
     return bool(local_build and remote_build != local_build)
 
 
+def _local_version_candidates() -> list[Path]:
+    """Where worker_version.json can live.
+
+    The launcher chdirs to the worker root, so the plain relative path normally
+    works, but a worker started any other way would silently read nothing - and
+    an unknown local build disables updating entirely. Fall back to the package
+    root, which is where the build actually writes the file.
+    """
+    candidates = [LOCAL_VERSION_PATH]
+    package_root = Path(__file__).resolve().parents[2]
+    fallback = package_root / LOCAL_VERSION_PATH.name
+    if fallback != LOCAL_VERSION_PATH.resolve():
+        candidates.append(fallback)
+    return candidates
+
+
 def _local_build_id() -> str:
-    try:
-        data = json.loads(LOCAL_VERSION_PATH.read_text(encoding="utf-8-sig"))
-    except Exception:
-        return ""
-    if not isinstance(data, dict):
-        return ""
-    return str(data.get("build_id") or data.get("sha256") or "").strip()
+    for path in _local_version_candidates():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        build_id = str(data.get("build_id") or data.get("sha256") or "").strip()
+        if build_id:
+            return build_id
+    # Staying quiet here is what let a stalled worker keep running old code
+    # unnoticed: no local build means the update check below always says no.
+    print(
+        "Worker build id is unknown (worker_version.json missing or unreadable); "
+        "auto-update cannot run until it is restored.",
+        flush=True,
+    )
+    return ""
 
 
 def _default_worker_id() -> str:
