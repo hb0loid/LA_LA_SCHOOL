@@ -150,6 +150,7 @@ $env:LALADUB_ADMIN_USERS_FILE = (Join-Path $Root "admins.txt")
 $env:LALADUB_BOT_WORKDIR = $WorkDir
 $env:LALADUB_PROPOSAL_ENABLED = "1"
 $env:LALADUB_PROPOSAL_DB = (Join-Path $Root "runs\proposal\proposals.sqlite3")
+$env:LALADUB_PAYSUPPORT_CONTACT = "пиши @hboloid"
 $env:LALADUB_EXECUTOR_MODE = "hybrid"
 $env:LALADUB_MAX_LOCAL_JOBS = "1"
 $env:LALADUB_WORKER_API_HOST = "0.0.0.0"
