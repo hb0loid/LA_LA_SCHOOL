@@ -169,12 +169,13 @@ async def _deliver_for_moderator(application: Any, moderator_id: int) -> int:
 
 
 async def _send_moderation_video(bot: Any, moderator_id: int, submission: Submission) -> Any:
-    from .bot import _telegram_sendable_video_path
+    from .bot import _telegram_sendable_video_path, video_upload_metadata
 
     video_path = Path(submission.video_path)
     if not video_path.is_file():
         raise FileNotFoundError(video_path)
     send_path = await _telegram_sendable_video_path(video_path)
+    metadata = await video_upload_metadata(send_path)
     with send_path.open("rb") as file_obj:
         return await bot.send_video(
             chat_id=moderator_id,
@@ -188,6 +189,7 @@ async def _send_moderation_video(bot: Any, moderator_id: int, submission: Submis
             write_timeout=300,
             connect_timeout=60,
             pool_timeout=60,
+            **metadata,
         )
 
 
@@ -394,12 +396,13 @@ def _level_up_message(before_milli: int, after_milli: int) -> str | None:
 
 
 async def _publish_to_channel(bot: Any, target_chat: str, submission: Submission) -> Any:
-    from .bot import _telegram_sendable_video_path
+    from .bot import _telegram_sendable_video_path, video_upload_metadata
 
     video_path = Path(submission.video_path)
     if not video_path.is_file():
         raise FileNotFoundError(video_path)
     send_path = await _telegram_sendable_video_path(video_path)
+    metadata = await video_upload_metadata(send_path)
     with send_path.open("rb") as file_obj:
         return await bot.send_video(
             chat_id=target_chat,
@@ -412,6 +415,7 @@ async def _publish_to_channel(bot: Any, target_chat: str, submission: Submission
             write_timeout=300,
             connect_timeout=60,
             pool_timeout=60,
+            **metadata,
         )
 
 

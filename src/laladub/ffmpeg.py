@@ -64,6 +64,39 @@ def probe_duration(path: Path) -> float:
     raise ToolError(f"Could not determine media duration: {path}")
 
 
+def probe_video_dimensions(path: Path) -> tuple[int, int] | None:
+    """Frame size of the first video stream, or None when it cannot be read."""
+    ffprobe = require_tool("ffprobe")
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        streams = json.loads(result.stdout).get("streams") or []
+    except Exception:
+        return None
+    if not streams:
+        return None
+    width = streams[0].get("width")
+    height = streams[0].get("height")
+    if not width or not height:
+        return None
+    return int(width), int(height)
+
+
 def has_video_stream(path: Path) -> bool:
     ffprobe = require_tool("ffprobe")
     try:

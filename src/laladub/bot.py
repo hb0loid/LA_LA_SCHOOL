@@ -20,7 +20,13 @@ from typing import Any
 
 from .bot_config import BotSettings, load_bot_settings
 from .download import download_video_url, extract_url, has_video_and_audio
-from .ffmpeg import compress_video_for_telegram, make_audio_visual_video, probe_duration, trim_video
+from .ffmpeg import (
+    compress_video_for_telegram,
+    make_audio_visual_video,
+    probe_duration,
+    probe_video_dimensions,
+    trim_video,
+)
 from .karma import KARMA_SCALE, PREMIUM_LEVEL, KarmaLevel, level_for_karma, next_level_for_karma, visible_karma
 from .asr import clear_openai_whisper_cache
 from .models import DubConfig
@@ -4211,6 +4217,27 @@ async def _send_video_file(
         await _send_video_file_once(bot, chat_id, retry_path, filename, caption=caption, reply_markup=reply_markup)
 
 
+async def video_upload_metadata(video_path: Path) -> dict[str, Any]:
+    """Duration and frame size to state when uploading a video.
+
+    Telegram shows a video's length from what the upload declares, not by
+    reading the file, so leaving these out makes every clip show 00:00 in
+    chats and media galleries however well-formed the file is. Probing failures
+    are not worth failing a send over - the upload just goes without them.
+    """
+    metadata: dict[str, Any] = {}
+    try:
+        duration = await asyncio.to_thread(probe_duration, video_path)
+        if duration > 0:
+            metadata["duration"] = int(round(duration))
+    except Exception as exc:
+        print(f"Video duration probe failed for {video_path.name}: {type(exc).__name__}: {exc}", flush=True)
+    dimensions = await asyncio.to_thread(probe_video_dimensions, video_path)
+    if dimensions is not None:
+        metadata["width"], metadata["height"] = dimensions
+    return metadata
+
+
 async def _send_video_file_once(
     bot: Any,
     chat_id: int | str,
@@ -4220,6 +4247,7 @@ async def _send_video_file_once(
     caption: str | None = None,
     reply_markup: Any = None,
 ) -> None:
+    metadata = await video_upload_metadata(video_path)
     with video_path.open("rb") as file_obj:
         await bot.send_video(
             chat_id=chat_id,
@@ -4232,6 +4260,7 @@ async def _send_video_file_once(
             write_timeout=300,
             connect_timeout=60,
             pool_timeout=60,
+            **metadata,
         )
 
 
