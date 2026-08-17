@@ -540,10 +540,51 @@ def _transcript_text_for_submission(submission: Submission) -> str | None:
     return text or None
 
 
+def _find_submission_original_video(submission: Submission) -> Path | None:
+    """The source video the dub was made from, as downloaded into the job folder."""
+    job_dir = Path(submission.video_path).parent
+    for candidate in sorted(job_dir.glob("input.*")):
+        if (
+            candidate.suffix.lower() in {".mp4", ".mkv", ".mov", ".webm"}
+            and candidate.is_file()
+            and candidate.stat().st_size > 1024
+        ):
+            return candidate
+    return None
+
+
+async def _reply_with_original_video(context: Any, message: Any, submission: Submission) -> None:
+    from .bot import _telegram_sendable_video_path, video_upload_metadata
+
+    original = _find_submission_original_video(submission)
+    if original is None:
+        return
+    send_path = await _telegram_sendable_video_path(original)
+    metadata = await video_upload_metadata(send_path)
+    with send_path.open("rb") as file_obj:
+        await context.bot.send_video(
+            chat_id=message.chat_id,
+            video=file_obj,
+            filename=f"work_{submission.job_number}_original{send_path.suffix}",
+            caption="Оригинал",
+            reply_to_message_id=message.message_id,
+            supports_streaming=True,
+            read_timeout=300,
+            write_timeout=300,
+            connect_timeout=60,
+            pool_timeout=60,
+            **metadata,
+        )
+
+
 async def comment_on_channel_forward(update: Any, context: Any) -> None:
     """Telegram auto-forwards every channel post into its linked Discussion Group as a
-    new message; this catches that forward and replies to it with the transcript,
-    which is how a bot "comments" on a channel post - there's no dedicated API for it."""
+    new message; this catches that forward and replies under it, which is how a bot
+    "comments" on a channel post - there is no dedicated API for it.
+
+    Posts the untranslated source video first and the transcript below it. The dub
+    itself is not repeated here: it is already the channel post these replies hang off.
+    """
     message = update.effective_message
     if message is None or not message.is_automatic_forward:
         return
@@ -557,17 +598,34 @@ async def comment_on_channel_forward(update: Any, context: Any) -> None:
     )
     if submission is None:
         return
+
     text = _transcript_text_for_submission(submission)
-    if not text:
+    has_original = _find_submission_original_video(submission) is not None
+    if not text and not has_original:
         return
     if not await asyncio.to_thread(store.mark_comment_posted, submission.id):
         return
-    if len(text) > 4000:
-        text = text[:4000] + "…"
-    try:
-        await context.bot.send_message(chat_id=message.chat_id, text=text, reply_to_message_id=message.message_id)
-    except Exception as exc:
-        print(f"Comment post failed for submission {submission.id}: {type(exc).__name__}: {exc}", flush=True)
+
+    # Each reply is sent on its own: a missing original should not cost us the
+    # transcript, and a transcript that will not send should not hide the video.
+    if has_original:
+        try:
+            await _reply_with_original_video(context, message, submission)
+        except Exception as exc:
+            print(
+                f"Original video comment failed for submission {submission.id}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+    if text:
+        if len(text) > 4000:
+            text = text[:4000] + "…"
+        try:
+            await context.bot.send_message(
+                chat_id=message.chat_id, text=text, reply_to_message_id=message.message_id
+            )
+        except Exception as exc:
+            print(f"Comment post failed for submission {submission.id}: {type(exc).__name__}: {exc}", flush=True)
 
 
 def _parse_ids(raw: str) -> set[int]:

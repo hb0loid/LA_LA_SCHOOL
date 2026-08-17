@@ -14,6 +14,7 @@ from laladub.karma import (
 )
 from laladub.proposal_bot import (
     _author_caption,
+    _find_submission_original_video,
     _find_submission_subtitles,
     _karma_tag,
     _level_up_message,
@@ -462,10 +463,10 @@ class CommentOnChannelForwardTests(unittest.IsolatedAsyncioTestCase):
         )
         return updated
 
-    def _context(self, send_spy: _SendMessageSpy) -> SimpleNamespace:
+    def _context(self, send_spy: _SendMessageSpy, video_spy: _SendMessageSpy | None = None) -> SimpleNamespace:
         return SimpleNamespace(
             application=SimpleNamespace(bot_data={"store": self.store}),
-            bot=SimpleNamespace(send_message=send_spy),
+            bot=SimpleNamespace(send_message=send_spy, send_video=video_spy or _SendMessageSpy()),
         )
 
     async def test_ignores_non_automatic_forward_messages(self) -> None:
@@ -531,6 +532,99 @@ class CommentOnChannelForwardTests(unittest.IsolatedAsyncioTestCase):
             second_spy = _SendMessageSpy()
             await comment_on_channel_forward(update, self._context(second_spy))
             self.assertEqual(second_spy.calls, [])
+
+    def _forward_update(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            effective_message=SimpleNamespace(
+                is_automatic_forward=True,
+                forward_origin=SimpleNamespace(chat=SimpleNamespace(id=-1001), message_id=55),
+                chat_id=-2002,
+                message_id=7,
+            )
+        )
+
+    async def test_posts_the_original_video_alongside_the_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as job_tempdir:
+            job_dir = Path(job_tempdir)
+            (job_dir / "video_transcript_lalaschool.txt").write_text("Привет мир", encoding="utf-8")
+            (job_dir / "input.mp4").write_bytes(b"x" * 4096)
+            self._publish(job_dir=job_dir)
+
+            send_spy, video_spy = _SendMessageSpy(), _SendMessageSpy()
+            await comment_on_channel_forward(self._forward_update(), self._context(send_spy, video_spy))
+
+            # The dub is the channel post itself, so only the source goes below it.
+            self.assertEqual(len(video_spy.calls), 1)
+            video_call = video_spy.calls[0]
+            self.assertEqual(video_call["chat_id"], -2002)
+            self.assertEqual(video_call["reply_to_message_id"], 7)
+            self.assertEqual(video_call["caption"], "Оригинал")
+            self.assertEqual(len(send_spy.calls), 1)
+
+    async def test_posts_the_transcript_even_when_no_original_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as job_tempdir:
+            job_dir = Path(job_tempdir)
+            (job_dir / "video_transcript_lalaschool.txt").write_text("Привет мир", encoding="utf-8")
+            self._publish(job_dir=job_dir)
+
+            send_spy, video_spy = _SendMessageSpy(), _SendMessageSpy()
+            await comment_on_channel_forward(self._forward_update(), self._context(send_spy, video_spy))
+
+            self.assertEqual(video_spy.calls, [])
+            self.assertEqual(len(send_spy.calls), 1)
+
+    async def test_posts_the_original_even_when_no_transcript_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as job_tempdir:
+            job_dir = Path(job_tempdir)
+            (job_dir / "input.mp4").write_bytes(b"x" * 4096)
+            self._publish(job_dir=job_dir)
+
+            send_spy, video_spy = _SendMessageSpy(), _SendMessageSpy()
+            await comment_on_channel_forward(self._forward_update(), self._context(send_spy, video_spy))
+
+            self.assertEqual(len(video_spy.calls), 1)
+            self.assertEqual(send_spy.calls, [])
+
+
+class FindOriginalVideoTests(unittest.TestCase):
+    def _submission(self, job_dir: Path) -> Submission:
+        return Submission(
+            id=1,
+            job_number="2",
+            user_id=123,
+            chat_id=123,
+            author_name="Тест",
+            author_username=None,
+            video_path=str(job_dir / "dubbed.mp4"),
+            output_filename="dubbed.mp4",
+            status="published",
+            destination="main",
+            karma_milli=0,
+            karma_before_milli=0,
+            duration_ms=0,
+            publication_chat_id=-1001,
+            publication_message_id=55,
+            created_at=0,
+            updated_at=0,
+        )
+
+    def test_finds_the_downloaded_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            job_dir = Path(tempdir)
+            original = job_dir / "input.mp4"
+            original.write_bytes(b"x" * 4096)
+            self.assertEqual(_find_submission_original_video(self._submission(job_dir)), original)
+
+    def test_ignores_the_trimmed_and_audio_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            job_dir = Path(tempdir)
+            (job_dir / "input_daily_trimmed.mp4").write_bytes(b"x" * 4096)
+            (job_dir / "input_audio.mp3").write_bytes(b"x" * 4096)
+            self.assertIsNone(_find_submission_original_video(self._submission(job_dir)))
+
+    def test_returns_none_when_the_source_is_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            self.assertIsNone(_find_submission_original_video(self._submission(Path(tempdir))))
 
 
 if __name__ == "__main__":
