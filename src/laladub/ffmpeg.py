@@ -517,8 +517,11 @@ def compress_video_for_telegram(
             str(input_path),
             "-map",
             "0:v:0",
+            # Every audio stream, not just the first: a multitrack dub carries the
+            # original alongside it, and mapping 0:a:0 alone silently threw that
+            # second track away for any video large enough to need compressing.
             "-map",
-            "0:a:0?",
+            "0:a?",
             "-vf",
             f"scale=w='if(gt(iw,{max_width}),{max_width},iw)':h=-2",
             "-c:v",
@@ -982,14 +985,19 @@ def combine_video_audio_multitrack(
     dub_path: Path,
     output_path: Path,
     dub_volume: float,
+    bed_volume: float = 1.0,
     bed_path: Path | None = None,
     original_lang: str | None = None,
     dub_lang: str | None = None,
 ) -> None:
     """Mux video with two separate audio streams instead of pre-mixing them:
-    the untouched original audio and the dub (optionally laid over the
-    instrumental bed). A player can then switch tracks instead of only ever
-    hearing one fixed mix.
+    the dub (optionally laid over the instrumental bed) and the untouched
+    original. A player can then switch tracks instead of only ever hearing one
+    fixed mix.
+
+    The dub track is built exactly as the single-track mux builds it, bed volume
+    included, so switching this on does not change how the video sounds by
+    default - it only adds the original alongside.
     """
     ffmpeg = require_tool("ffmpeg")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -999,7 +1007,8 @@ def combine_video_audio_multitrack(
         cmd.extend(["-i", str(bed_path)])
         filter_complex = (
             f"[2:a]volume={dub_volume:.3f}[dubv];"
-            "[3:a][dubv]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+            f"[3:a]volume={bed_volume:.3f}[bed];"
+            "[bed][dubv]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
             "alimiter=limit=0.95[dubout]"
         )
     else:
@@ -1011,27 +1020,31 @@ def combine_video_audio_multitrack(
             filter_complex,
             "-map",
             "0:v:0",
-            "-map",
-            "1:a:0",
+            # The dub goes first on purpose. Players that ignore the default
+            # disposition and simply take the first audio stream - Telegram's own
+            # viewer among the likely ones - must still get the dub, not the
+            # untranslated original.
             "-map",
             "[dubout]",
+            "-map",
+            "1:a:0",
             "-c:v",
             "copy",
             "-c:a",
             "aac",
             "-shortest",
             "-metadata:s:a:0",
-            f"language={mp4_language_tag(original_lang)}",
-            "-metadata:s:a:0",
-            "title=Original",
-            "-metadata:s:a:1",
             f"language={mp4_language_tag(dub_lang)}",
-            "-metadata:s:a:1",
+            "-metadata:s:a:0",
             "title=Dub",
+            "-metadata:s:a:1",
+            f"language={mp4_language_tag(original_lang)}",
+            "-metadata:s:a:1",
+            "title=Original",
             "-disposition:a:0",
-            "0",
-            "-disposition:a:1",
             "default",
+            "-disposition:a:1",
+            "0",
             str(output_path),
         ]
     )

@@ -1217,6 +1217,7 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
             dub_path=dub_track,
             output_path=config.output,
             dub_volume=config.dub_volume,
+            bed_volume=final_original_volume,
             bed_path=bed_path,
             original_lang=config.source_lang,
             dub_lang=config.target_lang,
