@@ -624,6 +624,14 @@ def extract_wav_slice(
 ) -> None:
     ffmpeg = require_tool("ffmpeg")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    effective_duration = max(0.15, duration)
+    # A hard -ss/-t cut lands mid-waveform on both edges (confirmed: real
+    # slices start/end tens of percent off zero amplitude), which is an
+    # audible click on every reference clip and artifact chunk. A short
+    # fade removes it without touching alignment or duration.
+    fade_seconds = min(0.015, effective_duration / 4)
+    fade_out_start = max(0.0, effective_duration - fade_seconds)
+    audio_filter = f"afade=t=in:st=0:d={fade_seconds:.4f},afade=t=out:st={fade_out_start:.4f}:d={fade_seconds:.4f}"
     run(
         [
             ffmpeg,
@@ -631,10 +639,12 @@ def extract_wav_slice(
             "-ss",
             f"{max(0.0, start):.3f}",
             "-t",
-            f"{max(0.15, duration):.3f}",
+            f"{effective_duration:.3f}",
             "-i",
             str(input_path),
             "-vn",
+            "-af",
+            audio_filter,
             "-ac",
             "1",
             "-ar",
