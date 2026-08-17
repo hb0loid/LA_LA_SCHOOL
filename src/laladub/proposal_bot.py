@@ -483,6 +483,7 @@ def _moderation_caption(submission: Submission) -> str:
         f"<b>Предложка №{submission.id}</b>",
         f"Работа №{html.escape(submission.job_number)}",
         _author_caption(submission),
+        f"Карма на момент отправки: {visible_karma(submission.karma_before_milli)}",
         f"Статус: {status_labels.get(submission.status, html.escape(submission.status))}",
     ]
     if submission.destination:
@@ -503,8 +504,8 @@ def _author_caption(submission: Submission) -> str:
 def _find_submission_subtitles(submission: Submission) -> Path | None:
     job_dir = Path(submission.video_path).parent
     candidates = [
-        job_dir / "work" / "translated.srt",
         *sorted(job_dir.glob("*_transcript_lalaschool.txt")),
+        job_dir / "work" / "translated.srt",
     ]
     work_dir = job_dir / "work"
     if work_dir.is_dir():

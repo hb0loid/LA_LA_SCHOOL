@@ -21,6 +21,7 @@ class Submission:
     status: str
     destination: str | None
     karma_milli: int
+    karma_before_milli: int
     duration_ms: int
     publication_chat_id: int | None
     publication_message_id: int | None
@@ -63,6 +64,7 @@ class ProposalStore:
                     status TEXT NOT NULL DEFAULT 'pending',
                     destination TEXT,
                     karma_award INTEGER NOT NULL DEFAULT 0,
+                    karma_before_milli INTEGER NOT NULL DEFAULT 0,
                     duration_ms INTEGER NOT NULL DEFAULT 0,
                     publication_chat_id INTEGER,
                     publication_message_id INTEGER,
@@ -133,6 +135,10 @@ class ProposalStore:
             columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(submissions)")}
             if "duration_ms" not in columns:
                 connection.execute("ALTER TABLE submissions ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0")
+            if "karma_before_milli" not in columns:
+                connection.execute(
+                    "ALTER TABLE submissions ADD COLUMN karma_before_milli INTEGER NOT NULL DEFAULT 0"
+                )
             migrated = connection.execute(
                 "SELECT value FROM store_metadata WHERE key = 'karma_milli_v1'"
             ).fetchone()
@@ -156,6 +162,7 @@ class ProposalStore:
         video_path: Path,
         output_filename: str,
         duration_ms: int = 0,
+        karma_before_milli: int = 0,
     ) -> tuple[Submission, bool]:
         now = time.time()
         with self._connect() as connection:
@@ -163,8 +170,8 @@ class ProposalStore:
                 """
                 INSERT OR IGNORE INTO submissions (
                     job_number, user_id, chat_id, author_name, author_username,
-                    video_path, output_filename, duration_ms, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    video_path, output_filename, duration_ms, karma_before_milli, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_number,
@@ -175,6 +182,7 @@ class ProposalStore:
                     str(video_path),
                     output_filename,
                     max(0, int(duration_ms)),
+                    int(karma_before_milli),
                     now,
                     now,
                 ),
@@ -559,6 +567,7 @@ def _submission_from_row(row: sqlite3.Row) -> Submission:
         status=str(row["status"]),
         destination=str(row["destination"]) if row["destination"] else None,
         karma_milli=int(row["karma_award"] or 0),
+        karma_before_milli=int(row["karma_before_milli"] or 0),
         duration_ms=int(row["duration_ms"] or 0),
         publication_chat_id=int(row["publication_chat_id"]) if row["publication_chat_id"] is not None else None,
         publication_message_id=(

@@ -1241,6 +1241,7 @@ async def _create_proposal_submission(
     author_username = str(getattr(user, "username", "") or "").strip() or None
     duration_ms = max(0, round(await asyncio.to_thread(probe_duration, video_path) * 1000))
     store: ProposalStore = context.application.bot_data["proposal_store"]
+    karma_before_milli = await asyncio.to_thread(store.karma_total, user.id)
     return await asyncio.to_thread(
         store.create_submission,
         job_number=job_number,
@@ -1251,6 +1252,7 @@ async def _create_proposal_submission(
         video_path=video_path,
         output_filename=output_filename,
         duration_ms=duration_ms,
+        karma_before_milli=karma_before_milli,
     )
 
 

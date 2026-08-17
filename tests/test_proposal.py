@@ -80,6 +80,35 @@ class ProposalStoreTests(unittest.TestCase):
         self.assertEqual(self.store.karma_summary(123), (4_000, 2))
         self.assertEqual(self.store.karma_users(), [123])
 
+    def test_karma_before_milli_is_captured_once_at_first_submission(self) -> None:
+        submission, created = self.store.create_submission(
+            job_number="1",
+            user_id=123,
+            chat_id=123,
+            author_name="Тест",
+            author_username=None,
+            video_path=Path("video.mp4"),
+            output_filename="video.mp4",
+            karma_before_milli=6_000,
+        )
+        self.assertTrue(created)
+        self.assertEqual(submission.karma_before_milli, 6_000)
+
+        # Resubmitting the same job_number/user_id updates other fields but
+        # must not overwrite the karma snapshot from the original submission.
+        duplicate, created_again = self.store.create_submission(
+            job_number="1",
+            user_id=123,
+            chat_id=123,
+            author_name="Тест",
+            author_username=None,
+            video_path=Path("video.mp4"),
+            output_filename="video.mp4",
+            karma_before_milli=9_000,
+        )
+        self.assertFalse(created_again)
+        self.assertEqual(duplicate.karma_before_milli, 6_000)
+
     def test_author_message_outbox(self) -> None:
         submission, _created = self.store.create_submission(
             job_number="1",
@@ -184,6 +213,7 @@ class ProposalUiTests(unittest.TestCase):
             status="pending",
             destination=None,
             karma_milli=0,
+            karma_before_milli=0,
             duration_ms=0,
             publication_chat_id=None,
             publication_message_id=None,
@@ -205,31 +235,48 @@ class ProposalUiTests(unittest.TestCase):
             ],
         )
 
-    def test_subtitle_button_prefers_translated_srt(self) -> None:
+    def _make_submission_for_subtitles(self, job_dir: Path) -> Submission:
+        return Submission(
+            id=1,
+            job_number="2",
+            user_id=123,
+            chat_id=123,
+            author_name="Тест",
+            author_username=None,
+            video_path=str(job_dir / "dubbed.mp4"),
+            output_filename="dubbed.mp4",
+            status="pending",
+            destination=None,
+            karma_milli=0,
+            karma_before_milli=0,
+            duration_ms=0,
+            publication_chat_id=None,
+            publication_message_id=None,
+            created_at=0,
+            updated_at=0,
+        )
+
+    def test_subtitle_button_prefers_plain_text_transcript_over_srt(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            job_dir = Path(tempdir)
+            work_dir = job_dir / "work"
+            work_dir.mkdir()
+            (work_dir / "translated.srt").write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nТест\n", encoding="utf-8"
+            )
+            transcript = job_dir / "video_transcript_lalaschool.txt"
+            transcript.write_text("Тест\n", encoding="utf-8")
+            submission = self._make_submission_for_subtitles(job_dir)
+            self.assertEqual(_find_submission_subtitles(submission), transcript)
+
+    def test_subtitle_button_falls_back_to_srt_when_no_transcript_txt(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             job_dir = Path(tempdir)
             work_dir = job_dir / "work"
             work_dir.mkdir()
             translated = work_dir / "translated.srt"
             translated.write_text("1\n00:00:00,000 --> 00:00:01,000\nТест\n", encoding="utf-8")
-            submission = Submission(
-                id=1,
-                job_number="2",
-                user_id=123,
-                chat_id=123,
-                author_name="Тест",
-                author_username=None,
-                video_path=str(job_dir / "dubbed.mp4"),
-                output_filename="dubbed.mp4",
-                status="pending",
-                destination=None,
-                karma_milli=0,
-                duration_ms=0,
-                publication_chat_id=None,
-                publication_message_id=None,
-                created_at=0,
-                updated_at=0,
-            )
+            submission = self._make_submission_for_subtitles(job_dir)
             self.assertEqual(_find_submission_subtitles(submission), translated)
 
     def test_published_caption_is_marked_with_check(self) -> None:
@@ -245,6 +292,7 @@ class ProposalUiTests(unittest.TestCase):
             status="published",
             destination="main",
             karma_milli=1_500,
+            karma_before_milli=3_000,
             duration_ms=15_000,
             publication_chat_id=-1001,
             publication_message_id=5,
@@ -253,6 +301,7 @@ class ProposalUiTests(unittest.TestCase):
         )
         self.assertIn("Статус: ✅ Опубликовано", _moderation_caption(submission))
         self.assertIn("Решение: La La School", _moderation_caption(submission))
+        self.assertIn("Карма на момент отправки: 3", _moderation_caption(submission))
 
     def test_level_up_message_lists_new_privileges(self) -> None:
         message = _level_up_message(5_900, 6_100)
