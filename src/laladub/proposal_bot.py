@@ -553,6 +553,28 @@ def _find_submission_original_video(submission: Submission) -> Path | None:
     return None
 
 
+async def _send_respecting_flood_limit(send: Any, *, attempts: int = 4) -> None:
+    """Run a send, waiting out Telegram's rate limit instead of losing the message.
+
+    A restart replays whatever forwards piled up, so several posts can want a
+    comment at once and trip flood control. That is a "wait and retry" answer,
+    not a failure - treating it as one silently dropped the comment for the post
+    that happened to be behind the backlog.
+    """
+    from telegram.error import RetryAfter
+
+    for attempt in range(attempts):
+        try:
+            await send()
+            return
+        except RetryAfter as exc:
+            if attempt == attempts - 1:
+                raise
+            delay = float(getattr(exc, "retry_after", 5) or 5) + 1.0
+            print(f"Comment send rate-limited, waiting {delay:.0f}s", flush=True)
+            await asyncio.sleep(delay)
+
+
 async def _reply_with_original_video(context: Any, message: Any, submission: Submission) -> None:
     from .bot import _telegram_sendable_video_path, video_upload_metadata
 
@@ -561,20 +583,25 @@ async def _reply_with_original_video(context: Any, message: Any, submission: Sub
         return
     send_path = await _telegram_sendable_video_path(original)
     metadata = await video_upload_metadata(send_path)
-    with send_path.open("rb") as file_obj:
-        await context.bot.send_video(
-            chat_id=message.chat_id,
-            video=file_obj,
-            filename=f"work_{submission.job_number}_original{send_path.suffix}",
-            caption="Оригинал",
-            reply_to_message_id=message.message_id,
-            supports_streaming=True,
-            read_timeout=300,
-            write_timeout=300,
-            connect_timeout=60,
-            pool_timeout=60,
-            **metadata,
-        )
+
+    async def send() -> None:
+        # Reopened per attempt: a retry cannot replay an already-consumed handle.
+        with send_path.open("rb") as file_obj:
+            await context.bot.send_video(
+                chat_id=message.chat_id,
+                video=file_obj,
+                filename=f"work_{submission.job_number}_original{send_path.suffix}",
+                caption="Оригинал",
+                reply_to_message_id=message.message_id,
+                supports_streaming=True,
+                read_timeout=300,
+                write_timeout=300,
+                connect_timeout=60,
+                pool_timeout=60,
+                **metadata,
+            )
+
+    await _send_respecting_flood_limit(send)
 
 
 async def comment_on_channel_forward(update: Any, context: Any) -> None:
@@ -608,9 +635,11 @@ async def comment_on_channel_forward(update: Any, context: Any) -> None:
 
     # Each reply is sent on its own: a missing original should not cost us the
     # transcript, and a transcript that will not send should not hide the video.
+    delivered = False
     if has_original:
         try:
             await _reply_with_original_video(context, message, submission)
+            delivered = True
         except Exception as exc:
             print(
                 f"Original video comment failed for submission {submission.id}: "
@@ -620,12 +649,24 @@ async def comment_on_channel_forward(update: Any, context: Any) -> None:
     if text:
         if len(text) > 4000:
             text = text[:4000] + "…"
-        try:
+
+        async def send_text() -> None:
             await context.bot.send_message(
                 chat_id=message.chat_id, text=text, reply_to_message_id=message.message_id
             )
+
+        try:
+            await _send_respecting_flood_limit(send_text)
+            delivered = True
         except Exception as exc:
             print(f"Comment post failed for submission {submission.id}: {type(exc).__name__}: {exc}", flush=True)
+
+    if not delivered:
+        # The claim was taken before sending to keep a redelivered forward from
+        # double-posting. Nothing went out, so hand it back rather than leave the
+        # post permanently marked as commented.
+        await asyncio.to_thread(store.clear_comment_posted, submission.id)
+        print(f"Comment claim released for submission {submission.id}: nothing was sent", flush=True)
 
 
 def _parse_ids(raw: str) -> set[int]:

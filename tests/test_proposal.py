@@ -586,6 +586,86 @@ class CommentOnChannelForwardTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(send_spy.calls, [])
 
 
+class _FloodThenSucceedSpy:
+    """Fails with Telegram's rate-limit error the first time, then succeeds."""
+
+    def __init__(self, failures: int = 1) -> None:
+        self.calls: list[dict] = []
+        self._remaining = failures
+
+    async def __call__(self, **kwargs) -> None:
+        if self._remaining > 0:
+            self._remaining -= 1
+            from telegram.error import RetryAfter
+
+            raise RetryAfter(0)
+        self.calls.append(kwargs)
+
+
+class _AlwaysFloodSpy:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs) -> None:
+        from telegram.error import RetryAfter
+
+        raise RetryAfter(0)
+
+
+class CommentFloodControlTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = ProposalStore(Path(self._tempdir.name) / "proposal.sqlite3")
+        self.job_dir = Path(self._tempdir.name) / "job"
+        self.job_dir.mkdir()
+        (self.job_dir / "video_transcript_lalaschool.txt").write_text("Привет мир", encoding="utf-8")
+
+    def _publish(self) -> Submission:
+        submission, _created = self.store.create_submission(
+            job_number="1", user_id=123, chat_id=123, author_name="Тест", author_username=None,
+            video_path=self.job_dir / "dubbed.mp4", output_filename="dubbed.mp4",
+        )
+        self.store.try_claim(submission.id, 631551040)
+        updated, _delta = self.store.finish_decision(
+            submission_id=submission.id, moderator_id=631551040, destination="main",
+            award_milli=100, publication_chat_id=-1001, publication_message_id=55,
+        )
+        return updated
+
+    def _update(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            effective_message=SimpleNamespace(
+                is_automatic_forward=True,
+                forward_origin=SimpleNamespace(chat=SimpleNamespace(id=-1001), message_id=55),
+                chat_id=-2002,
+                message_id=7,
+            )
+        )
+
+    def _context(self, send_spy: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            application=SimpleNamespace(bot_data={"store": self.store}),
+            bot=SimpleNamespace(send_message=send_spy, send_video=_SendMessageSpy()),
+        )
+
+    async def test_retries_after_a_rate_limit_instead_of_dropping_the_comment(self) -> None:
+        submission = self._publish()
+        spy = _FloodThenSucceedSpy(failures=1)
+        await comment_on_channel_forward(self._update(), self._context(spy))
+        # It went out on the retry rather than being lost to the backlog.
+        self.assertEqual(len(spy.calls), 1)
+        self.assertEqual(spy.calls[0]["text"], "Привет мир")
+        self.assertFalse(self.store.mark_comment_posted(submission.id))
+
+    async def test_releases_the_claim_when_nothing_could_be_sent(self) -> None:
+        submission = self._publish()
+        await comment_on_channel_forward(self._update(), self._context(_AlwaysFloodSpy()))
+        # Still unclaimed, so a later attempt is not blocked by a comment that
+        # never actually appeared.
+        self.assertTrue(self.store.mark_comment_posted(submission.id))
+
+
 class FindOriginalVideoTests(unittest.TestCase):
     def _submission(self, job_dir: Path) -> Submission:
         return Submission(

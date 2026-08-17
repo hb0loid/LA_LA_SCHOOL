@@ -566,6 +566,15 @@ class ProposalStore:
             ).fetchone()
         return _submission_from_row(row) if row is not None else None
 
+    def clear_comment_posted(self, submission_id: int) -> None:
+        """Give the claim back when nothing could actually be sent, so a later
+        attempt is not blocked by a reservation that produced no comment."""
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE submissions SET comment_posted_at = NULL WHERE id = ?",
+                (submission_id,),
+            )
+
     def mark_comment_posted(self, submission_id: int) -> bool:
         """Claims the right to post the discussion-group comment for this submission.
         Returns False if it was already claimed - guards against duplicate/retried
