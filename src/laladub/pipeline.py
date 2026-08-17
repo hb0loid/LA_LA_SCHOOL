@@ -1085,6 +1085,8 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
                 # MOSS controls its own delivery and must be allowed to finish
                 # the phrase instead of being time-stretched or trimmed.
                 normalize_wav(raw_path, fitted_path)
+                if config.trim_tts_silence:
+                    _trim_tts_silence(fitted_path, config.tts_max_pause_seconds)
             elif config.fit_to_segments:
                 fit_wav_to_duration(raw_path, fitted_path, max(0.1, segment.duration))
             else:
@@ -3807,6 +3809,73 @@ def _basic_speaker_feature_vector(samples, sample_rate: int, rms: float):
         ],
         dtype=np.float64,
     )
+
+
+def _trim_tts_silence(path: Path, max_pause_seconds: float) -> bool:
+    """Tighten a synthesized phrase in place: drop the silence MOSS pads around the
+    phrase and clamp the pauses it leaves inside one.
+
+    MOSS is deliberately never time-stretched (it owns its own delivery), so its
+    padding is the one thing that can be reclaimed without touching the voice.
+    On real jobs a quarter of the generated audio is silence, which is what pushes
+    phrases into each other's slots - a phrase of two words can otherwise occupy
+    seven seconds. Only silence is removed here, never speech, so the delivery
+    itself comes out unchanged.
+    """
+    import numpy as np
+
+    samples, sample_rate = _read_wav_mono(path)
+    if samples is None or sample_rate <= 0 or samples.size == 0:
+        return False
+
+    frame = max(1, int(sample_rate * 0.02))
+    frame_count = samples.size // frame
+    if frame_count <= 1:
+        return False
+    frames = samples[: frame_count * frame].reshape(frame_count, frame)
+    rms = np.sqrt(np.maximum(0.0, (frames * frames).mean(axis=1)))
+    peak = float(rms.max())
+    if peak <= 0.0:
+        return False
+    voiced = rms > max(peak * 0.02, 0.003)
+    voiced_index = np.flatnonzero(voiced)
+    if voiced_index.size == 0:
+        return False
+
+    # A little air on both sides keeps the phrase from sounding clipped.
+    pad = max(1, int(0.05 / 0.02))
+    max_pause = max(0, int(max(0.0, max_pause_seconds) / 0.02))
+    first, last = int(voiced_index[0]), int(voiced_index[-1])
+    keep = np.zeros(frame_count, dtype=bool)
+    keep[max(0, first - pad) : min(frame_count, last + pad + 1)] = True
+
+    # Clamp each run of silence between two voiced frames to max_pause.
+    run_start: int | None = None
+    for index in range(first, last + 2):
+        silent = index <= last and not voiced[index]
+        if silent and run_start is None:
+            run_start = index
+        elif not silent and run_start is not None:
+            run_length = index - run_start
+            if run_length > max_pause:
+                drop_from = run_start + max_pause // 2
+                drop_to = index - (max_pause - max_pause // 2)
+                keep[drop_from:drop_to] = False
+            run_start = None
+
+    if keep.all():
+        return False
+    trimmed = frames[keep].reshape(-1)
+    if trimmed.size == 0:
+        return False
+
+    data = np.clip(trimmed, -1.0, 1.0)
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes((data * 32767.0).astype("<i2").tobytes())
+    return True
 
 
 def _read_wav_mono(path: Path):

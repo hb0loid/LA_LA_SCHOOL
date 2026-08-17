@@ -98,6 +98,8 @@ def main(argv: list[str] | None = None) -> None:
             max_phrase_repeats=args.max_phrase_repeats,
             max_word_repeats=args.max_word_repeats,
             fit_to_segments=not args.no_fit_to_segments,
+            trim_tts_silence=not args.no_trim_tts_silence,
+            tts_max_pause_seconds=args.tts_max_pause_seconds,
             translation_pivots=args.translation_pivots,
             translation_second_pass_ratio=args.translation_second_pass_ratio,
             keep_workdir=True,
@@ -244,6 +246,17 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument("--ghost-gap-seconds", type=float, default=2.7, help="Minimum pause length for ghost insertions.")
     dub.add_argument("--original-volume", type=float, default=0.18, help="Original audio volume in final mix.")
     dub.add_argument("--dub-volume", type=float, default=1.0, help="Dub audio volume in final mix.")
+    dub.add_argument(
+        "--no-trim-tts-silence",
+        action="store_true",
+        help="Keep the silence MOSS pads around and inside a phrase instead of tightening it.",
+    )
+    dub.add_argument(
+        "--tts-max-pause-seconds",
+        type=float,
+        default=0.3,
+        help="Longest pause kept inside a synthesized phrase when trimming silence.",
+    )
     dub.add_argument("--no-collapse-repetitions", action="store_true", help="Keep repeated ASR/translation loops.")
     dub.add_argument("--max-phrase-repeats", type=int, default=2, help="Maximum consecutive repeated phrase copies.")
     dub.add_argument("--max-word-repeats", type=int, default=3, help="Maximum consecutive repeated single words.")

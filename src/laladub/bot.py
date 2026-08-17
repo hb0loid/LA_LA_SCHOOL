@@ -3492,6 +3492,8 @@ async def _process_job(
         glitch_profile=job.get("glitch_profile", "clean"),
         original_volume=settings.original_volume,
         dub_volume=settings.dub_volume,
+        trim_tts_silence=settings.trim_tts_silence,
+        tts_max_pause_seconds=settings.tts_max_pause_seconds,
         force_source_language=False,
         suppress_plain_ascii_tokens=settings.suppress_plain_ascii_tokens,
         asr_retry_on_repetition=True,

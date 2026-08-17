@@ -114,6 +114,8 @@ class BotSettings:
     suppress_plain_ascii_tokens: bool
     original_volume: float
     dub_volume: float
+    trim_tts_silence: bool
+    tts_max_pause_seconds: float
     collapse_repetitions: bool
     max_phrase_repeats: int
     max_word_repeats: int
@@ -287,6 +289,8 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         suppress_plain_ascii_tokens=_parse_bool(os.environ.get("LALADUB_SUPPRESS_PLAIN_ASCII_TOKENS", "0")),
         original_volume=float(os.environ.get("LALADUB_ORIGINAL_VOLUME", "0.35")),
         dub_volume=float(os.environ.get("LALADUB_DUB_VOLUME", "1.0")),
+        trim_tts_silence=_parse_bool(os.environ.get("LALADUB_TRIM_TTS_SILENCE", "1")),
+        tts_max_pause_seconds=max(0.0, float(os.environ.get("LALADUB_TTS_MAX_PAUSE_SECONDS", "0.3"))),
         collapse_repetitions=_parse_bool(os.environ.get("LALADUB_COLLAPSE_REPETITIONS", "1")),
         max_phrase_repeats=int(os.environ.get("LALADUB_MAX_PHRASE_REPEATS", "2")),
         max_word_repeats=int(os.environ.get("LALADUB_MAX_WORD_REPEATS", "3")),

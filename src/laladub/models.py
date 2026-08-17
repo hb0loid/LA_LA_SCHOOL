@@ -143,6 +143,8 @@ class DubConfig:
     original_volume: float = 0.18
     dub_volume: float = 1.0
     fit_to_segments: bool = True
+    trim_tts_silence: bool = True
+    tts_max_pause_seconds: float = 0.3
     keep_workdir: bool = True
     resume: bool = True
     preprocess_only: bool = False
