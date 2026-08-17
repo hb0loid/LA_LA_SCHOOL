@@ -73,6 +73,27 @@ class PremiumStoreTests(unittest.TestCase):
         self.store.record_payment(user_id=1, telegram_payment_charge_id="c1", stars_amount=250, days=0)
         self.assertIsNone(self.store.active_subscription(1))
 
+    def test_list_active_subscriptions_dedupes_stacked_purchases(self) -> None:
+        self.store.record_payment(user_id=1, telegram_payment_charge_id="c1", stars_amount=250, days=30)
+        self.store.record_payment(user_id=1, telegram_payment_charge_id="c2", stars_amount=250, days=30)
+        owners = self.store.list_active_subscriptions()
+        self.assertEqual([s.user_id for s in owners], [1])
+        self.assertEqual(owners[0].telegram_payment_charge_id, "c2")
+
+    def test_list_active_subscriptions_excludes_expired_and_revoked(self) -> None:
+        self.store.record_payment(user_id=1, telegram_payment_charge_id="c1", stars_amount=250, days=30)
+        self.store.record_payment(user_id=2, telegram_payment_charge_id="c2", stars_amount=250, days=0)
+        self.store.record_payment(user_id=3, telegram_payment_charge_id="c3", stars_amount=250, days=30)
+        self.store.revoke(3, status="refunded")
+        owners = self.store.list_active_subscriptions()
+        self.assertEqual([s.user_id for s in owners], [1])
+
+    def test_list_active_subscriptions_includes_manual_grants(self) -> None:
+        self.store.grant_manual(user_id=9, days=7, admin_id=555)
+        owners = self.store.list_active_subscriptions()
+        self.assertEqual([s.user_id for s in owners], [9])
+        self.assertEqual(owners[0].granted_by, "555")
+
     def test_user_settings_default_to_watermark_on_no_censor_override(self) -> None:
         settings = self.store.get_user_settings(42)
         self.assertTrue(settings.watermark_enabled)

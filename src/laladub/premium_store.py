@@ -176,6 +176,26 @@ class PremiumStore:
             ).fetchone()
         return _subscription_from_row(row) if row is not None else None
 
+    def list_active_subscriptions(self) -> list[Subscription]:
+        """One row per user - their latest active, unexpired subscription. A user can
+        have several active rows from stacked purchases, so this dedupes to the one
+        with the furthest expiry instead of returning every purchase separately."""
+        now = time.time()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM subscriptions s
+                WHERE s.status = 'active' AND s.expires_at > ?
+                  AND s.expires_at = (
+                      SELECT MAX(s2.expires_at) FROM subscriptions s2
+                      WHERE s2.user_id = s.user_id AND s2.status = 'active'
+                  )
+                ORDER BY s.expires_at ASC
+                """,
+                (now,),
+            ).fetchall()
+        return [_subscription_from_row(row) for row in rows]
+
     def latest_charge_id(self, user_id: int) -> str | None:
         with self._connect() as connection:
             row = connection.execute(

@@ -217,6 +217,7 @@ def main() -> None:
     application.add_handler(CommandHandler("grant_premium", admin_grant_premium, filters=private_chat))
     application.add_handler(CommandHandler("revoke_premium", admin_revoke_premium, filters=private_chat))
     application.add_handler(CommandHandler("refund_premium", admin_refund_premium, filters=private_chat))
+    application.add_handler(CommandHandler("prem_owners", admin_prem_owners, filters=private_chat))
     application.add_handler(CommandHandler("watermark", watermark_command, filters=private_chat))
     application.add_handler(CommandHandler("mycensor", mycensor_command, filters=private_chat))
     application.add_handler(CallbackQueryHandler(premium_buy_callback, pattern=r"^premium_buy$"))
@@ -792,6 +793,34 @@ async def admin_refund_premium(update: Any, context: Any) -> None:
     await update.effective_message.reply_text(f"Звёзды возвращены, премиум для {target_id} отключён.")
 
 
+async def admin_prem_owners(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
+    user = update.effective_user
+    if user is None or not settings.is_admin(user.id):
+        await update.effective_message.reply_text("Команда доступна только администратору.")
+        return
+    subscriptions = (
+        await asyncio.to_thread(premium_store.list_active_subscriptions) if premium_store is not None else []
+    )
+    if not subscriptions:
+        await update.effective_message.reply_text("Активных премиум-подписок нет.")
+        return
+    lines = [f"⭐ Активные премиум-подписки: {len(subscriptions)}", ""]
+    for subscription in subscriptions:
+        expiry = datetime.fromtimestamp(subscription.expires_at).strftime("%d.%m.%Y")
+        if subscription.granted_by:
+            source = f"выдано вручную (админ {subscription.granted_by})"
+        else:
+            purchased = datetime.fromtimestamp(subscription.purchased_at).strftime("%d.%m.%Y")
+            source = f"{subscription.stars_amount} ⭐, куплено {purchased}"
+        lines.append(f"{subscription.user_id} — до {expiry} ({source})")
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        text = text[:3900] + "\n…"
+    await update.effective_message.reply_text(text)
+
+
 def _is_premium_user(settings: BotSettings, premium_store: PremiumStore | None, user_id: int | None) -> bool:
     if user_id is None:
         return False
@@ -957,7 +986,12 @@ async def censored(update: Any, context: Any) -> None:
     if user is None:
         return
     if not settings.is_admin(user.id):
-        await update.effective_message.reply_text("Команда доступна только администратору.")
+        premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
+        if _is_premium_user(settings, premium_store, user.id):
+            hint = "Свой личный уровень можно настроить через /mycensor."
+        else:
+            hint = _PREMIUM_ONLY_TEXT
+        await update.effective_message.reply_text(f"Команда доступна только администратору.\n{hint}")
         return
 
     raw_value = str(context.args[0]).strip() if context.args else ""

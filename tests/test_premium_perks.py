@@ -10,6 +10,7 @@ from laladub.bot import (
     _is_premium_user,
     _remember_job_and_ask_source,
     _set_censor_percent,
+    admin_prem_owners,
     censored,
     mycensor_command,
     watermark_command,
@@ -224,12 +225,22 @@ class CensoredCommandGateTests(unittest.IsolatedAsyncioTestCase):
         self.store = PremiumStore(Path(self._tempdir.name) / "premium.sqlite3")
         self.workdir = Path(self._tempdir.name) / "bot"
 
-    async def test_non_admin_cannot_change_global_censor(self) -> None:
+    async def test_non_admin_non_premium_is_pointed_to_premium(self) -> None:
         settings = _Settings(workdir=self.workdir)
         message = _Message()
         update = SimpleNamespace(effective_user=SimpleNamespace(id=1), effective_message=message)
         await censored(update, _context(settings, self.store, args=["0"]))
         self.assertTrue(any("администратору" in text for text in message.replies))
+        self.assertTrue(any("/premium" in text for text in message.replies))
+        self.assertEqual(_get_censor_percent(settings), 100)
+
+    async def test_non_admin_premium_user_is_pointed_to_mycensor(self) -> None:
+        settings = _Settings(paid={1}, workdir=self.workdir)
+        message = _Message()
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=1), effective_message=message)
+        await censored(update, _context(settings, self.store, args=["0"]))
+        self.assertTrue(any("администратору" in text for text in message.replies))
+        self.assertTrue(any("/mycensor" in text for text in message.replies))
         self.assertEqual(_get_censor_percent(settings), 100)
 
     async def test_admin_can_change_global_censor(self) -> None:
@@ -238,6 +249,37 @@ class CensoredCommandGateTests(unittest.IsolatedAsyncioTestCase):
         update = SimpleNamespace(effective_user=SimpleNamespace(id=7), effective_message=message)
         await censored(update, _context(settings, self.store, args=["30"]))
         self.assertEqual(_get_censor_percent(settings), 30)
+
+
+class PremOwnersCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = PremiumStore(Path(self._tempdir.name) / "premium.sqlite3")
+
+    async def test_non_admin_is_rejected(self) -> None:
+        settings = _Settings()
+        self.store.record_payment(user_id=42, telegram_payment_charge_id="c1", stars_amount=250, days=30)
+        message = _Message()
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=1), effective_message=message)
+        await admin_prem_owners(update, _context(settings, self.store))
+        self.assertTrue(any("администратору" in text for text in message.replies))
+        self.assertFalse(any("42" in text for text in message.replies))
+
+    async def test_admin_sees_active_subscribers(self) -> None:
+        settings = _Settings(admins={7})
+        self.store.record_payment(user_id=42, telegram_payment_charge_id="c1", stars_amount=250, days=30)
+        message = _Message()
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7), effective_message=message)
+        await admin_prem_owners(update, _context(settings, self.store))
+        self.assertTrue(any("42" in text for text in message.replies))
+
+    async def test_admin_sees_empty_state_message(self) -> None:
+        settings = _Settings(admins={7})
+        message = _Message()
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7), effective_message=message)
+        await admin_prem_owners(update, _context(settings, self.store))
+        self.assertTrue(any("нет" in text for text in message.replies))
 
 
 if __name__ == "__main__":
