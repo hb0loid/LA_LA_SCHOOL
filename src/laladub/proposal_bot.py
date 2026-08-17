@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import html
 import os
+import re
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,6 +75,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^mod:"))
     application.add_handler(ChatMemberHandler(karma_member_changed, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(MessageHandler(private_chat & filters.TEXT & ~filters.COMMAND, relay_message))
+    application.add_handler(MessageHandler(~private_chat & filters.VIDEO, comment_on_channel_forward))
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
@@ -514,6 +516,54 @@ def _find_submission_subtitles(submission: Submission) -> Path | None:
         if candidate.is_file() and candidate.stat().st_size > 0:
             return candidate
     return None
+
+
+def _transcript_text_for_submission(submission: Submission) -> str | None:
+    path = _find_submission_subtitles(submission)
+    if path is None:
+        return None
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    if path.suffix.lower() != ".srt":
+        text = raw.strip()
+        return text or None
+    lines: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.isdigit() or "-->" in stripped:
+            continue
+        lines.append(stripped)
+    text = re.sub(r"\s+", " ", " ".join(lines)).strip()
+    return text or None
+
+
+async def comment_on_channel_forward(update: Any, context: Any) -> None:
+    """Telegram auto-forwards every channel post into its linked Discussion Group as a
+    new message; this catches that forward and replies to it with the transcript,
+    which is how a bot "comments" on a channel post - there's no dedicated API for it."""
+    message = update.effective_message
+    if message is None or not message.is_automatic_forward:
+        return
+    origin = getattr(message, "forward_origin", None)
+    origin_chat = getattr(origin, "chat", None)
+    if origin_chat is None:
+        return
+    store: ProposalStore = context.application.bot_data["store"]
+    submission = await asyncio.to_thread(
+        store.find_by_publication, int(origin_chat.id), int(origin.message_id)
+    )
+    if submission is None:
+        return
+    text = _transcript_text_for_submission(submission)
+    if not text:
+        return
+    if not await asyncio.to_thread(store.mark_comment_posted, submission.id):
+        return
+    if len(text) > 4000:
+        text = text[:4000] + "…"
+    try:
+        await context.bot.send_message(chat_id=message.chat_id, text=text, reply_to_message_id=message.message_id)
+    except Exception as exc:
+        print(f"Comment post failed for submission {submission.id}: {type(exc).__name__}: {exc}", flush=True)
 
 
 def _parse_ids(raw: str) -> set[int]:

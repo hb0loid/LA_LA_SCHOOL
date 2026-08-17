@@ -68,6 +68,7 @@ class ProposalStore:
                     duration_ms INTEGER NOT NULL DEFAULT 0,
                     publication_chat_id INTEGER,
                     publication_message_id INTEGER,
+                    comment_posted_at REAL,
                     processing_by INTEGER,
                     processing_at REAL,
                     created_at REAL NOT NULL,
@@ -130,6 +131,8 @@ class ProposalStore:
                     ON author_outbox(status, created_at);
                 CREATE INDEX IF NOT EXISTS idx_daily_usage_user_day
                     ON daily_usage(user_id, day_key);
+                CREATE INDEX IF NOT EXISTS idx_submissions_publication
+                    ON submissions(publication_chat_id, publication_message_id);
                 """
             )
             columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(submissions)")}
@@ -139,6 +142,8 @@ class ProposalStore:
                 connection.execute(
                     "ALTER TABLE submissions ADD COLUMN karma_before_milli INTEGER NOT NULL DEFAULT 0"
                 )
+            if "comment_posted_at" not in columns:
+                connection.execute("ALTER TABLE submissions ADD COLUMN comment_posted_at REAL")
             migrated = connection.execute(
                 "SELECT value FROM store_metadata WHERE key = 'karma_milli_v1'"
             ).fetchone()
@@ -552,6 +557,25 @@ class ProposalStore:
                 "SELECT DISTINCT user_id FROM karma_events ORDER BY user_id"
             ).fetchall()
         return [int(row["user_id"]) for row in rows]
+
+    def find_by_publication(self, chat_id: int, message_id: int) -> Submission | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM submissions WHERE publication_chat_id = ? AND publication_message_id = ?",
+                (chat_id, message_id),
+            ).fetchone()
+        return _submission_from_row(row) if row is not None else None
+
+    def mark_comment_posted(self, submission_id: int) -> bool:
+        """Claims the right to post the discussion-group comment for this submission.
+        Returns False if it was already claimed - guards against duplicate/retried
+        forward events triggering a second comment."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE submissions SET comment_posted_at = ? WHERE id = ? AND comment_posted_at IS NULL",
+                (time.time(), submission_id),
+            )
+        return cursor.rowcount > 0
 
 
 def _submission_from_row(row: sqlite3.Row) -> Submission:

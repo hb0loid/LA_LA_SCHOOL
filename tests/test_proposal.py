@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from laladub.bot import _find_proposal_video_path
 from laladub.karma import (
@@ -18,6 +19,8 @@ from laladub.proposal_bot import (
     _level_up_message,
     _moderation_caption,
     _moderation_keyboard,
+    _transcript_text_for_submission,
+    comment_on_channel_forward,
 )
 from laladub.proposal_store import ProposalStore, Submission
 
@@ -179,6 +182,43 @@ class ProposalStoreTests(unittest.TestCase):
         )
         self.assertEqual(self.store.users_with_recent_usage(now - day), [1])
 
+    def test_find_by_publication_matches_exact_chat_and_message(self) -> None:
+        submission, _created = self.store.create_submission(
+            job_number="1",
+            user_id=123,
+            chat_id=123,
+            author_name="Тест",
+            author_username=None,
+            video_path=Path("video.mp4"),
+            output_filename="video.mp4",
+        )
+        self.store.try_claim(submission.id, 631551040)
+        self.store.finish_decision(
+            submission_id=submission.id,
+            moderator_id=631551040,
+            destination="main",
+            award_milli=100,
+            publication_chat_id=-1001,
+            publication_message_id=55,
+        )
+        found = self.store.find_by_publication(-1001, 55)
+        self.assertIsNotNone(found)
+        self.assertEqual(found.id, submission.id)
+        self.assertIsNone(self.store.find_by_publication(-1001, 999))
+
+    def test_mark_comment_posted_is_idempotent(self) -> None:
+        submission, _created = self.store.create_submission(
+            job_number="1",
+            user_id=123,
+            chat_id=123,
+            author_name="Тест",
+            author_username=None,
+            video_path=Path("video.mp4"),
+            output_filename="video.mp4",
+        )
+        self.assertTrue(self.store.mark_comment_posted(submission.id))
+        self.assertFalse(self.store.mark_comment_posted(submission.id))
+
 
 class ProposalUiTests(unittest.TestCase):
     def test_old_job_uses_watermarked_video_for_forced_submission(self) -> None:
@@ -338,6 +378,159 @@ class KarmaRulesTests(unittest.TestCase):
         self.assertEqual([level_for_karma(value).daily_minutes for value in thresholds], [1, 5, 10, 15, 20, 25, 30])
         self.assertEqual([level_for_karma(value).queue_limit for value in thresholds], [1, 1, 2, 2, 3, 3, 3])
         self.assertEqual(format_karma_milli(1_234), "1,234")
+
+
+class TranscriptTextTests(unittest.TestCase):
+    def _submission_for(self, job_dir: Path) -> Submission:
+        return Submission(
+            id=1,
+            job_number="2",
+            user_id=123,
+            chat_id=123,
+            author_name="Тест",
+            author_username=None,
+            video_path=str(job_dir / "dubbed.mp4"),
+            output_filename="dubbed.mp4",
+            status="pending",
+            destination=None,
+            karma_milli=0,
+            karma_before_milli=0,
+            duration_ms=0,
+            publication_chat_id=None,
+            publication_message_id=None,
+            created_at=0,
+            updated_at=0,
+        )
+
+    def test_reads_plain_text_transcript_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            job_dir = Path(tempdir)
+            (job_dir / "video_transcript_lalaschool.txt").write_text("  Привет мир  \n", encoding="utf-8")
+            text = _transcript_text_for_submission(self._submission_for(job_dir))
+            self.assertEqual(text, "Привет мир")
+
+    def test_strips_timestamps_when_only_srt_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            job_dir = Path(tempdir)
+            work_dir = job_dir / "work"
+            work_dir.mkdir()
+            (work_dir / "translated.srt").write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nПривет\n\n2\n00:00:01,000 --> 00:00:02,000\nмир\n",
+                encoding="utf-8",
+            )
+            text = _transcript_text_for_submission(self._submission_for(job_dir))
+            self.assertEqual(text, "Привет мир")
+
+    def test_returns_none_when_nothing_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            text = _transcript_text_for_submission(self._submission_for(Path(tempdir)))
+            self.assertIsNone(text)
+
+
+class _SendMessageSpy:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs) -> None:
+        self.calls.append(kwargs)
+
+
+class CommentOnChannelForwardTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = ProposalStore(Path(self._tempdir.name) / "proposal.sqlite3")
+
+    def _publish(self, *, job_dir: Path) -> Submission:
+        submission, _created = self.store.create_submission(
+            job_number="1",
+            user_id=123,
+            chat_id=123,
+            author_name="Тест",
+            author_username=None,
+            video_path=job_dir / "dubbed.mp4",
+            output_filename="dubbed.mp4",
+        )
+        self.store.try_claim(submission.id, 631551040)
+        updated, _delta = self.store.finish_decision(
+            submission_id=submission.id,
+            moderator_id=631551040,
+            destination="main",
+            award_milli=100,
+            publication_chat_id=-1001,
+            publication_message_id=55,
+        )
+        return updated
+
+    def _context(self, send_spy: _SendMessageSpy) -> SimpleNamespace:
+        return SimpleNamespace(
+            application=SimpleNamespace(bot_data={"store": self.store}),
+            bot=SimpleNamespace(send_message=send_spy),
+        )
+
+    async def test_ignores_non_automatic_forward_messages(self) -> None:
+        send_spy = _SendMessageSpy()
+        update = SimpleNamespace(
+            effective_message=SimpleNamespace(is_automatic_forward=False, forward_origin=None)
+        )
+        await comment_on_channel_forward(update, self._context(send_spy))
+        self.assertEqual(send_spy.calls, [])
+
+    async def test_ignores_forward_with_no_matching_submission(self) -> None:
+        send_spy = _SendMessageSpy()
+        message = SimpleNamespace(
+            is_automatic_forward=True,
+            forward_origin=SimpleNamespace(chat=SimpleNamespace(id=-1001), message_id=999),
+            chat_id=-2002,
+            message_id=7,
+        )
+        update = SimpleNamespace(effective_message=message)
+        await comment_on_channel_forward(update, self._context(send_spy))
+        self.assertEqual(send_spy.calls, [])
+
+    async def test_posts_transcript_as_reply_on_matching_forward(self) -> None:
+        with tempfile.TemporaryDirectory() as job_tempdir:
+            job_dir = Path(job_tempdir)
+            (job_dir / "video_transcript_lalaschool.txt").write_text("Привет мир", encoding="utf-8")
+            self._publish(job_dir=job_dir)
+
+            send_spy = _SendMessageSpy()
+            message = SimpleNamespace(
+                is_automatic_forward=True,
+                forward_origin=SimpleNamespace(chat=SimpleNamespace(id=-1001), message_id=55),
+                chat_id=-2002,
+                message_id=7,
+            )
+            update = SimpleNamespace(effective_message=message)
+            await comment_on_channel_forward(update, self._context(send_spy))
+
+            self.assertEqual(len(send_spy.calls), 1)
+            call = send_spy.calls[0]
+            self.assertEqual(call["chat_id"], -2002)
+            self.assertEqual(call["reply_to_message_id"], 7)
+            self.assertEqual(call["text"], "Привет мир")
+
+    async def test_does_not_post_twice_for_the_same_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as job_tempdir:
+            job_dir = Path(job_tempdir)
+            (job_dir / "video_transcript_lalaschool.txt").write_text("Привет мир", encoding="utf-8")
+            self._publish(job_dir=job_dir)
+
+            message = SimpleNamespace(
+                is_automatic_forward=True,
+                forward_origin=SimpleNamespace(chat=SimpleNamespace(id=-1001), message_id=55),
+                chat_id=-2002,
+                message_id=7,
+            )
+            update = SimpleNamespace(effective_message=message)
+
+            first_spy = _SendMessageSpy()
+            await comment_on_channel_forward(update, self._context(first_spy))
+            self.assertEqual(len(first_spy.calls), 1)
+
+            second_spy = _SendMessageSpy()
+            await comment_on_channel_forward(update, self._context(second_spy))
+            self.assertEqual(second_spy.calls, [])
 
 
 if __name__ == "__main__":
