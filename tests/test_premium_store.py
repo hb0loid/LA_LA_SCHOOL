@@ -73,6 +73,29 @@ class PremiumStoreTests(unittest.TestCase):
         self.store.record_payment(user_id=1, telegram_payment_charge_id="c1", stars_amount=250, days=0)
         self.assertIsNone(self.store.active_subscription(1))
 
+    def test_user_settings_default_to_watermark_on_no_censor_override(self) -> None:
+        settings = self.store.get_user_settings(42)
+        self.assertTrue(settings.watermark_enabled)
+        self.assertIsNone(settings.censor_percent)
+
+    def test_set_watermark_enabled_persists_and_is_independent_of_censor(self) -> None:
+        self.store.set_censor_percent(1, 40)
+        self.store.set_watermark_enabled(1, False)
+        settings = self.store.get_user_settings(1)
+        self.assertFalse(settings.watermark_enabled)
+        self.assertEqual(settings.censor_percent, 40)
+
+        self.store.set_watermark_enabled(1, True)
+        settings = self.store.get_user_settings(1)
+        self.assertTrue(settings.watermark_enabled)
+        self.assertEqual(settings.censor_percent, 40)
+
+    def test_set_censor_percent_none_clears_override(self) -> None:
+        self.store.set_censor_percent(1, 75)
+        self.assertEqual(self.store.get_user_settings(1).censor_percent, 75)
+        self.store.set_censor_percent(1, None)
+        self.assertIsNone(self.store.get_user_settings(1).censor_percent)
+
 
 if __name__ == "__main__":
     unittest.main()

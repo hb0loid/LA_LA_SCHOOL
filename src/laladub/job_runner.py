@@ -97,16 +97,17 @@ def _execute_job(
     result = run_dub(input_path, config)
     send_path = result
 
-    watermarked_path = job_dir / "dubbed_watermarked.mp4"
-    if progress_callback:
-        progress_callback("Adding watermark", 98, 100, None)
-    add_watermark(
-        result,
-        watermarked_path,
-        text=settings.watermark_text,
-        image_path=settings.watermark_image,
-    )
-    send_path = watermarked_path
+    if job.get("watermark_enabled", True):
+        watermarked_path = job_dir / "dubbed_watermarked.mp4"
+        if progress_callback:
+            progress_callback("Adding watermark", 98, 100, None)
+        add_watermark(
+            result,
+            watermarked_path,
+            text=settings.watermark_text,
+            image_path=settings.watermark_image,
+        )
+        send_path = watermarked_path
 
     transcript_text = _read_transcript_text(job_dir / "work" / "translated.srt")
     transcript_path: Path | None = None

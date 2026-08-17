@@ -25,7 +25,7 @@ from .karma import KARMA_SCALE, PREMIUM_LEVEL, KarmaLevel, level_for_karma, next
 from .asr import clear_openai_whisper_cache
 from .models import DubConfig
 from .pipeline import run_dub, run_transcript
-from .premium_store import PremiumStore, Subscription
+from .premium_store import PremiumStore, Subscription, UserSettings
 from .proposal_store import ProposalStore
 from .tts import clear_tts_model_caches
 from .watermark import add_watermark
@@ -217,6 +217,8 @@ def main() -> None:
     application.add_handler(CommandHandler("grant_premium", admin_grant_premium, filters=private_chat))
     application.add_handler(CommandHandler("revoke_premium", admin_revoke_premium, filters=private_chat))
     application.add_handler(CommandHandler("refund_premium", admin_refund_premium, filters=private_chat))
+    application.add_handler(CommandHandler("watermark", watermark_command, filters=private_chat))
+    application.add_handler(CommandHandler("mycensor", mycensor_command, filters=private_chat))
     application.add_handler(CallbackQueryHandler(premium_buy_callback, pattern=r"^premium_buy$"))
     application.add_handler(PreCheckoutQueryHandler(premium_precheckout))
     application.add_handler(MessageHandler(private_chat & filters.SUCCESSFUL_PAYMENT, premium_successful_payment))
@@ -457,10 +459,11 @@ async def _setup_bot_commands(application: Any) -> None:
         ("censored", "Experimental censor 0..100"),
         ("me", "Показать профиль и карму"),
         ("cancel", "Сбросить текущую задачу"),
+        ("premium", "Оформить премиум"),
+        ("paysupport", "Поддержка по платежам"),
+        ("watermark", "Премиум: вкл/выкл водяной знак"),
+        ("mycensor", "Премиум: свой уровень censor"),
     ]
-    # /premium and /paysupport stay unlisted for now (soft launch) - their
-    # CommandHandlers in main() still work if typed directly, matching how
-    # /maintenance is already hidden from this same menu.
     await application.bot.set_my_commands(commands)
     with contextlib.suppress(Exception):
         from telegram import BotCommandScopeAllPrivateChats, BotCommandScopeDefault
@@ -786,6 +789,90 @@ async def admin_refund_premium(update: Any, context: Any) -> None:
         return
     await asyncio.to_thread(premium_store.revoke, target_id, status="refunded")
     await update.effective_message.reply_text(f"Звёзды возвращены, премиум для {target_id} отключён.")
+
+
+def _is_premium_user(settings: BotSettings, premium_store: PremiumStore | None, user_id: int | None) -> bool:
+    if user_id is None:
+        return False
+    if settings.is_paid(user_id) or settings.is_admin(user_id):
+        return True
+    return premium_store is not None and premium_store.active_subscription(user_id) is not None
+
+
+_PREMIUM_ONLY_TEXT = "Это премиум-функция. Оформить: /premium"
+
+
+async def watermark_command(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
+    user = update.effective_user
+    if user is None:
+        return
+    if not _is_premium_user(settings, premium_store, user.id):
+        await update.effective_message.reply_text(_PREMIUM_ONLY_TEXT, reply_markup=_remove_reply_keyboard())
+        return
+
+    args = context.args or []
+    action = str(args[0]).strip().lower() if args else ""
+    if action not in {"on", "off"}:
+        current = await asyncio.to_thread(premium_store.get_user_settings, user.id)
+        state = "включён" if current.watermark_enabled else "выключен"
+        await update.effective_message.reply_text(
+            f"Водяной знак сейчас {state}.\nИспользование: /watermark on или /watermark off",
+            reply_markup=_remove_reply_keyboard(),
+        )
+        return
+
+    enabled = action == "on"
+    await asyncio.to_thread(premium_store.set_watermark_enabled, user.id, enabled)
+    state = "включён" if enabled else "выключен"
+    await update.effective_message.reply_text(
+        f"Водяной знак теперь {state} для твоих новых задач.", reply_markup=_remove_reply_keyboard()
+    )
+
+
+async def mycensor_command(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
+    user = update.effective_user
+    if user is None:
+        return
+    if not _is_premium_user(settings, premium_store, user.id):
+        await update.effective_message.reply_text(_PREMIUM_ONLY_TEXT, reply_markup=_remove_reply_keyboard())
+        return
+
+    args = context.args or []
+    raw_value = str(args[0]).strip().lower() if args else ""
+    if not raw_value:
+        current = await asyncio.to_thread(premium_store.get_user_settings, user.id)
+        global_percent = _get_censor_percent(settings)
+        state = f"{current.censor_percent}%" if current.censor_percent is not None else f"общий ({global_percent}%)"
+        await update.effective_message.reply_text(
+            f"Твой censor сейчас: {state}.\n"
+            "Использование: /mycensor 0..100 или /mycensor default (использовать общий).",
+            reply_markup=_remove_reply_keyboard(),
+        )
+        return
+
+    if raw_value in {"default", "auto", "global"}:
+        await asyncio.to_thread(premium_store.set_censor_percent, user.id, None)
+        await update.effective_message.reply_text(
+            "Личный censor сброшен, для тебя снова используется общий уровень.",
+            reply_markup=_remove_reply_keyboard(),
+        )
+        return
+
+    if not raw_value.isdigit() or not 0 <= int(raw_value) <= 100:
+        await update.effective_message.reply_text(
+            "Использование: /mycensor 0..100 или /mycensor default", reply_markup=_remove_reply_keyboard()
+        )
+        return
+
+    percent = int(raw_value)
+    await asyncio.to_thread(premium_store.set_censor_percent, user.id, percent)
+    await update.effective_message.reply_text(
+        f"Личный censor для твоих задач теперь: {percent}%.", reply_markup=_remove_reply_keyboard()
+    )
 
 
 async def start(update: Any, context: Any) -> None:
@@ -1210,7 +1297,9 @@ async def receive_video(update: Any, context: Any) -> None:
     if input_path is None:
         return
 
-    await _remember_job_and_ask_source(context, status, job_dir, input_path, source_title, input_source="telegram_upload")
+    await _remember_job_and_ask_source(
+        context, status, job_dir, input_path, source_title, input_source="telegram_upload", user_id=user_id
+    )
 
 
 async def receive_audio(update: Any, context: Any) -> None:
@@ -1248,7 +1337,9 @@ async def receive_audio(update: Any, context: Any) -> None:
         await status.edit_text(f"Не смог скачать аудио:\n{details}")
         return
 
-    await _remember_job_and_ask_source(context, status, job_dir, audio_path, source_title, input_source="telegram_audio")
+    await _remember_job_and_ask_source(
+        context, status, job_dir, audio_path, source_title, input_source="telegram_audio", user_id=user_id
+    )
 
 
 async def receive_link(update: Any, context: Any) -> None:
@@ -1292,6 +1383,7 @@ async def receive_link(update: Any, context: Any) -> None:
         input_path,
         source_title,
         input_source="coordinator_download",
+        user_id=user_id,
         source_url=url,
     )
 
@@ -1488,16 +1580,26 @@ async def _remember_job_and_ask_source(
     source_title: str,
     *,
     input_source: str,
+    user_id: int | None = None,
     source_url: str | None = None,
 ) -> None:
     settings: BotSettings = context.application.bot_data["settings"]
+    premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
+    censor_percent = _get_censor_percent(settings)
+    watermark_enabled = True
+    if _is_premium_user(settings, premium_store, user_id):
+        user_settings = await asyncio.to_thread(premium_store.get_user_settings, user_id)
+        watermark_enabled = user_settings.watermark_enabled
+        if user_settings.censor_percent is not None:
+            censor_percent = user_settings.censor_percent
     context.user_data["job"] = {
         "job_dir": str(job_dir),
         "input_path": str(input_path),
         "source_title": source_title,
         "input_source": input_source,
         "translation_seed": job_dir.name,
-        "censor_percent": _get_censor_percent(settings),
+        "censor_percent": censor_percent,
+        "watermark_enabled": watermark_enabled,
     }
     if source_url:
         context.user_data["job"]["source_url"] = source_url
@@ -3487,16 +3589,17 @@ async def _process_job(
         )
         send_path = result
 
-        watermarked_path = job_dir / "dubbed_watermarked.mp4"
-        progress.update("Добавляю водяной знак", 98, 100, None)
-        await asyncio.to_thread(
-            add_watermark,
-            result,
-            watermarked_path,
-            text=settings.watermark_text,
-            image_path=settings.watermark_image,
-        )
-        send_path = watermarked_path
+        if job.get("watermark_enabled", True):
+            watermarked_path = job_dir / "dubbed_watermarked.mp4"
+            progress.update("Добавляю водяной знак", 98, 100, None)
+            await asyncio.to_thread(
+                add_watermark,
+                result,
+                watermarked_path,
+                text=settings.watermark_text,
+                image_path=settings.watermark_image,
+            )
+            send_path = watermarked_path
 
         if _video_needs_telegram_compression(send_path):
             progress.update("Сжимаю видео для Telegram", 99, 100, _format_file_size(send_path.stat().st_size))

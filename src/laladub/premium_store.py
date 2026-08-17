@@ -9,6 +9,13 @@ from typing import Iterator
 
 
 @dataclass(frozen=True, slots=True)
+class UserSettings:
+    user_id: int
+    watermark_enabled: bool
+    censor_percent: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class Subscription:
     id: int
     user_id: int
@@ -76,6 +83,13 @@ class PremiumStore:
                 CREATE TABLE IF NOT EXISTS store_metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id INTEGER PRIMARY KEY,
+                    watermark_enabled INTEGER NOT NULL DEFAULT 1,
+                    censor_percent INTEGER,
+                    updated_at REAL NOT NULL
                 );
                 """
             )
@@ -181,3 +195,42 @@ class PremiumStore:
                 (status, user_id),
             )
         return cursor.rowcount > 0
+
+    def get_user_settings(self, user_id: int) -> UserSettings:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT watermark_enabled, censor_percent FROM user_settings WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return UserSettings(user_id=user_id, watermark_enabled=True, censor_percent=None)
+        censor_percent = row["censor_percent"]
+        return UserSettings(
+            user_id=user_id,
+            watermark_enabled=bool(row["watermark_enabled"]),
+            censor_percent=int(censor_percent) if censor_percent is not None else None,
+        )
+
+    def set_watermark_enabled(self, user_id: int, enabled: bool) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO user_settings (user_id, watermark_enabled, censor_percent, updated_at)
+                VALUES (?, ?, NULL, ?)
+                ON CONFLICT(user_id) DO UPDATE SET watermark_enabled = excluded.watermark_enabled,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, 1 if enabled else 0, time.time()),
+            )
+
+    def set_censor_percent(self, user_id: int, percent: int | None) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO user_settings (user_id, watermark_enabled, censor_percent, updated_at)
+                VALUES (?, 1, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET censor_percent = excluded.censor_percent,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, percent, time.time()),
+            )
