@@ -427,16 +427,18 @@ def _get_censor_percent(settings: BotSettings) -> int:
     if "global" in data:
         return data["global"]
     legacy_values = [value for key, value in data.items() if key.isdigit()]
-    return max(legacy_values, default=0)
+    if legacy_values:
+        return max(legacy_values)
+    # Never explicitly configured - default to fully on rather than off.
+    return 100
 
 
 def _set_censor_percent(settings: BotSettings, percent: int) -> None:
     data = {key: value for key, value in _load_censor_settings(settings).items() if not key.isdigit()}
-    percent = max(0, min(100, int(percent)))
-    if percent <= 0:
-        data.pop("global", None)
-    else:
-        data["global"] = percent
+    # Store the value explicitly (including 0) so an admin can actually turn
+    # it off - dropping the key on 0 would make it indistinguishable from
+    # "never configured", which now defaults to 100, not 0.
+    data["global"] = max(0, min(100, int(percent)))
     _save_censor_settings(settings, data)
 
 
@@ -456,7 +458,6 @@ async def _setup_bot_commands(application: Any) -> None:
         ("queue", "Показать очередь задач"),
         ("resume", "Продолжить задачу по номеру"),
         ("send", "Отправить старую работу в предложку"),
-        ("censored", "Experimental censor 0..100"),
         ("me", "Показать профиль и карму"),
         ("cancel", "Сбросить текущую задачу"),
         ("premium", "Оформить премиум"),
@@ -954,6 +955,9 @@ async def censored(update: Any, context: Any) -> None:
     settings: BotSettings = context.application.bot_data["settings"]
     user = update.effective_user
     if user is None:
+        return
+    if not settings.is_admin(user.id):
+        await update.effective_message.reply_text("Команда доступна только администратору.")
         return
 
     raw_value = str(context.args[0]).strip() if context.args else ""

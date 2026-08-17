@@ -6,8 +6,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from laladub.bot import (
+    _get_censor_percent,
     _is_premium_user,
     _remember_job_and_ask_source,
+    _set_censor_percent,
+    censored,
     mycensor_command,
     watermark_command,
 )
@@ -104,7 +107,7 @@ class RememberJobAppliesPerksTests(unittest.IsolatedAsyncioTestCase):
         )
         job = context.user_data["job"]
         self.assertTrue(job["watermark_enabled"])
-        self.assertEqual(job["censor_percent"], 0)
+        self.assertEqual(job["censor_percent"], 100)
 
     async def test_premium_user_gets_personal_overrides(self) -> None:
         settings = _Settings(paid={1})
@@ -133,7 +136,7 @@ class RememberJobAppliesPerksTests(unittest.IsolatedAsyncioTestCase):
         )
         job = context.user_data["job"]
         self.assertFalse(job["watermark_enabled"])
-        self.assertEqual(job["censor_percent"], 0)
+        self.assertEqual(job["censor_percent"], 100)
 
 
 class WatermarkCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -194,6 +197,47 @@ class MyCensorCommandTests(unittest.IsolatedAsyncioTestCase):
         await mycensor_command(update, _context(settings, self.store, args=["150"]))
         self.assertIsNone(self.store.get_user_settings(1).censor_percent)
         self.assertTrue(any("Использование" in text for text in message.replies))
+
+
+class GlobalCensorDefaultTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.settings = _Settings(workdir=Path(self._tempdir.name))
+
+    def test_defaults_to_fully_on_when_never_configured(self) -> None:
+        self.assertEqual(_get_censor_percent(self.settings), 100)
+
+    def test_explicit_zero_persists_instead_of_falling_back_to_default(self) -> None:
+        _set_censor_percent(self.settings, 0)
+        self.assertEqual(_get_censor_percent(self.settings), 0)
+
+    def test_explicit_value_persists(self) -> None:
+        _set_censor_percent(self.settings, 42)
+        self.assertEqual(_get_censor_percent(self.settings), 42)
+
+
+class CensoredCommandGateTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = PremiumStore(Path(self._tempdir.name) / "premium.sqlite3")
+        self.workdir = Path(self._tempdir.name) / "bot"
+
+    async def test_non_admin_cannot_change_global_censor(self) -> None:
+        settings = _Settings(workdir=self.workdir)
+        message = _Message()
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=1), effective_message=message)
+        await censored(update, _context(settings, self.store, args=["0"]))
+        self.assertTrue(any("администратору" in text for text in message.replies))
+        self.assertEqual(_get_censor_percent(settings), 100)
+
+    async def test_admin_can_change_global_censor(self) -> None:
+        settings = _Settings(admins={7}, workdir=self.workdir)
+        message = _Message()
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7), effective_message=message)
+        await censored(update, _context(settings, self.store, args=["30"]))
+        self.assertEqual(_get_censor_percent(settings), 30)
 
 
 if __name__ == "__main__":
