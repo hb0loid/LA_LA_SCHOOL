@@ -337,7 +337,90 @@ def _dub_is_too_sparse(segments: list[Segment], source_duration: float) -> bool:
         return True
     if source_duration >= 90.0 and len(spoken) < 6 and text_chars / duration < 1.6:
         return True
+    # Plenty of phrases overall can still leave a long stretch saying nothing -
+    # in job 40814 the opening 27 seconds were silent while every count above
+    # looked healthy, because one segment claimed the whole 30-second window.
+    if source_duration >= 30.0 and _largest_unspoken_stretch(spoken, source_duration) >= 12.0:
+        return True
     return False
+
+
+def _plausible_speech_seconds(text: str) -> float:
+    """How long a phrase could plausibly take to say, erring on the slow side.
+
+    Real segments run about 10 characters per second; assuming half that keeps
+    this from mistaking an ordinary phrase for a hole.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return 0.0
+    return max(0.8, len(stripped) / 5.0)
+
+
+def _tighten_overlong_segments(
+    segments: list[Segment],
+    min_hole_seconds: float = 5.0,
+) -> list[Segment]:
+    """Shrink segments that claim far more time than their words can fill.
+
+    Whisper answers an unintelligible stretch with one segment spanning its whole
+    30-second window and a handful of words in it. Everything downstream reads a
+    segment's span as time that is already spoken for, so those dead seconds are
+    invisible: the sparse-fill check sees full coverage, and fill candidates
+    landing inside the span are rejected as conflicts. Trimming the segment back
+    to what it can actually say turns that dead time into an ordinary gap, which
+    the existing gap handling already knows how to fill.
+    """
+    tightened: list[Segment] = []
+    changed = 0
+    for segment in segments:
+        needed = _plausible_speech_seconds(segment.spoken_text)
+        if needed > 0.0 and segment.duration - needed >= min_hole_seconds:
+            tightened.append(
+                Segment(
+                    start=segment.start,
+                    end=segment.start + needed,
+                    text=segment.text,
+                    translated_text=segment.translated_text,
+                    speaker_wav=segment.speaker_wav,
+                    speaker_id=segment.speaker_id,
+                    speaker_ref_text=segment.speaker_ref_text,
+                )
+            )
+            changed += 1
+            continue
+        tightened.append(segment)
+
+    if not changed:
+        return segments
+    print(f"      Tightened over-long ASR segments: {changed}/{len(segments)}")
+    return tightened
+
+
+def _largest_unspoken_stretch(segments: list[Segment], source_duration: float) -> float:
+    """Longest run of the video with nothing being said, measured from the time
+    each segment actually speaks rather than the span it claims."""
+    if source_duration <= 0.0:
+        return 0.0
+    spoken: list[tuple[float, float]] = []
+    for segment in segments:
+        needed = _plausible_speech_seconds(segment.spoken_text)
+        if needed <= 0.0:
+            continue
+        # Audio runs from the segment's start for as long as the words take; the
+        # span it claims is bookkeeping and is exactly what hides these holes.
+        start = max(0.0, segment.start)
+        spoken.append((start, min(source_duration, start + needed)))
+    if not spoken:
+        return source_duration
+
+    largest = 0.0
+    cursor = 0.0
+    for start, end in sorted(spoken):
+        if start - cursor > largest:
+            largest = start - cursor
+        cursor = max(cursor, end)
+    return max(largest, source_duration - cursor)
 
 
 def _segment_coverage_seconds(segments: list[Segment]) -> float:
@@ -955,6 +1038,10 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
                 max_phrase_repeats=config.max_phrase_repeats,
                 max_word_repeats=config.max_word_repeats,
             )
+        # Before anything looks for room to place content: a segment that claims a
+        # whole silent Whisper window makes that time look occupied, so neither
+        # artifacts nor the sparse fill can land in it.
+        segments = _tighten_overlong_segments(segments)
         if artifact_segments:
             segments = _inject_artifact_segments(
                 segments,
@@ -1303,6 +1390,9 @@ def _fill_sparse_dub_segments(
     source_audio: Path,
     source_duration: float,
 ) -> list[Segment]:
+    # Do this first: a segment claiming a whole silent window would otherwise both
+    # hide the hole from the check below and reject any fill landing inside it.
+    segments = _tighten_overlong_segments(segments)
     if not _should_sparse_fill(config) or not _dub_is_too_sparse(segments, source_duration):
         return segments
 
