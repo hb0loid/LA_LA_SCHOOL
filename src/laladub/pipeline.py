@@ -3357,6 +3357,16 @@ def _assign_pyannote_speaker_refs(
     bank_paths = _build_pyannote_speaker_bank(turns, speaker_order, reference_audio, config)
     if not bank_paths:
         return False
+    # pyannote sometimes reports a "speaker" whose turns are all too short to
+    # build a voice reference from (typically noise or a stray interjection,
+    # not a real extra character). Drop those turns before picking the
+    # dominant speaker per utterance below - otherwise a line that mostly
+    # overlaps a bank-less phantom speaker loses the vote to nobody and
+    # falls all the way back to the raw full-mix reference instead of to the
+    # closest real, voiced speaker.
+    turns = [turn for turn in turns if turn[2] in bank_paths]
+    if not turns:
+        return False
     # A translated or injected subtitle is already one TTS utterance. Splitting
     # its words at every diarization boundary made a single sentence jump
     # between voices, especially when pyannote produced sub-second jitter.
