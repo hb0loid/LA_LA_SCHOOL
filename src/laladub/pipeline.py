@@ -1004,18 +1004,25 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
 
     tts_already_fit = config.resume and _tts_fit_complete(segments, config)
 
+    # The old Demucs vocals had metallic/warbling artifacts that clone TTS
+    # would copy, so speaker identity used to come from the full-band mix
+    # instead. BS-Roformer's separated vocals are clean enough to use
+    # directly - prefer them when separation actually ran, and fall back to
+    # the raw mix otherwise (e.g. --separation none).
+    clean_vocals_path = (
+        separation_result.vocals_path
+        if separation_result and _file_ready(separation_result.vocals_path)
+        else None
+    )
     if not tts_already_fit and _needs_speaker_references(config) and config.speaker_wav is None:
-        # Demucs is useful for the background bed, but its separated vocals can
-        # contain metallic/warbling artifacts that are copied by voice-cloning
-        # TTS. Prefer the original full-band mix for speaker identity.
-        config.speaker_wav = mix_audio if _file_ready(mix_audio) else source_audio
+        config.speaker_wav = clean_vocals_path or (mix_audio if _file_ready(mix_audio) else source_audio)
     if not tts_already_fit and _needs_speaker_references(config) and config.speaker_wav is not None:
         config.speaker_wav = _prepare_xtts_reference(config.speaker_wav, config.workdir / "speaker_refs" / "global_clean.wav")
         print(f"      Clone TTS speaker reference: {config.speaker_wav}")
 
     if not tts_already_fit and _needs_speaker_references(config) and config.multi_speaker:
         _report_progress(config, "Готовлю голосовые референсы", 64, 100, "multi-speaker")
-        reference_audio = mix_audio if _file_ready(mix_audio) else source_audio
+        reference_audio = clean_vocals_path or (mix_audio if _file_ready(mix_audio) else source_audio)
         _assign_segment_speaker_refs(segments, reference_audio, config, diarization_audio=source_audio)
 
     _report_progress(config, "Озвучиваю реплики", 70, 100, f"provider={config.tts}, реплик: {len(segments)}")
