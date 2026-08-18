@@ -108,11 +108,15 @@ TARGET_LANGS = [
     ("en", "Английский"),
 ]
 TTS_METHODS = [
-    ("moss", "MOSS v1.5 (основной)"),
-    ("cosyvoice", "CosyVoice (скрытый резерв)"),
-    ("f5", "F5 (резерв для украинского)"),
-    ("qwen3", "Qwen3 (скрытый резерв)"),
+    ("moss", "MOSS — лучше качество, дольше ждать"),
+    ("cosyvoice", "CosyVoice — быстрее, но попроще"),
+    ("f5", "F5 (для украинского)"),
+    ("qwen3", "Qwen3 (нестабильный, не предлагается)"),
 ]
+# What's actually offered to the user: qwen3 hung mid-batch during testing (a
+# reference-voice-dependent stall, not a fluke of the run) and f5 is Ukrainian's
+# only compatible engine, auto-picked without asking - see select_target_lang.
+TTS_METHOD_CHOICES = [("moss", "MOSS — лучше качество, дольше ждать"), ("cosyvoice", "CosyVoice — быстрее, но попроще")]
 
 TELEGRAM_SAFE_VIDEO_BYTES = 45 * 1024 * 1024
 TELEGRAM_DIRECT_DOWNLOAD_SAFE_BYTES = 20 * 1024 * 1024
@@ -1863,21 +1867,29 @@ async def select_target_lang(update: Any, context: Any) -> None:
         return
 
     job["target_lang"] = target_lang
-    # MOSS is the normal production engine and is selected without an extra
-    # user-facing screen. MOSS v1.5 has no Ukrainian language, so Ukrainian
-    # jobs transparently retain the compatible F5 path.
-    tts_provider = "f5" if target_lang == "uk" else "moss"
-    job["tts_provider"] = tts_provider
     job["translation_chaos"] = "crooked"
     _ensure_translation_seed(job)
-    _save_job_snapshot(Path(job["job_dir"]), job, status="queued")
+    job_dir = Path(job["job_dir"])
+
+    if target_lang == "uk":
+        # Neither MOSS nor CosyVoice speaks Ukrainian; F5 is the only compatible
+        # engine, so it's picked without an extra user-facing screen.
+        job["tts_provider"] = "f5"
+        _save_job_snapshot(job_dir, job, status="queued")
+        await query.edit_message_text(
+            f"Ставлю задачу в очередь. Голоса: {_speaker_count_label(job.get('speaker_count'))}. "
+            f"Язык озвучки: {_target_lang_label(target_lang)}. "
+            f"Движок: {_tts_method_label('f5')}."
+        )
+        context.user_data.pop("job", None)
+        await _enqueue_job(update, context, job, query.message)
+        return
+
+    _save_job_snapshot(job_dir, job, status="select_tts")
     await query.edit_message_text(
-        f"Ставлю задачу в очередь. Голоса: {_speaker_count_label(job.get('speaker_count'))}. "
-        f"Язык озвучки: {_target_lang_label(target_lang)}. "
-        f"Движок: {_tts_method_label(tts_provider)}."
+        "Выбери движок озвучки.",
+        reply_markup=_language_keyboard("tts", TTS_METHOD_CHOICES, columns=1, back_callback="back:target"),
     )
-    context.user_data.pop("job", None)
-    await _enqueue_job(update, context, job, query.message)
 
 
 async def select_tts_method(update: Any, context: Any) -> None:
@@ -1889,15 +1901,8 @@ async def select_tts_method(update: Any, context: Any) -> None:
         return
 
     tts_provider = _tts_provider_value(query.data.split(":", 1)[1])
-    if tts_provider is None:
+    if tts_provider is None or tts_provider not in {code for code, _label in TTS_METHOD_CHOICES}:
         await query.edit_message_text("Неизвестный метод озвучки. Пришли видео ещё раз.")
-        return
-    if _target_lang_value(job.get("target_lang")) == "uk" and tts_provider in {"qwen3", "cosyvoice", "moss"}:
-        provider_label = _tts_method_label(tts_provider)
-        await query.edit_message_text(
-            f"{provider_label} не поддерживает украинскую озвучку. Выбери F5.",
-            reply_markup=_language_keyboard("tts", TTS_METHODS, columns=2, back_callback="back:target"),
-        )
         return
 
     job["tts_provider"] = tts_provider
