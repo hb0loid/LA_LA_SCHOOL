@@ -824,11 +824,26 @@ async def admin_prem_owners(update: Any, context: Any) -> None:
         else:
             purchased = datetime.fromtimestamp(subscription.purchased_at).strftime("%d.%m.%Y")
             source = f"{subscription.stars_amount} ⭐, куплено {purchased}"
-        lines.append(f"{subscription.user_id} — до {expiry} ({source})")
+        who = await _describe_telegram_user(context.bot, subscription.user_id)
+        lines.append(f"{who} — до {expiry} ({source})")
     text = "\n".join(lines)
     if len(text) > 3900:
         text = text[:3900] + "\n…"
     await update.effective_message.reply_text(text)
+
+
+async def _describe_telegram_user(bot: Any, user_id: int) -> str:
+    """Best-effort "@username Full Name (id)" label for admin listings - nothing
+    is stored locally, so this is a live lookup and can fail (blocked bot, no
+    shared chat history yet), in which case it just falls back to the bare id."""
+    try:
+        chat = await bot.get_chat(user_id)
+    except Exception:
+        return str(user_id)
+    name = " ".join(part for part in (chat.first_name, chat.last_name) if part).strip()
+    username = f"@{chat.username}" if chat.username else None
+    label = " ".join(part for part in (username, name) if part).strip()
+    return f"{label} ({user_id})" if label else str(user_id)
 
 
 def _is_premium_user(settings: BotSettings, premium_store: PremiumStore | None, user_id: int | None) -> bool:

@@ -4,8 +4,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from laladub.bot import (
+    _describe_telegram_user,
     _get_censor_percent,
     _is_premium_user,
     _remember_job_and_ask_source,
@@ -53,13 +55,19 @@ class _Settings(SimpleNamespace):
         return user_id in self._admins
 
 
-def _context(settings: _Settings, premium_store: PremiumStore, *, args: list[str] | None = None) -> SimpleNamespace:
+def _context(
+    settings: _Settings, premium_store: PremiumStore, *, args: list[str] | None = None, bot: object | None = None
+) -> SimpleNamespace:
     return SimpleNamespace(
         application=SimpleNamespace(
             bot_data={"settings": settings, "premium_store": premium_store},
         ),
         user_data={},
         args=args or [],
+        # Defaults to "lookup unavailable" so callers that never touch context.bot
+        # (most commands) are unaffected, and admin_prem_owners falls back to the
+        # bare user id exactly like it did before username lookup existed.
+        bot=bot or SimpleNamespace(get_chat=AsyncMock(side_effect=Exception("no chat history"))),
     )
 
 
@@ -280,6 +288,53 @@ class PremOwnersCommandTests(unittest.IsolatedAsyncioTestCase):
         update = SimpleNamespace(effective_user=SimpleNamespace(id=7), effective_message=message)
         await admin_prem_owners(update, _context(settings, self.store))
         self.assertTrue(any("нет" in text for text in message.replies))
+
+    async def test_shows_username_when_it_can_be_resolved(self) -> None:
+        settings = _Settings(admins={7})
+        self.store.record_payment(user_id=42, telegram_payment_charge_id="c1", stars_amount=250, days=30)
+        message = _Message()
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7), effective_message=message)
+        bot = SimpleNamespace(
+            get_chat=AsyncMock(
+                return_value=SimpleNamespace(username="hboloid", first_name="Hyper", last_name=None)
+            )
+        )
+        await admin_prem_owners(update, _context(settings, self.store, bot=bot))
+        self.assertTrue(any("@hboloid" in text and "Hyper" in text and "42" in text for text in message.replies))
+
+    async def test_falls_back_to_bare_id_when_lookup_fails(self) -> None:
+        settings = _Settings(admins={7})
+        self.store.record_payment(user_id=42, telegram_payment_charge_id="c1", stars_amount=250, days=30)
+        message = _Message()
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7), effective_message=message)
+        # Default _context() bot.get_chat raises - simulates a user who blocked
+        # the bot or never started a chat with it, so Telegram has nothing to give.
+        await admin_prem_owners(update, _context(settings, self.store))
+        self.assertTrue(any("42" in text for text in message.replies))
+
+
+class DescribeTelegramUserTests(unittest.IsolatedAsyncioTestCase):
+    async def test_username_and_name_both_present(self) -> None:
+        bot = SimpleNamespace(
+            get_chat=AsyncMock(return_value=SimpleNamespace(username="hboloid", first_name="Hyper", last_name="B"))
+        )
+        self.assertEqual(await _describe_telegram_user(bot, 42), "@hboloid Hyper B (42)")
+
+    async def test_only_name_no_username(self) -> None:
+        bot = SimpleNamespace(
+            get_chat=AsyncMock(return_value=SimpleNamespace(username=None, first_name="Hyper", last_name=None))
+        )
+        self.assertEqual(await _describe_telegram_user(bot, 42), "Hyper (42)")
+
+    async def test_nothing_resolvable_falls_back_to_bare_id(self) -> None:
+        bot = SimpleNamespace(
+            get_chat=AsyncMock(return_value=SimpleNamespace(username=None, first_name=None, last_name=None))
+        )
+        self.assertEqual(await _describe_telegram_user(bot, 42), "42")
+
+    async def test_lookup_failure_falls_back_to_bare_id(self) -> None:
+        bot = SimpleNamespace(get_chat=AsyncMock(side_effect=Exception("blocked")))
+        self.assertEqual(await _describe_telegram_user(bot, 42), "42")
 
 
 if __name__ == "__main__":
