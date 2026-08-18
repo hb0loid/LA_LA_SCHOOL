@@ -32,6 +32,7 @@ from .asr import clear_openai_whisper_cache
 from .models import DubConfig
 from .pipeline import run_dub, run_transcript
 from .premium_store import PremiumStore, Subscription, UserSettings
+from .preset_store import PRESET_FIELDS, PresetStore, UserPreset
 from .proposal_store import ProposalStore
 from .tts import clear_tts_model_caches
 from .watermark import add_watermark
@@ -210,6 +211,7 @@ def main() -> None:
     application.bot_data["job_scheduler"] = _JobScheduler(settings)
     application.bot_data["proposal_store"] = ProposalStore(settings.proposal_db)
     application.bot_data["premium_store"] = PremiumStore(settings.premium_db)
+    application.bot_data["preset_store"] = PresetStore(settings.preset_db)
     private_chat = filters.ChatType.PRIVATE
     application.add_error_handler(_telegram_error_handler)
     application.add_handler(MessageHandler(private_chat, maintenance_message_gate), group=-1)
@@ -231,6 +233,7 @@ def main() -> None:
     application.add_handler(CommandHandler("starbalance", admin_star_balance, filters=private_chat))
     application.add_handler(CommandHandler("watermark", watermark_command, filters=private_chat))
     application.add_handler(CommandHandler("mycensor", mycensor_command, filters=private_chat))
+    application.add_handler(CommandHandler("preset", preset_command, filters=private_chat))
     application.add_handler(CallbackQueryHandler(premium_buy_callback, pattern=r"^premium_buy$"))
     application.add_handler(PreCheckoutQueryHandler(premium_precheckout))
     application.add_handler(MessageHandler(private_chat & filters.SUCCESSFUL_PAYMENT, premium_successful_payment))
@@ -246,6 +249,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(select_speaker_count, pattern=r"^spk:"))
     application.add_handler(CallbackQueryHandler(select_target_lang, pattern=r"^tgt:"))
     application.add_handler(CallbackQueryHandler(select_tts_method, pattern=r"^tts:"))
+    application.add_handler(CallbackQueryHandler(preset_wizard_callback, pattern=r"^pset:"))
     application.add_handler(CallbackQueryHandler(resume_callback, pattern=r"^resume:"))
     application.add_handler(CallbackQueryHandler(proposal_callback, pattern=r"^proposal:"))
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
@@ -472,6 +476,7 @@ async def _setup_bot_commands(application: Any) -> None:
         ("send", "Отправить старую работу в предложку"),
         ("me", "Показать профиль и карму"),
         ("cancel", "Сбросить текущую задачу"),
+        ("preset", "Настроить пресет выбора"),
         ("premium", "Оформить премиум"),
         ("paysupport", "Поддержка по платежам"),
         ("watermark", "Премиум: вкл/выкл водяной знак"),
@@ -1000,6 +1005,107 @@ async def mycensor_command(update: Any, context: Any) -> None:
     )
 
 
+# Same field order the normal send-a-video flow asks in (see _advance_selection).
+# Each entry: (field name in PresetStore, screen title, option list, keyboard columns).
+PRESET_WIZARD_STEPS: list[tuple[str, str, list[tuple[str, str]], int]] = [
+    ("visual_mode", "Видеоряд", VISUAL_MODE_OPTIONS, 1),
+    ("source_lang", "Входной язык", SOURCE_LANGS, 2),
+    ("speaker_count", "Количество голосов", SPEAKER_COUNT_OPTIONS, 5),
+    ("target_lang", "Язык озвучки", TARGET_LANGS, 2),
+    ("tts_provider", "Движок озвучки", TTS_METHOD_CHOICES, 1),
+]
+
+
+def _preset_step_keyboard(field: str, options: list[tuple[str, str]], columns: int) -> Any:
+    items = [("ask", "❓ Спрашивать каждый раз"), *options]
+    return _language_keyboard(f"pset:{field}", items, columns=columns)
+
+
+def _preset_step_text(step_index: int, title: str) -> str:
+    return (
+        f"Настройка пресета — шаг {step_index}/{len(PRESET_WIZARD_STEPS)}.\n"
+        f"{title}: нажми так же, как обычно выбираешь при отправке видео, "
+        "или «Спрашивать каждый раз», если хочешь продолжать выбирать вручную."
+    )
+
+
+def _preset_field_label(field: str, value: str) -> str:
+    if field == "visual_mode":
+        return next((label for code, label in VISUAL_MODE_OPTIONS if code == value), value)
+    if field == "source_lang":
+        return next((label for code, label in SOURCE_LANGS if code == value), value)
+    if field == "speaker_count":
+        return _speaker_count_label(value)
+    if field == "target_lang":
+        return _target_lang_label(value)
+    if field == "tts_provider":
+        return _tts_method_label(value)
+    return value
+
+
+_PRESET_FIELD_TITLES = {field: title for field, title, _options, _columns in PRESET_WIZARD_STEPS}
+
+
+def _preset_summary_text(preset: UserPreset) -> str:
+    lines = ["Пресет сохранён:"]
+    for field in PRESET_FIELDS:
+        value = getattr(preset, field)
+        shown = "спрашивать каждый раз" if value is None else _preset_field_label(field, value)
+        lines.append(f"{_PRESET_FIELD_TITLES[field]}: {shown}")
+    lines.append("")
+    lines.append("Изменить: /preset. Сбросить всё: /preset reset.")
+    return "\n".join(lines)
+
+
+async def preset_command(update: Any, context: Any) -> None:
+    preset_store: PresetStore | None = context.application.bot_data.get("preset_store")
+    user = update.effective_user
+    if user is None or preset_store is None:
+        return
+
+    args = context.args or []
+    if args and str(args[0]).strip().lower() in {"reset", "clear"}:
+        await asyncio.to_thread(preset_store.clear_preset, user.id)
+        await update.effective_message.reply_text(
+            "Пресет сброшен, дальше буду спрашивать всё вручную. /preset — настроить заново."
+        )
+        return
+
+    field, title, options, columns = PRESET_WIZARD_STEPS[0]
+    await update.effective_message.reply_text(
+        _preset_step_text(1, title), reply_markup=_preset_step_keyboard(field, options, columns)
+    )
+
+
+async def preset_wizard_callback(update: Any, context: Any) -> None:
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    preset_store: PresetStore | None = context.application.bot_data.get("preset_store")
+    if user is None or preset_store is None:
+        return
+
+    _, field, value = query.data.split(":", 2)
+    if field not in PRESET_FIELDS:
+        await query.edit_message_text("Неизвестный шаг пресета. Набери /preset ещё раз.")
+        return
+
+    await asyncio.to_thread(preset_store.set_preset_field, user.id, field, None if value == "ask" else value)
+
+    step_index = next(index for index, item in enumerate(PRESET_WIZARD_STEPS) if item[0] == field)
+    next_index = step_index + 1
+    if next_index >= len(PRESET_WIZARD_STEPS):
+        preset = await asyncio.to_thread(preset_store.get_preset, user.id)
+        await query.edit_message_text(_preset_summary_text(preset))
+        return
+
+    next_field, next_title, next_options, next_columns = PRESET_WIZARD_STEPS[next_index]
+    await query.edit_message_text(
+        _preset_step_text(next_index + 1, next_title),
+        reply_markup=_preset_step_keyboard(next_field, next_options, next_columns),
+    )
+
+
 async def start(update: Any, context: Any) -> None:
     await update.effective_message.reply_text(
         "Пришли видео или аудио. Я попрошу выбрать видеоряд, input-язык, количество голосов и язык озвучки.\n\n"
@@ -1433,7 +1539,7 @@ async def receive_video(update: Any, context: Any) -> None:
         return
 
     await _remember_job_and_ask_source(
-        context, status, job_dir, input_path, source_title, input_source="telegram_upload", user_id=user_id
+        context, status, job_dir, input_path, source_title, input_source="telegram_upload", update=update, user_id=user_id
     )
 
 
@@ -1473,7 +1579,7 @@ async def receive_audio(update: Any, context: Any) -> None:
         return
 
     await _remember_job_and_ask_source(
-        context, status, job_dir, audio_path, source_title, input_source="telegram_audio", user_id=user_id
+        context, status, job_dir, audio_path, source_title, input_source="telegram_audio", update=update, user_id=user_id
     )
 
 
@@ -1518,6 +1624,7 @@ async def receive_link(update: Any, context: Any) -> None:
         input_path,
         source_title,
         input_source="coordinator_download",
+        update=update,
         user_id=user_id,
         source_url=url,
     )
@@ -1715,11 +1822,13 @@ async def _remember_job_and_ask_source(
     source_title: str,
     *,
     input_source: str,
+    update: Any = None,
     user_id: int | None = None,
     source_url: str | None = None,
 ) -> None:
     settings: BotSettings = context.application.bot_data["settings"]
     premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
+    preset_store: PresetStore | None = context.application.bot_data.get("preset_store")
     censor_percent = _get_censor_percent(settings)
     watermark_enabled = True
     if _is_premium_user(settings, premium_store, user_id):
@@ -1727,6 +1836,11 @@ async def _remember_job_and_ask_source(
         watermark_enabled = user_settings.watermark_enabled
         if user_settings.censor_percent is not None:
             censor_percent = user_settings.censor_percent
+    preset = (
+        await asyncio.to_thread(preset_store.get_preset, user_id)
+        if preset_store is not None and user_id is not None
+        else None
+    )
     context.user_data["job"] = {
         "job_dir": str(job_dir),
         "input_path": str(input_path),
@@ -1735,29 +1849,134 @@ async def _remember_job_and_ask_source(
         "translation_seed": job_dir.name,
         "censor_percent": censor_percent,
         "watermark_enabled": watermark_enabled,
+        "_preset": preset.as_dict() if preset is not None else {},
     }
     if source_url:
         context.user_data["job"]["source_url"] = source_url
-    if input_source == "telegram_audio":
-        context.user_data["job"]["visual_mode"] = "random"
-        _save_job_snapshot(job_dir, context.user_data["job"], status="select_source")
-        await _ask_source_language(status, context.user_data["job"])
-        return
+    await _advance_selection(update, context, context.user_data["job"], status)
 
-    context.user_data["job"]["visual_mode"] = "original"
-    _save_job_snapshot(job_dir, context.user_data["job"], status="select_visual")
+
+def _preset_choice(job: dict[str, Any], field: str) -> str | None:
+    """The user's saved answer for `field`, or None when it's set to "ask
+    every time" (or the user never configured a preset at all)."""
+    choice = (job.get("_preset") or {}).get(field)
+    return choice if choice and choice != "ask" else None
+
+
+async def _show_selection_screen(target: Any, text: str, markup: Any) -> None:
     try:
-        await status.edit_text(
-            "Выбери видеоряд.",
-            reply_markup=_language_keyboard("vis", VISUAL_MODE_OPTIONS, columns=1, back_callback="back:cancel"),
-        )
+        await target.edit_text(text, reply_markup=markup)
     except Exception as exc:
         if "Message can't be edited" not in f"{type(exc).__name__}: {exc}":
             raise
-        await status.reply_text(
-            "Выбери видеоряд.",
-            reply_markup=_language_keyboard("vis", VISUAL_MODE_OPTIONS, columns=1, back_callback="back:cancel"),
-        )
+        await target.reply_text(text, reply_markup=markup)
+
+
+async def _show_visual_screen(target: Any, job: dict[str, Any]) -> None:
+    _save_job_snapshot(Path(job["job_dir"]), job, status="select_visual")
+    await _show_selection_screen(
+        target,
+        "Выбери видеоряд.",
+        _language_keyboard("vis", VISUAL_MODE_OPTIONS, columns=1, back_callback="back:cancel"),
+    )
+
+
+async def _show_speakers_screen(target: Any, job: dict[str, Any]) -> None:
+    _save_job_snapshot(Path(job["job_dir"]), job, status="select_speakers")
+    await _show_selection_screen(
+        target,
+        "Выбери количество голосов.",
+        _language_keyboard("spk", SPEAKER_COUNT_OPTIONS, columns=5, back_callback="back:source"),
+    )
+
+
+async def _show_target_screen(target: Any, job: dict[str, Any]) -> None:
+    _save_job_snapshot(Path(job["job_dir"]), job, status="select_target")
+    await _show_selection_screen(
+        target,
+        "Выбери язык озвучки.",
+        _language_keyboard("tgt", TARGET_LANGS, columns=2, back_callback="back:speakers"),
+    )
+
+
+async def _show_tts_screen(target: Any, job: dict[str, Any]) -> None:
+    _save_job_snapshot(Path(job["job_dir"]), job, status="select_tts")
+    await _show_selection_screen(
+        target,
+        "Выбери движок озвучки.",
+        _language_keyboard("tts", TTS_METHOD_CHOICES, columns=1, back_callback="back:target"),
+    )
+
+
+async def _advance_selection(update: Any, context: Any, job: dict[str, Any], target: Any) -> None:
+    """Drives the video-setup wizard one step at a time: any field the user's
+    saved /preset already answers is filled in and skipped silently, and the
+    first field still left on "ask every time" gets its picker screen shown."""
+    job_dir = Path(job["job_dir"])
+
+    if "visual_mode" not in job:
+        if job.get("input_source") == "telegram_audio":
+            job["visual_mode"] = "random"
+        else:
+            choice = _preset_choice(job, "visual_mode")
+            if choice:
+                job["visual_mode"] = choice
+            else:
+                await _show_visual_screen(target, job)
+                return
+
+    if "source_lang" not in job:
+        choice = _preset_choice(job, "source_lang")
+        if choice:
+            job["source_lang"] = None if choice == "auto" else choice
+            job["asr_method"] = "ow-large-v3-chaos-backbone"
+            job["mode"] = "dub"
+            job["glitch_profile"] = "clean"
+        else:
+            await _ask_source_language(target, job)
+            return
+
+    if "speaker_count" not in job:
+        choice = _preset_choice(job, "speaker_count")
+        if choice:
+            job["speaker_count"] = "auto" if choice == "auto" else int(choice)
+        else:
+            await _show_speakers_screen(target, job)
+            return
+
+    if "target_lang" not in job:
+        choice = _preset_choice(job, "target_lang")
+        if choice:
+            job["target_lang"] = choice
+            job["translation_chaos"] = "crooked"
+            _ensure_translation_seed(job)
+        else:
+            await _show_target_screen(target, job)
+            return
+
+    if job["target_lang"] == "uk":
+        # Neither MOSS nor CosyVoice speaks Ukrainian; F5 is the only compatible
+        # engine, so it's picked without an extra user-facing screen.
+        job["tts_provider"] = "f5"
+    elif "tts_provider" not in job:
+        choice = _preset_choice(job, "tts_provider")
+        if choice and choice in {code for code, _label in TTS_METHOD_CHOICES}:
+            job["tts_provider"] = choice
+        else:
+            await _show_tts_screen(target, job)
+            return
+
+    job.pop("_preset", None)
+    _save_job_snapshot(job_dir, job, status="queued")
+    await _show_selection_screen(
+        target,
+        f"Ставлю задачу в очередь. Голоса: {_speaker_count_label(job.get('speaker_count'))}. "
+        f"Язык озвучки: {_target_lang_label(job.get('target_lang'))}. "
+        f"Движок: {_tts_method_label(job.get('tts_provider'))}.",
+        None,
+    )
+    context.user_data.pop("job", None)
+    await _enqueue_job(update, context, job, target)
 
 
 async def _ask_source_language(status: Any, job: dict[str, Any]) -> None:
@@ -1793,57 +2012,21 @@ async def selection_back(update: Any, context: Any) -> None:
         await query.edit_message_text("Выбор отменён. Пришли видео или аудио, когда захочешь начать заново.")
         return
     if destination == "visual" and job.get("input_source") != "telegram_audio":
-        _save_job_snapshot(job_dir, job, status="select_visual")
-        await query.edit_message_text(
-            "Выбери видеоряд.",
-            reply_markup=_language_keyboard(
-                "vis",
-                VISUAL_MODE_OPTIONS,
-                columns=1,
-                back_callback="back:cancel",
-            ),
-        )
+        await _show_visual_screen(query.message, job)
         return
     if destination == "source":
         await _ask_source_language(query.message, job)
         return
     if destination == "speakers":
-        _save_job_snapshot(job_dir, job, status="select_speakers")
-        await query.edit_message_text(
-            "Выбери количество голосов.",
-            reply_markup=_language_keyboard(
-                "spk",
-                SPEAKER_COUNT_OPTIONS,
-                columns=5,
-                back_callback="back:source",
-            ),
-        )
+        await _show_speakers_screen(query.message, job)
         return
     if destination == "target":
-        _save_job_snapshot(job_dir, job, status="select_target")
-        await query.edit_message_text(
-            "Выбери язык озвучки.",
-            reply_markup=_language_keyboard(
-                "tgt",
-                TARGET_LANGS,
-                columns=2,
-                back_callback="back:speakers",
-            ),
-        )
+        await _show_target_screen(query.message, job)
         return
     if destination == "chaos":
         # Compatibility for an old TTS keyboard left open before this step was
         # removed: send the user back to the target-language screen.
-        _save_job_snapshot(job_dir, job, status="select_target")
-        await query.edit_message_text(
-            "Выбери язык озвучки.",
-            reply_markup=_language_keyboard(
-                "tgt",
-                TARGET_LANGS,
-                columns=2,
-                back_callback="back:speakers",
-            ),
-        )
+        await _show_target_screen(query.message, job)
         return
 
     await query.edit_message_text("Не удалось вернуться назад. Пришли файл ещё раз.")
@@ -1863,10 +2046,7 @@ async def select_visual_mode(update: Any, context: Any) -> None:
         return
 
     job["visual_mode"] = mode
-    job_dir = Path(str(job["job_dir"]))
-    _save_job_snapshot(job_dir, job, status="select_source")
-
-    await _ask_source_language(query.message, job)
+    await _advance_selection(update, context, job, query.message)
 
 
 async def select_source(update: Any, context: Any) -> None:
@@ -1882,11 +2062,7 @@ async def select_source(update: Any, context: Any) -> None:
     job["asr_method"] = "ow-large-v3-chaos-backbone"
     job["mode"] = "dub"
     job["glitch_profile"] = "clean"
-    _save_job_snapshot(Path(job["job_dir"]), job, status="select_speakers")
-    await query.edit_message_text(
-        "Выбери количество голосов.",
-        reply_markup=_language_keyboard("spk", SPEAKER_COUNT_OPTIONS, columns=5, back_callback="back:source"),
-    )
+    await _advance_selection(update, context, job, query.message)
 
 
 async def select_asr_method(update: Any, context: Any) -> None:
@@ -1931,11 +2107,7 @@ async def select_speaker_count(update: Any, context: Any) -> None:
         return
 
     job["speaker_count"] = "auto" if value == "auto" else int(value)
-    _save_job_snapshot(Path(job["job_dir"]), job, status="select_target")
-    await query.edit_message_text(
-        "Выбери язык озвучки.",
-        reply_markup=_language_keyboard("tgt", TARGET_LANGS, columns=2, back_callback="back:speakers"),
-    )
+    await _advance_selection(update, context, job, query.message)
 
 
 async def select_target_lang(update: Any, context: Any) -> None:
@@ -1954,27 +2126,7 @@ async def select_target_lang(update: Any, context: Any) -> None:
     job["target_lang"] = target_lang
     job["translation_chaos"] = "crooked"
     _ensure_translation_seed(job)
-    job_dir = Path(job["job_dir"])
-
-    if target_lang == "uk":
-        # Neither MOSS nor CosyVoice speaks Ukrainian; F5 is the only compatible
-        # engine, so it's picked without an extra user-facing screen.
-        job["tts_provider"] = "f5"
-        _save_job_snapshot(job_dir, job, status="queued")
-        await query.edit_message_text(
-            f"Ставлю задачу в очередь. Голоса: {_speaker_count_label(job.get('speaker_count'))}. "
-            f"Язык озвучки: {_target_lang_label(target_lang)}. "
-            f"Движок: {_tts_method_label('f5')}."
-        )
-        context.user_data.pop("job", None)
-        await _enqueue_job(update, context, job, query.message)
-        return
-
-    _save_job_snapshot(job_dir, job, status="select_tts")
-    await query.edit_message_text(
-        "Выбери движок озвучки.",
-        reply_markup=_language_keyboard("tts", TTS_METHOD_CHOICES, columns=1, back_callback="back:target"),
-    )
+    await _advance_selection(update, context, job, query.message)
 
 
 async def select_tts_method(update: Any, context: Any) -> None:
@@ -1993,14 +2145,7 @@ async def select_tts_method(update: Any, context: Any) -> None:
     job["tts_provider"] = tts_provider
     job["translation_chaos"] = _translation_chaos_value(job.get("translation_chaos")) or "crooked"
     _ensure_translation_seed(job)
-    _save_job_snapshot(Path(job["job_dir"]), job, status="queued")
-    await query.edit_message_text(
-        f"Ставлю задачу в очередь. Голоса: {_speaker_count_label(job.get('speaker_count'))}. "
-        f"Язык озвучки: {_target_lang_label(job.get('target_lang'))}. "
-        f"Движок: {_tts_method_label(tts_provider)}."
-    )
-    context.user_data.pop("job", None)
-    await _enqueue_job(update, context, job, query.message)
+    await _advance_selection(update, context, job, query.message)
 
 
 async def _enqueue_job(update: Any, context: Any, job: dict[str, Any], status_message: Any) -> None:

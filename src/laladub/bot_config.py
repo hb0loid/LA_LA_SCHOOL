@@ -26,6 +26,7 @@ class BotSettings:
     proposal_enabled: bool
     proposal_db: Path
     premium_db: Path
+    preset_db: Path
     premium_price_stars: int
     premium_days: int
     paysupport_contact: str
@@ -173,6 +174,7 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         proposal_enabled=_parse_bool(os.environ.get("LALADUB_PROPOSAL_ENABLED", "1")),
         proposal_db=Path(os.environ.get("LALADUB_PROPOSAL_DB", "runs/proposal/proposals.sqlite3")),
         premium_db=Path(os.environ.get("LALADUB_PREMIUM_DB", "runs/premium/subscriptions.sqlite3")),
+        preset_db=Path(os.environ.get("LALADUB_PRESET_DB", "runs/presets/presets.sqlite3")),
         premium_price_stars=max(1, int(os.environ.get("LALADUB_PREMIUM_PRICE_STARS", "250"))),
         premium_days=max(1, int(os.environ.get("LALADUB_PREMIUM_DAYS", "30"))),
         paysupport_contact=os.environ.get("LALADUB_PAYSUPPORT_CONTACT", "свяжись с администратором бота").strip()

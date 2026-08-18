@@ -14,7 +14,7 @@ class _Query:
         self.data = data
         self.answer = AsyncMock()
         self.edit_message_text = AsyncMock()
-        self.message = SimpleNamespace(chat_id=-1)
+        self.message = SimpleNamespace(chat_id=-1, edit_text=AsyncMock(), reply_text=AsyncMock())
 
 
 def _context(job: dict) -> SimpleNamespace:
@@ -29,7 +29,16 @@ class SelectTargetLangTests(unittest.IsolatedAsyncioTestCase):
         self._tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self._tempdir.cleanup)
         self.job_dir = Path(self._tempdir.name)
-        self.job = {"job_dir": str(self.job_dir), "input_path": str(self.job_dir / "input.mp4")}
+        # Real jobs always reach the target-language screen with the earlier
+        # steps (visual/source/speakers) already answered - _advance_selection
+        # re-walks from the start otherwise, so these are pre-filled here too.
+        self.job = {
+            "job_dir": str(self.job_dir),
+            "input_path": str(self.job_dir / "input.mp4"),
+            "visual_mode": "original",
+            "source_lang": None,
+            "speaker_count": "auto",
+        }
 
     async def test_ru_shows_the_engine_choice_instead_of_enqueueing(self) -> None:
         query = _Query("tgt:ru")
@@ -40,7 +49,7 @@ class SelectTargetLangTests(unittest.IsolatedAsyncioTestCase):
         enqueue.assert_not_called()
         self.assertEqual(context.user_data["job"]["target_lang"], "ru")
         self.assertNotIn("tts_provider", context.user_data["job"])
-        markup = query.edit_message_text.call_args.kwargs["reply_markup"]
+        markup = query.message.edit_text.call_args.kwargs["reply_markup"]
         labels_and_data = [
             (button.text, button.callback_data) for row in markup.inline_keyboard for button in row
         ]
@@ -68,7 +77,7 @@ class SelectTargetLangTests(unittest.IsolatedAsyncioTestCase):
         with patch("laladub.bot._enqueue_job", new=AsyncMock()) as enqueue:
             await select_target_lang(update, context)
         enqueue.assert_not_called()
-        self.assertIn("Выбери движок озвучки", query.edit_message_text.call_args.args[0])
+        self.assertIn("Выбери движок озвучки", query.message.edit_text.call_args.args[0])
 
 
 class SelectTtsMethodTests(unittest.IsolatedAsyncioTestCase):
@@ -79,6 +88,9 @@ class SelectTtsMethodTests(unittest.IsolatedAsyncioTestCase):
         self.job = {
             "job_dir": str(self.job_dir),
             "input_path": str(self.job_dir / "input.mp4"),
+            "visual_mode": "original",
+            "source_lang": None,
+            "speaker_count": "auto",
             "target_lang": "ru",
         }
 
