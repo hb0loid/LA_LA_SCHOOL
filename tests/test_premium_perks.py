@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from laladub.bot import (
     _describe_telegram_user,
+    _describe_transaction_partner,
     _get_censor_percent,
     _is_premium_user,
     _remember_job_and_ask_source,
     _set_censor_percent,
     admin_prem_owners,
+    admin_star_balance,
     censored,
     mycensor_command,
     watermark_command,
@@ -335,6 +338,84 @@ class DescribeTelegramUserTests(unittest.IsolatedAsyncioTestCase):
     async def test_lookup_failure_falls_back_to_bare_id(self) -> None:
         bot = SimpleNamespace(get_chat=AsyncMock(side_effect=Exception("blocked")))
         self.assertEqual(await _describe_telegram_user(bot, 42), "42")
+
+
+class TransactionPartnerUser(SimpleNamespace):
+    pass
+
+
+class TransactionPartnerFragment(SimpleNamespace):
+    pass
+
+
+class DescribeTransactionPartnerTests(unittest.TestCase):
+    def test_incoming_user_payment(self) -> None:
+        partner = TransactionPartnerUser(user=SimpleNamespace(id=42, username="hboloid", first_name="Hyper", last_name=None))
+        self.assertEqual(_describe_transaction_partner(partner), "@hboloid Hyper (42)")
+
+    def test_fragment_withdrawal(self) -> None:
+        partner = TransactionPartnerFragment(withdrawal_state=None)
+        self.assertIn("Fragment", _describe_transaction_partner(partner))
+
+    def test_unknown_partner_type_has_a_fallback_label(self) -> None:
+        partner = SimpleNamespace()
+        self.assertTrue(_describe_transaction_partner(partner))
+
+
+class StarBalanceCommandTests(unittest.IsolatedAsyncioTestCase):
+    def _context(self, *, admins: set[int] = frozenset(), bot: object) -> SimpleNamespace:
+        settings = _Settings(admins=admins)
+        return SimpleNamespace(
+            application=SimpleNamespace(bot_data={"settings": settings}),
+            bot=bot,
+        )
+
+    async def test_non_admin_is_rejected(self) -> None:
+        message = _Message()
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=1), effective_message=message)
+        bot = SimpleNamespace(get_my_star_balance=AsyncMock(), get_star_transactions=AsyncMock())
+        await admin_star_balance(update, self._context(bot=bot))
+        self.assertTrue(any("администратору" in text for text in message.replies))
+        bot.get_my_star_balance.assert_not_called()
+
+    async def test_admin_sees_balance_and_transactions(self) -> None:
+        message = _Message()
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7), effective_message=message)
+        balance = SimpleNamespace(amount=1500, nanostar_amount=0)
+        incoming = SimpleNamespace(
+            id="tx1",
+            amount=250,
+            nanostar_amount=0,
+            date=datetime(2026, 8, 18, 12, 30),
+            source=TransactionPartnerUser(user=SimpleNamespace(id=99, username="buyer", first_name=None, last_name=None)),
+            receiver=None,
+        )
+        outgoing = SimpleNamespace(
+            id="tx2",
+            amount=1000,
+            nanostar_amount=0,
+            date=datetime(2026, 8, 17, 9, 0),
+            source=None,
+            receiver=TransactionPartnerFragment(withdrawal_state=None),
+        )
+        bot = SimpleNamespace(
+            get_my_star_balance=AsyncMock(return_value=balance),
+            get_star_transactions=AsyncMock(return_value=SimpleNamespace(transactions=[incoming, outgoing])),
+        )
+        await admin_star_balance(update, self._context(admins={7}, bot=bot))
+        text = "\n".join(message.replies)
+        self.assertIn("1500", text)
+        self.assertIn("+250", text)
+        self.assertIn("@buyer", text)
+        self.assertIn("-1000", text)
+        self.assertIn("Fragment", text)
+
+    async def test_balance_lookup_failure_reports_error_without_crashing(self) -> None:
+        message = _Message()
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=7), effective_message=message)
+        bot = SimpleNamespace(get_my_star_balance=AsyncMock(side_effect=Exception("boom")))
+        await admin_star_balance(update, self._context(admins={7}, bot=bot))
+        self.assertTrue(any("Не удалось получить баланс" in text for text in message.replies))
 
 
 if __name__ == "__main__":

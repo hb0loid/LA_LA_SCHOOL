@@ -228,6 +228,7 @@ def main() -> None:
     application.add_handler(CommandHandler("revoke_premium", admin_revoke_premium, filters=private_chat))
     application.add_handler(CommandHandler("refund_premium", admin_refund_premium, filters=private_chat))
     application.add_handler(CommandHandler("prem_owners", admin_prem_owners, filters=private_chat))
+    application.add_handler(CommandHandler("starbalance", admin_star_balance, filters=private_chat))
     application.add_handler(CommandHandler("watermark", watermark_command, filters=private_chat))
     application.add_handler(CommandHandler("mycensor", mycensor_command, filters=private_chat))
     application.add_handler(CallbackQueryHandler(premium_buy_callback, pattern=r"^premium_buy$"))
@@ -832,6 +833,17 @@ async def admin_prem_owners(update: Any, context: Any) -> None:
     await update.effective_message.reply_text(text)
 
 
+def _format_telegram_person(person: Any, fallback_id: int) -> str:
+    """"@username Full Name (id)" from an already-fetched User/Chat-like object -
+    no API call, unlike _describe_telegram_user below."""
+    name = " ".join(
+        part for part in (getattr(person, "first_name", None), getattr(person, "last_name", None)) if part
+    ).strip()
+    username = f"@{person.username}" if getattr(person, "username", None) else None
+    label = " ".join(part for part in (username, name) if part).strip()
+    return f"{label} ({fallback_id})" if label else str(fallback_id)
+
+
 async def _describe_telegram_user(bot: Any, user_id: int) -> str:
     """Best-effort "@username Full Name (id)" label for admin listings - nothing
     is stored locally, so this is a live lookup and can fail (blocked bot, no
@@ -840,10 +852,68 @@ async def _describe_telegram_user(bot: Any, user_id: int) -> str:
         chat = await bot.get_chat(user_id)
     except Exception:
         return str(user_id)
-    name = " ".join(part for part in (chat.first_name, chat.last_name) if part).strip()
-    username = f"@{chat.username}" if chat.username else None
-    label = " ".join(part for part in (username, name) if part).strip()
-    return f"{label} ({user_id})" if label else str(user_id)
+    return _format_telegram_person(chat, user_id)
+
+
+def _describe_transaction_partner(partner: Any) -> str:
+    kind = type(partner).__name__
+    if kind == "TransactionPartnerUser":
+        person = getattr(partner, "user", None)
+        return _format_telegram_person(person, person.id) if person is not None else "пользователь"
+    if kind == "TransactionPartnerFragment":
+        return "Fragment (вывод/возврат)"
+    if kind == "TransactionPartnerTelegramAds":
+        return "реклама Telegram Ads"
+    if kind == "TransactionPartnerTelegramApi":
+        return "оплата запросов Bot API"
+    if kind == "TransactionPartnerAffiliateProgram":
+        return "партнёрская программа"
+    if kind == "TransactionPartnerChat":
+        chat = getattr(partner, "chat", None)
+        title = getattr(chat, "title", None) if chat is not None else None
+        return f"чат «{title}»" if title else "чат"
+    return "источник неизвестен"
+
+
+async def admin_star_balance(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    user = update.effective_user
+    if user is None or not settings.is_admin(user.id):
+        await update.effective_message.reply_text("Команда доступна только администратору.")
+        return
+
+    try:
+        balance = await context.bot.get_my_star_balance()
+    except Exception as exc:
+        await update.effective_message.reply_text(f"Не удалось получить баланс: {type(exc).__name__}: {exc}")
+        return
+
+    lines = [f"⭐ Баланс бота: {balance.amount}"]
+    if balance.nanostar_amount:
+        lines[0] += f" + {balance.nanostar_amount / 1_000_000_000:.3f}"
+
+    try:
+        transactions = await context.bot.get_star_transactions(limit=10)
+    except Exception as exc:
+        lines.append(f"\nНе удалось получить историю операций: {type(exc).__name__}: {exc}")
+        await update.effective_message.reply_text("\n".join(lines))
+        return
+
+    if transactions.transactions:
+        lines.append("")
+        lines.append("Последние операции:")
+        for transaction in transactions.transactions:
+            when = transaction.date.strftime("%d.%m %H:%M")
+            if transaction.source is not None:
+                lines.append(f"{when}  +{transaction.amount} ⭐  {_describe_transaction_partner(transaction.source)}")
+            else:
+                who = _describe_transaction_partner(transaction.receiver) if transaction.receiver else "неизвестно"
+                lines.append(f"{when}  -{transaction.amount} ⭐  {who}")
+
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        text = text[:3900] + "\n…"
+    await update.effective_message.reply_text(text)
 
 
 def _is_premium_user(settings: BotSettings, premium_store: PremiumStore | None, user_id: int | None) -> bool:
