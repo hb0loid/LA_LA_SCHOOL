@@ -522,6 +522,80 @@ def synthesize_moss_batch(
         raise TTSError(f"MOSS did not create valid WAV files: {', '.join(missing[:3])}")
 
 
+def _resolve_fish_python(config: DubConfig) -> Path:
+    python_path = config.fish_python or Path(".venv-fish") / "Scripts" / "python.exe"
+    python_path = _resolve_repo_relative_path(python_path)
+    if not python_path.is_file():
+        raise TTSError(
+            "Fish Speech Python was not found. Set LALADUB_FISH_PYTHON to the Fish Speech environment."
+        )
+    return python_path
+
+
+def synthesize_fish_batch(
+    items: list[tuple[int, Segment, Path]],
+    config: DubConfig,
+) -> None:
+    if not items:
+        return
+
+    python_path = _resolve_fish_python(config)
+    runner_path = _repo_root() / "tools" / "fish_tts_batch_runner.py"
+    if not runner_path.is_file():
+        raise TTSError(f"Fish batch runner does not exist: {runner_path}")
+
+    manifest_items: list[dict[str, object]] = []
+    for _index, segment, output_path in items:
+        text = _sanitize_text_for_xtts(segment.spoken_text)
+        if config.target_lang == "ru":
+            text = _apply_f5_pronunciation_dictionary(text)
+        if not text:
+            make_silence(output_path, max(0.15, segment.duration))
+            continue
+        speaker_wav = segment.speaker_wav or config.speaker_wav
+        if not speaker_wav or not speaker_wav.is_file():
+            raise TTSError(f"Fish speaker reference does not exist: {speaker_wav}")
+        manifest_items.append(
+            {
+                "output": str(output_path.resolve()),
+                "text": text,
+                "reference": str(speaker_wav.resolve()),
+                "prompt_text": segment.speaker_ref_text or "",
+            }
+        )
+
+    if not manifest_items:
+        return
+
+    manifest_path = config.workdir / "fish_batch_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "repo_dir": str(_resolve_repo_relative_path(config.fish_repo_dir)),
+        "model_dir": str(_resolve_repo_relative_path(config.fish_model_dir)),
+        "device": config.fish_device,
+        "decoder_config": "modded_dac_vq",
+        "seed": 42,
+        "items": manifest_items,
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    command = [str(python_path), str(runner_path), "--manifest", str(manifest_path.resolve())]
+    _run_progress_tts_batch(
+        command,
+        items,
+        config,
+        label="Fish",
+        start_prefix="FISH_READY",
+        progress_prefix="FISH_ITEM",
+        timeout_seconds=config.fish_timeout_seconds,
+        extra_env={"HF_HUB_DISABLE_XET": "1"},
+    )
+
+    missing = [str(path) for _index, _segment, path in items if not path.is_file() or path.stat().st_size < 1024]
+    if missing:
+        raise TTSError(f"Fish did not create valid WAV files: {', '.join(missing[:3])}")
+
+
 def _run_progress_tts_batch(
     command: list[str],
     items: list[tuple[int, Segment, Path]],
