@@ -350,12 +350,13 @@ async def _send_moderation_video(bot: Any, moderator_id: int, submission: Submis
         raise FileNotFoundError(video_path)
     send_path = await _telegram_sendable_video_path(video_path)
     metadata = await video_upload_metadata(send_path)
+    transcript = await asyncio.to_thread(_transcript_text_for_submission, submission)
     with send_path.open("rb") as file_obj:
         return await bot.send_video(
             chat_id=moderator_id,
             video=file_obj,
             filename=submission.output_filename,
-            caption=_moderation_caption(submission),
+            caption=_moderation_caption(submission, transcript=transcript),
             parse_mode="HTML",
             reply_markup=_moderation_keyboard(submission.id),
             supports_streaming=True,
@@ -396,24 +397,6 @@ async def moderation_callback(update: Any, context: Any) -> None:
             f"Напиши сообщение автору работы №{submission.job_number}. Я передам его через основной бот.",
             reply_markup=ForceReply(selective=True),
         )
-        return
-
-    if action == "subtitles":
-        subtitles = _find_submission_subtitles(submission)
-        if subtitles is None:
-            await query.answer("Субтитры этой работы не найдены.", show_alert=True)
-            return
-        await query.answer("Отправляю субтитры…")
-        try:
-            with subtitles.open("rb") as document:
-                await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    document=document,
-                    filename=f"work_{submission.job_number}_subtitles{subtitles.suffix}",
-                    caption=f"Субтитры работы №{submission.job_number}",
-                )
-        except Exception as exc:
-            await query.message.reply_text(f"Не удалось отправить субтитры: {type(exc).__name__}: {exc}")
         return
 
     decisions = {
@@ -659,7 +642,8 @@ async def _publish_to_channel(bot: Any, target_chat: str, submission: Submission
 async def _refresh_moderator_messages(
     bot: Any, store: ProposalStore, submission: Submission, *, scheduled_for: float | None = None
 ) -> None:
-    caption = _moderation_caption(submission)
+    transcript = await asyncio.to_thread(_transcript_text_for_submission, submission)
+    caption = _moderation_caption(submission, transcript=transcript)
     if scheduled_for is not None:
         when = datetime.fromtimestamp(scheduled_for).strftime("%H:%M")
         caption += f"\n⏳ Запланировано на {when}"
@@ -712,12 +696,14 @@ def _moderation_keyboard(submission_id: int) -> Any:
                 InlineKeyboardButton("В Ghien Mi Go", callback_data=f"mod:shame:{submission_id}"),
             ],
             [InlineKeyboardButton("Передать сообщение", callback_data=f"mod:message:{submission_id}")],
-            [InlineKeyboardButton("Посмотреть субтитры", callback_data=f"mod:subtitles:{submission_id}")],
         ]
     )
 
 
-def _moderation_caption(submission: Submission) -> str:
+_MODERATION_CAPTION_LIMIT = 1024
+
+
+def _moderation_caption(submission: Submission, *, transcript: str | None = None) -> str:
     status_labels = {
         "pending": "Ожидает решения",
         "published": "✅ Опубликовано",
@@ -738,7 +724,20 @@ def _moderation_caption(submission: Submission) -> str:
     if submission.destination:
         lines.append(f"Решение: {destination_labels.get(submission.destination, html.escape(submission.destination))}")
         lines.append(f"Карма за работу: {format_karma_milli(submission.karma_milli, signed=True)}")
-    return "\n".join(lines)
+    text = "\n".join(lines)
+
+    if transcript:
+        # Subtitles are shown inline as a collapsed quote instead of behind a
+        # separate button - the mod reads them before every decision anyway.
+        # Video captions are hard-capped at 1024 chars, so long transcripts
+        # are truncated to whatever's left after the rest of the caption.
+        wrapper_overhead = len("\n\n<blockquote expandable></blockquote>")
+        budget = _MODERATION_CAPTION_LIMIT - len(text) - wrapper_overhead
+        if budget > 20:
+            snippet = transcript if len(transcript) <= budget else transcript[: budget - 1].rstrip() + "…"
+            text += f"\n\n<blockquote expandable>{html.escape(snippet)}</blockquote>"
+
+    return text
 
 
 def _author_caption(submission: Submission) -> str:

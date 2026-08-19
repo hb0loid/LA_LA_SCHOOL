@@ -279,7 +279,6 @@ class ProposalUiTests(unittest.TestCase):
             [
                 ["В La La School", "В Ghien Mi Go"],
                 ["Передать сообщение"],
-                ["Посмотреть субтитры"],
             ],
         )
 
@@ -350,6 +349,32 @@ class ProposalUiTests(unittest.TestCase):
         self.assertIn("Статус: ✅ Опубликовано", _moderation_caption(submission))
         self.assertIn("Решение: La La School", _moderation_caption(submission))
         self.assertIn("Карма на момент отправки: 3", _moderation_caption(submission))
+
+    def _minimal_submission(self) -> Submission:
+        return Submission(
+            id=1, job_number="2", user_id=123, chat_id=123, author_name="Тест", author_username=None,
+            video_path="dubbed.mp4", output_filename="dubbed.mp4", status="pending", destination=None,
+            karma_milli=0, karma_before_milli=0, duration_ms=0, publication_chat_id=None,
+            publication_message_id=None, created_at=0, updated_at=0,
+        )
+
+    def test_transcript_is_embedded_as_a_collapsed_quote(self) -> None:
+        caption = _moderation_caption(self._minimal_submission(), transcript="Привет мир")
+        self.assertIn("<blockquote expandable>Привет мир</blockquote>", caption)
+
+    def test_no_transcript_means_no_blockquote(self) -> None:
+        caption = _moderation_caption(self._minimal_submission(), transcript=None)
+        self.assertNotIn("<blockquote", caption)
+
+    def test_transcript_is_html_escaped(self) -> None:
+        caption = _moderation_caption(self._minimal_submission(), transcript="<script> & друзья")
+        self.assertIn("&lt;script&gt; &amp; друзья", caption)
+        self.assertNotIn("<script>", caption)
+
+    def test_long_transcript_is_truncated_to_fit_the_caption_limit(self) -> None:
+        caption = _moderation_caption(self._minimal_submission(), transcript="ы" * 2000)
+        self.assertLessEqual(len(caption), 1024)
+        self.assertIn("…</blockquote>", caption)
 
     def test_level_up_message_lists_new_privileges(self) -> None:
         message = _level_up_message(5_900, 6_100)
