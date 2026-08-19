@@ -657,6 +657,19 @@ class ProposalStore:
             return now
         return max(now, float(last_t) + interval_seconds)
 
+    def find_pending_schedule_by_job_number(self, job_number: str) -> ScheduledPost | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT sp.* FROM scheduled_posts sp
+                JOIN submissions s ON s.id = sp.submission_id
+                WHERE s.job_number = ? AND sp.status = 'pending'
+                ORDER BY sp.id DESC LIMIT 1
+                """,
+                (job_number,),
+            ).fetchone()
+        return _scheduled_post_from_row(row) if row is not None else None
+
     def pending_schedule_for_submission(self, submission_id: int) -> ScheduledPost | None:
         with self._connect() as connection:
             row = connection.execute(

@@ -27,8 +27,10 @@ from laladub.proposal_bot import (
     _transcript_text_for_submission,
     comment_on_channel_forward,
     moderation_callback,
-    scheduled_post_callback,
+    post_command,
+    scheduled_command,
     timer_command,
+    unpost_command,
 )
 from laladub.proposal_store import ProposalStore, Submission
 
@@ -951,7 +953,7 @@ class ModerationCallbackDelayedPostingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.pending_scheduled_posts(), [])
 
 
-class ScheduledPostCallbackTests(unittest.IsolatedAsyncioTestCase):
+class ScheduledQueueCommandsTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self._tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self._tempdir.cleanup)
@@ -965,10 +967,10 @@ class ScheduledPostCallbackTests(unittest.IsolatedAsyncioTestCase):
             karma_chat="@lalaschoo",
         )
 
-    def _submission_and_schedule(self):
+    def _submission_and_schedule(self, job_number: str = "1"):
         submission, _created = self.store.create_submission(
-            job_number="1", user_id=123, chat_id=123, author_name="Тест", author_username=None,
-            video_path=Path(self._tempdir.name) / "dubbed.mp4", output_filename="dubbed.mp4",
+            job_number=job_number, user_id=123, chat_id=123, author_name="Тест", author_username=None,
+            video_path=Path(self._tempdir.name) / f"{job_number}.mp4", output_filename="dubbed.mp4",
         )
         item = self.store.schedule_post(
             submission_id=submission.id, destination="main", target_chat="@elevenlabss", moderator_id=631551040,
@@ -976,66 +978,68 @@ class ScheduledPostCallbackTests(unittest.IsolatedAsyncioTestCase):
         )
         return submission, item
 
-    def _context(self) -> SimpleNamespace:
+    def _context(self, args: list[str] | None = None) -> SimpleNamespace:
         return SimpleNamespace(
             application=SimpleNamespace(bot_data={"settings": self.settings, "store": self.store}),
             bot=SimpleNamespace(send_message=AsyncMock(), edit_message_caption=AsyncMock()),
+            args=args or [],
         )
 
-    async def test_cancel_marks_the_schedule_cancelled(self) -> None:
-        _submission, item = self._submission_and_schedule()
-        query = SimpleNamespace(
-            data=f"sch:cancel:{item.id}",
-            answer=AsyncMock(),
-            edit_message_text=AsyncMock(),
-            message=SimpleNamespace(text="Работа №1 → La La School"),
-        )
-        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=631551040))
-        await scheduled_post_callback(update, self._context())
-        self.assertEqual(self.store.pending_scheduled_posts(), [])
-        query.edit_message_text.assert_awaited_once()
+    def _update(self, user_id: int = 631551040) -> tuple[SimpleNamespace, SimpleNamespace]:
+        message = SimpleNamespace(reply_text=AsyncMock())
+        return SimpleNamespace(effective_user=SimpleNamespace(id=user_id), effective_message=message), message
 
-    async def test_cancel_restores_the_decision_buttons_on_the_moderator_message(self) -> None:
-        submission, item = self._submission_and_schedule()
-        self.store.record_moderator_message(submission.id, 631551040, -100, 55)
-        query = SimpleNamespace(
-            data=f"sch:cancel:{item.id}",
-            answer=AsyncMock(),
-            edit_message_text=AsyncMock(),
-            message=SimpleNamespace(text="Работа №1 → La La School"),
-        )
-        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=631551040))
-        context = self._context()
-        await scheduled_post_callback(update, context)
-        context.bot.edit_message_caption.assert_awaited_once()
-        kwargs = context.bot.edit_message_caption.call_args.kwargs
-        self.assertIsNotNone(kwargs["reply_markup"])
+    async def test_scheduled_command_sends_a_single_message_for_the_whole_queue(self) -> None:
+        self._submission_and_schedule("1")
+        self._submission_and_schedule("2")
+        update, message = self._update()
+        await scheduled_command(update, self._context())
+        message.reply_text.assert_awaited_once()
+        text = message.reply_text.call_args.args[0]
+        self.assertIn("№1", text)
+        self.assertIn("№2", text)
+        self.assertIn("/post", text)
+        self.assertIn("/unpost", text)
 
-    async def test_send_now_publishes_and_marks_sent(self) -> None:
-        submission, item = self._submission_and_schedule()
-        query = SimpleNamespace(
-            data=f"sch:now:{item.id}",
-            answer=AsyncMock(),
-            edit_message_text=AsyncMock(),
-            message=SimpleNamespace(text="Работа №1 → La La School"),
-        )
-        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=631551040))
+    async def test_scheduled_command_reports_an_empty_queue(self) -> None:
+        update, message = self._update()
+        await scheduled_command(update, self._context())
+        self.assertIn("пуста", message.reply_text.call_args.args[0])
+
+    async def test_post_sends_by_job_number_and_marks_sent(self) -> None:
+        submission, _item = self._submission_and_schedule("42")
+        update, message = self._update()
         fake_message = _FakePublishedMessage(chat_id=-1001, message_id=42)
         with patch("laladub.proposal_bot._publish_to_channel", new=AsyncMock(return_value=fake_message)):
-            await scheduled_post_callback(update, self._context())
+            await post_command(update, self._context(["42"]))
         updated = self.store.get_submission(submission.id)
         self.assertEqual(updated.destination, "main")
-        self.assertEqual(updated.publication_message_id, 42)
         self.assertEqual(self.store.pending_scheduled_posts(), [])
-        self.assertIn("Отправлено", query.edit_message_text.call_args.args[0])
+        self.assertIn("отправлена", message.reply_text.call_args.args[0])
 
-    async def test_non_moderator_is_rejected(self) -> None:
-        _submission, item = self._submission_and_schedule()
-        query = SimpleNamespace(data=f"sch:cancel:{item.id}", answer=AsyncMock())
-        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=1))
-        await scheduled_post_callback(update, self._context())
+    async def test_post_with_unknown_job_number_reports_not_found(self) -> None:
+        update, message = self._update()
+        await post_command(update, self._context(["999"]))
+        self.assertIn("не найдена", message.reply_text.call_args.args[0])
+
+    async def test_unpost_cancels_and_restores_decision_buttons(self) -> None:
+        submission, _item = self._submission_and_schedule("42")
+        self.store.record_moderator_message(submission.id, 631551040, -100, 55)
+        update, message = self._update()
+        context = self._context(["42"])
+        await unpost_command(update, context)
+        self.assertEqual(self.store.pending_scheduled_posts(), [])
+        self.assertIn("снята", message.reply_text.call_args.args[0])
+        context.bot.edit_message_caption.assert_awaited_once()
+        self.assertIsNotNone(context.bot.edit_message_caption.call_args.kwargs["reply_markup"])
+
+    async def test_non_moderator_cannot_post_or_unpost(self) -> None:
+        self._submission_and_schedule("42")
+        update, message = self._update(user_id=1)
+        await post_command(update, self._context(["42"]))
+        await unpost_command(update, self._context(["42"]))
         self.assertEqual(len(self.store.pending_scheduled_posts()), 1)
-        query.answer.assert_awaited_once()
+        message.reply_text.assert_not_awaited()
 
 
 class ProcessScheduledPostTests(unittest.IsolatedAsyncioTestCase):

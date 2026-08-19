@@ -86,8 +86,9 @@ def main() -> None:
     application.add_handler(CommandHandler("cancel", cancel, filters=private_chat))
     application.add_handler(CommandHandler("timer", timer_command, filters=private_chat))
     application.add_handler(CommandHandler("scheduled", scheduled_command, filters=private_chat))
+    application.add_handler(CommandHandler("post", post_command, filters=private_chat))
+    application.add_handler(CommandHandler("unpost", unpost_command, filters=private_chat))
     application.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^mod:"))
-    application.add_handler(CallbackQueryHandler(scheduled_post_callback, pattern=r"^sch:"))
     application.add_handler(ChatMemberHandler(karma_member_changed, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(MessageHandler(private_chat & filters.TEXT & ~filters.COMMAND, relay_message))
     application.add_handler(MessageHandler(~private_chat & filters.VIDEO, comment_on_channel_forward))
@@ -104,6 +105,8 @@ async def _post_init(application: Any) -> None:
         ("cancel", "Отменить ввод сообщения"),
         ("timer", "Вкл/выкл отложенную публикацию"),
         ("scheduled", "Очередь отложенных постов"),
+        ("post", "Отправить отложенный пост сейчас"),
+        ("unpost", "Снять пост с отложенной публикации"),
     ]
     await application.bot.set_my_commands(commands)
     asyncio.create_task(_delivery_loop(application))
@@ -176,19 +179,6 @@ async def timer_command(update: Any, context: Any) -> None:
     await update.effective_message.reply_text(f"Отложенная публикация теперь {state}.{suffix}")
 
 
-def _scheduled_post_keyboard(scheduled_id: int) -> Any:
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Отправить сейчас", callback_data=f"sch:now:{scheduled_id}"),
-                InlineKeyboardButton("Отменить", callback_data=f"sch:cancel:{scheduled_id}"),
-            ]
-        ]
-    )
-
-
 async def scheduled_command(update: Any, context: Any) -> None:
     settings: ProposalBotSettings = context.application.bot_data["settings"]
     store: ProposalStore = context.application.bot_data["store"]
@@ -202,58 +192,72 @@ async def scheduled_command(update: Any, context: Any) -> None:
         return
 
     channel_names = {"main": "La La School", "shame": "Ghien Mi Go"}
+    lines = ["Очередь отложенных постов:", ""]
     for item in items:
         submission = await asyncio.to_thread(store.get_submission, item.submission_id)
         label = f"№{submission.job_number}" if submission is not None else f"id{item.submission_id}"
         when = datetime.fromtimestamp(item.scheduled_for).strftime("%d.%m %H:%M")
         channel = channel_names.get(item.destination, item.destination)
-        await update.effective_message.reply_text(
-            f"Работа {label} → {channel}, отправка в {when}",
-            reply_markup=_scheduled_post_keyboard(item.id),
-        )
+        lines.append(f"Работа {label} → {channel}, отправка в {when}")
+    lines.append("")
+    lines.append("Отправить сейчас: /post номер\nОтменить: /unpost номер")
+    await update.effective_message.reply_text("\n".join(lines))
 
 
-async def scheduled_post_callback(update: Any, context: Any) -> None:
-    query = update.callback_query
+async def post_command(update: Any, context: Any) -> None:
     settings: ProposalBotSettings = context.application.bot_data["settings"]
     store: ProposalStore = context.application.bot_data["store"]
     moderator_id = getattr(update.effective_user, "id", None)
     if not _is_moderator(settings, moderator_id):
-        await query.answer("Нет доступа.", show_alert=True)
         return
 
-    parts = str(query.data or "").split(":")
-    if len(parts) != 3 or not parts[2].isdigit():
-        await query.answer("Некорректная кнопка.", show_alert=True)
-        return
-    action, scheduled_id = parts[1], int(parts[2])
-
-    if action == "cancel":
-        cancelled = await asyncio.to_thread(store.cancel_scheduled_post, scheduled_id)
-        if cancelled is None:
-            await query.answer("Уже отправлено или отменено.", show_alert=True)
-            return
-        await query.answer("Отменено.")
-        await query.edit_message_text(f"{query.message.text}\n\nОтменено.")
-        # Give the decision buttons back on the moderator's copy of the post -
-        # scheduling had hidden them, and the submission is unresolved again.
-        submission = await asyncio.to_thread(store.get_submission, cancelled.submission_id)
-        if submission is not None:
-            await _refresh_moderator_messages(context.bot, store, submission)
+    args = context.args or []
+    job_number = str(args[0]).strip() if args else ""
+    if not job_number:
+        await update.effective_message.reply_text("Использование: /post номер_работы")
         return
 
-    if action == "now":
-        item = await asyncio.to_thread(store.get_scheduled_post, scheduled_id)
-        if item is None or item.status != "pending":
-            await query.answer("Уже отправлено или отменено.", show_alert=True)
-            return
-        await query.answer("Отправляю…")
-        ok = await _process_scheduled_post(context, item)
-        text = f"{query.message.text}\n\n{'Отправлено.' if ok else 'Не удалось отправить, смотри лог.'}"
-        await query.edit_message_text(text)
+    item = await asyncio.to_thread(store.find_pending_schedule_by_job_number, job_number)
+    if item is None:
+        await update.effective_message.reply_text(f"Работа №{job_number} не найдена в очереди отложенных постов.")
         return
 
-    await query.answer("Неизвестное действие.", show_alert=True)
+    ok = await _process_scheduled_post(context, item)
+    if ok:
+        await update.effective_message.reply_text(f"Работа №{job_number} отправлена.")
+    else:
+        await update.effective_message.reply_text(f"Не удалось отправить работу №{job_number}, смотри лог.")
+
+
+async def unpost_command(update: Any, context: Any) -> None:
+    settings: ProposalBotSettings = context.application.bot_data["settings"]
+    store: ProposalStore = context.application.bot_data["store"]
+    moderator_id = getattr(update.effective_user, "id", None)
+    if not _is_moderator(settings, moderator_id):
+        return
+
+    args = context.args or []
+    job_number = str(args[0]).strip() if args else ""
+    if not job_number:
+        await update.effective_message.reply_text("Использование: /unpost номер_работы")
+        return
+
+    item = await asyncio.to_thread(store.find_pending_schedule_by_job_number, job_number)
+    if item is None:
+        await update.effective_message.reply_text(f"Работа №{job_number} не найдена в очереди отложенных постов.")
+        return
+
+    cancelled = await asyncio.to_thread(store.cancel_scheduled_post, item.id)
+    if cancelled is None:
+        await update.effective_message.reply_text(f"Работа №{job_number} уже отправлена или отменена.")
+        return
+
+    await update.effective_message.reply_text(f"Работа №{job_number} снята с отложенной публикации.")
+    # Give the decision buttons back on the moderator's copy of the post -
+    # scheduling had hidden them, and the submission is unresolved again.
+    submission = await asyncio.to_thread(store.get_submission, cancelled.submission_id)
+    if submission is not None:
+        await _refresh_moderator_messages(context.bot, store, submission)
 
 
 async def _scheduled_post_loop(application: Any) -> None:
