@@ -263,10 +263,14 @@ async def moderation_callback(update: Any, context: Any) -> None:
         await query.answer("Эту заявку сейчас обрабатывает другой модератор.", show_alert=True)
         return
 
-    await query.answer("Публикую…" if target_chat else "Отмечаю…")
+    # Answering is just UI feedback (clears the loading spinner) - if Telegram
+    # rejects it (e.g. "Query is too old"), that must not abort the actual
+    # publish and leave the claim stuck for the full staleness window.
+    with contextlib.suppress(Exception):
+        await query.answer("Публикую…" if target_chat else "Отмечаю…")
     new_message = None
-    karma_before = await asyncio.to_thread(store.karma_total, claimed.user_id)
     try:
+        karma_before = await asyncio.to_thread(store.karma_total, claimed.user_id)
         duration_ms = claimed.duration_ms
         if duration_ms <= 0 and Path(claimed.video_path).is_file():
             duration_ms = max(0, round(await asyncio.to_thread(probe_duration, Path(claimed.video_path)) * 1000))

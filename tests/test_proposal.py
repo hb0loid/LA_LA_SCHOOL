@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from laladub.bot import _find_proposal_video_path
 from laladub.karma import (
@@ -13,6 +14,7 @@ from laladub.karma import (
     visible_karma,
 )
 from laladub.proposal_bot import (
+    ProposalBotSettings,
     _author_caption,
     _find_submission_original_video,
     _find_submission_subtitles,
@@ -22,6 +24,7 @@ from laladub.proposal_bot import (
     _moderation_keyboard,
     _transcript_text_for_submission,
     comment_on_channel_forward,
+    moderation_callback,
 )
 from laladub.proposal_store import ProposalStore, Submission
 
@@ -664,6 +667,63 @@ class CommentFloodControlTests(unittest.IsolatedAsyncioTestCase):
         # Still unclaimed, so a later attempt is not blocked by a comment that
         # never actually appeared.
         self.assertTrue(self.store.mark_comment_posted(submission.id))
+
+
+class _RaisingAnswer:
+    """Simulates Telegram's "Query is too old" BadRequest on query.answer()."""
+
+    async def __call__(self, *args: object, **kwargs: object) -> None:
+        from telegram.error import BadRequest
+
+        raise BadRequest("Query is too old and response timeout expired or query id is invalid")
+
+
+class ModerationCallbackClaimReleaseTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = ProposalStore(Path(self._tempdir.name) / "proposal.sqlite3")
+        self.settings = ProposalBotSettings(
+            token="x",
+            database=Path(self._tempdir.name) / "proposal.sqlite3",
+            moderator_ids=frozenset({631551040}),
+            main_channel="@elevenlabss",
+            shame_channel="@ghienmigo",
+            karma_chat="@lalaschoo",
+        )
+
+    def _submission(self) -> Submission:
+        submission, _created = self.store.create_submission(
+            job_number="1", user_id=123, chat_id=123, author_name="Тест", author_username=None,
+            video_path=Path(self._tempdir.name) / "dubbed.mp4", output_filename="dubbed.mp4",
+        )
+        return submission
+
+    def _context(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            application=SimpleNamespace(bot_data={"settings": self.settings, "store": self.store}),
+            bot=SimpleNamespace(),
+        )
+
+    async def test_a_failed_answer_does_not_leave_the_claim_stuck(self) -> None:
+        # Regression test: query.answer() used to run outside the try/except
+        # that releases the claim, so a stale-callback BadRequest from
+        # Telegram left the submission locked as "being processed" for the
+        # full 10-minute staleness window with no decision ever applied.
+        submission = self._submission()
+        query = SimpleNamespace(
+            data=f"mod:reject:{submission.id}",
+            answer=_RaisingAnswer(),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=631551040))
+        await moderation_callback(update, self._context())
+
+        updated = self.store.get_submission(submission.id)
+        self.assertEqual(updated.destination, "rejected")
+        # The claim must be released immediately, not left to expire after the
+        # 10-minute staleness window - a second moderator can act right away.
+        self.assertIsNotNone(self.store.try_claim(submission.id, 999))
 
 
 class FindOriginalVideoTests(unittest.TestCase):
