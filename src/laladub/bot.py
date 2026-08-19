@@ -29,6 +29,7 @@ from .ffmpeg import (
 )
 from .karma import KARMA_SCALE, PREMIUM_LEVEL, KarmaLevel, level_for_karma, next_level_for_karma, visible_karma
 from .asr import clear_openai_whisper_cache
+from .library import LibraryStore, show_command
 from .models import DubConfig
 from .pipeline import run_dub, run_transcript
 from .premium_store import PremiumStore, Subscription, UserSettings
@@ -212,6 +213,7 @@ def main() -> None:
     application.bot_data["proposal_store"] = ProposalStore(settings.proposal_db)
     application.bot_data["premium_store"] = PremiumStore(settings.premium_db)
     application.bot_data["preset_store"] = PresetStore(settings.preset_db)
+    application.bot_data["library_store"] = LibraryStore(settings.library_db)
     private_chat = filters.ChatType.PRIVATE
     application.add_error_handler(_telegram_error_handler)
     application.add_handler(MessageHandler(private_chat, maintenance_message_gate), group=-1)
@@ -234,6 +236,7 @@ def main() -> None:
     application.add_handler(CommandHandler("watermark", watermark_command, filters=private_chat))
     application.add_handler(CommandHandler("mycensor", mycensor_command, filters=private_chat))
     application.add_handler(CommandHandler("preset", preset_command, filters=private_chat))
+    application.add_handler(CommandHandler("show", show_command, filters=private_chat))
     application.add_handler(CallbackQueryHandler(premium_buy_callback, pattern=r"^premium_buy$"))
     application.add_handler(PreCheckoutQueryHandler(premium_precheckout))
     application.add_handler(MessageHandler(private_chat & filters.SUCCESSFUL_PAYMENT, premium_successful_payment))
@@ -477,6 +480,7 @@ async def _setup_bot_commands(application: Any) -> None:
         ("me", "Показать профиль и карму"),
         ("cancel", "Сбросить текущую задачу"),
         ("preset", "Настроить пресет выбора"),
+        ("show", "Показать готовую работу из библиотеки"),
         ("premium", "Оформить премиум"),
         ("paysupport", "Поддержка по платежам"),
         ("watermark", "Премиум: вкл/выкл водяной знак"),
@@ -3944,6 +3948,7 @@ async def _process_job(
             sent_items.append("транскрипт")
         final_detail = "Отправлены: " + ", ".join(sent_items)
         _save_job_snapshot(job_dir, job, status="done")
+        await _archive_finished_dub(context, job)
         await _finish_progress(progress, progress_task, status_message, "Готово", detail=final_detail)
     except Exception as exc:
         traceback_text = traceback.format_exc()
@@ -3965,6 +3970,36 @@ async def _process_job(
 def _clear_runtime_model_caches() -> None:
     clear_openai_whisper_cache()
     clear_tts_model_caches()
+
+
+async def _archive_finished_dub(context: Any, job: dict[str, Any]) -> None:
+    """Copies the finished dub into the permanent library so /show keeps
+    working after the job's own workdir is swept by the retention cleanup.
+    Best-effort - a failure here must not touch the job the user just got."""
+    library_store: LibraryStore | None = context.application.bot_data.get("library_store")
+    if library_store is None:
+        return
+    try:
+        job_dir = Path(str(job["job_dir"]))
+        source_path = _find_proposal_video_path(job_dir, job)
+        if source_path is None:
+            return
+        settings: BotSettings = context.application.bot_data["settings"]
+        job_number = _job_number(job)
+        settings.library_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = settings.library_dir / f"{job_number}{source_path.suffix}"
+        await asyncio.to_thread(shutil.copy2, source_path, dest_path)
+        await asyncio.to_thread(
+            library_store.add,
+            job_number=job_number,
+            user_id=int(job.get("user_id") or 0),
+            source_title=str(job.get("source_title") or ""),
+            target_lang=_target_lang_value(job.get("target_lang")),
+            video_path=str(dest_path),
+            output_filename=str(job.get("proposal_output_filename") or dest_path.name),
+        )
+    except Exception as exc:
+        print(f"Library archive failed for job {job.get('job_dir')}: {type(exc).__name__}: {exc}", flush=True)
 
 
 async def _send_remote_worker_result(context: Any, item: _QueuedJob, manifest: dict[str, Any]) -> None:
@@ -4061,6 +4096,7 @@ async def _send_remote_worker_result(context: Any, item: _QueuedJob, manifest: d
                 pool_timeout=60,
             )
         _save_job_snapshot(job_dir, job, status="done")
+        await _archive_finished_dub(context, job)
         sent_items = ["дубляж"]
         if fun_visual_sent:
             sent_items.append("исходный прикольный видеоряд")

@@ -14,6 +14,7 @@ from datetime import datetime
 
 from .ffmpeg import probe_duration
 from .karma import format_karma_milli, karma_milli_for_duration, level_for_karma, visible_karma
+from .library import LibraryStore, show_command
 from .proposal_store import ProposalStore, ScheduledPost, Submission
 
 # How far apart consecutive posts to the same channel are spaced when /timer
@@ -29,6 +30,8 @@ class ProposalBotSettings:
     main_channel: str
     shame_channel: str
     karma_chat: str
+    library_db: Path = Path("runs/library/library.sqlite3")
+    library_dir: Path = Path("runs/library/videos")
 
 
 class _ApplicationContext:
@@ -51,6 +54,8 @@ def load_settings() -> ProposalBotSettings:
         main_channel=os.environ.get("LALADUB_PROPOSAL_MAIN_CHANNEL", "@elevenlabss").strip() or "@elevenlabss",
         shame_channel=os.environ.get("LALADUB_PROPOSAL_SHAME_CHANNEL", "@ghienmigo").strip() or "@ghienmigo",
         karma_chat=os.environ.get("LALADUB_PROPOSAL_KARMA_CHAT", "@lalaschoo").strip() or "@lalaschoo",
+        library_db=Path(os.environ.get("LALADUB_LIBRARY_DB", "runs/library/library.sqlite3")),
+        library_dir=Path(os.environ.get("LALADUB_LIBRARY_DIR", "runs/library/videos")),
     )
 
 
@@ -79,6 +84,7 @@ def main() -> None:
     application = Application.builder().token(settings.token).post_init(_post_init).build()
     application.bot_data["settings"] = settings
     application.bot_data["store"] = store
+    application.bot_data["library_store"] = LibraryStore(settings.library_db)
     private_chat = filters.ChatType.PRIVATE
     application.add_error_handler(_error_handler)
     application.add_handler(CommandHandler("start", start, filters=private_chat))
@@ -88,6 +94,7 @@ def main() -> None:
     application.add_handler(CommandHandler("scheduled", scheduled_command, filters=private_chat))
     application.add_handler(CommandHandler("post", post_command, filters=private_chat))
     application.add_handler(CommandHandler("unpost", unpost_command, filters=private_chat))
+    application.add_handler(CommandHandler("show", show_command, filters=private_chat))
     application.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^mod:"))
     application.add_handler(ChatMemberHandler(karma_member_changed, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(MessageHandler(private_chat & filters.TEXT & ~filters.COMMAND, relay_message))
@@ -107,6 +114,7 @@ async def _post_init(application: Any) -> None:
         ("scheduled", "Очередь отложенных постов"),
         ("post", "Отправить отложенный пост сейчас"),
         ("unpost", "Снять пост с отложенной публикации"),
+        ("show", "Показать готовую работу из библиотеки"),
     ]
     await application.bot.set_my_commands(commands)
     asyncio.create_task(_delivery_loop(application))
