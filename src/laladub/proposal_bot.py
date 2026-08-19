@@ -235,6 +235,11 @@ async def scheduled_post_callback(update: Any, context: Any) -> None:
             return
         await query.answer("Отменено.")
         await query.edit_message_text(f"{query.message.text}\n\nОтменено.")
+        # Give the decision buttons back on the moderator's copy of the post -
+        # scheduling had hidden them, and the submission is unresolved again.
+        submission = await asyncio.to_thread(store.get_submission, cancelled.submission_id)
+        if submission is not None:
+            await _refresh_moderator_messages(context.bot, store, submission)
         return
 
     if action == "now":
@@ -457,6 +462,7 @@ async def moderation_callback(update: Any, context: Any) -> None:
         when = datetime.fromtimestamp(slot).strftime("%H:%M")
         with contextlib.suppress(Exception):
             await query.answer(f"Запланировано на {when}.", show_alert=True)
+        await _refresh_moderator_messages(context.bot, store, submission, scheduled_for=slot)
         await query.message.reply_text(f"Работа №{submission.job_number} запланирована на {when}. Очередь: /scheduled.")
         return
 
@@ -650,18 +656,24 @@ async def _publish_to_channel(bot: Any, target_chat: str, submission: Submission
         )
 
 
-async def _refresh_moderator_messages(bot: Any, store: ProposalStore, submission: Submission) -> None:
+async def _refresh_moderator_messages(
+    bot: Any, store: ProposalStore, submission: Submission, *, scheduled_for: float | None = None
+) -> None:
+    caption = _moderation_caption(submission)
+    if scheduled_for is not None:
+        when = datetime.fromtimestamp(scheduled_for).strftime("%H:%M")
+        caption += f"\n⏳ Запланировано на {when}"
     messages = await asyncio.to_thread(store.moderator_messages, submission.id)
     for chat_id, message_id in messages:
         with contextlib.suppress(Exception):
             await bot.edit_message_caption(
                 chat_id=chat_id,
                 message_id=message_id,
-                caption=_moderation_caption(submission),
+                caption=caption,
                 parse_mode="HTML",
                 reply_markup=(
                     _moderation_keyboard(submission.id)
-                    if submission.status == "pending"
+                    if submission.status == "pending" and scheduled_for is None
                     else None
                 ),
             )

@@ -850,7 +850,7 @@ class ModerationCallbackDelayedPostingTests(unittest.IsolatedAsyncioTestCase):
     def _context(self) -> SimpleNamespace:
         return SimpleNamespace(
             application=SimpleNamespace(bot_data={"settings": self.settings, "store": self.store}),
-            bot=SimpleNamespace(),
+            bot=SimpleNamespace(edit_message_caption=AsyncMock()),
         )
 
     def _click(self, destination_action: str, submission: Submission) -> tuple[SimpleNamespace, SimpleNamespace]:
@@ -873,6 +873,18 @@ class ModerationCallbackDelayedPostingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0].destination, "main")
         query.message.reply_text.assert_awaited_once()
+
+    async def test_scheduling_hides_the_decision_buttons_on_the_moderator_message(self) -> None:
+        submission = self._submission("1")
+        self.store.record_moderator_message(submission.id, 631551040, -100, 55)
+        update, _query = self._click("main", submission)
+        context = self._context()
+        with patch("laladub.proposal_bot._publish_to_channel", new=AsyncMock()):
+            await moderation_callback(update, context)
+        context.bot.edit_message_caption.assert_awaited_once()
+        kwargs = context.bot.edit_message_caption.call_args.kwargs
+        self.assertIsNone(kwargs["reply_markup"])
+        self.assertIn("Запланировано", kwargs["caption"])
 
     async def test_second_click_on_the_same_submission_is_rejected_not_double_scheduled(self) -> None:
         submission = self._submission("1")
@@ -942,7 +954,7 @@ class ScheduledPostCallbackTests(unittest.IsolatedAsyncioTestCase):
     def _context(self) -> SimpleNamespace:
         return SimpleNamespace(
             application=SimpleNamespace(bot_data={"settings": self.settings, "store": self.store}),
-            bot=SimpleNamespace(send_message=AsyncMock()),
+            bot=SimpleNamespace(send_message=AsyncMock(), edit_message_caption=AsyncMock()),
         )
 
     async def test_cancel_marks_the_schedule_cancelled(self) -> None:
@@ -957,6 +969,22 @@ class ScheduledPostCallbackTests(unittest.IsolatedAsyncioTestCase):
         await scheduled_post_callback(update, self._context())
         self.assertEqual(self.store.pending_scheduled_posts(), [])
         query.edit_message_text.assert_awaited_once()
+
+    async def test_cancel_restores_the_decision_buttons_on_the_moderator_message(self) -> None:
+        submission, item = self._submission_and_schedule()
+        self.store.record_moderator_message(submission.id, 631551040, -100, 55)
+        query = SimpleNamespace(
+            data=f"sch:cancel:{item.id}",
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            message=SimpleNamespace(text="Работа №1 → La La School"),
+        )
+        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=631551040))
+        context = self._context()
+        await scheduled_post_callback(update, context)
+        context.bot.edit_message_caption.assert_awaited_once()
+        kwargs = context.bot.edit_message_caption.call_args.kwargs
+        self.assertIsNotNone(kwargs["reply_markup"])
 
     async def test_send_now_publishes_and_marks_sent(self) -> None:
         submission, item = self._submission_and_schedule()
