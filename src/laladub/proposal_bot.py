@@ -10,9 +10,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from datetime import datetime
+
 from .ffmpeg import probe_duration
 from .karma import format_karma_milli, karma_milli_for_duration, level_for_karma, visible_karma
-from .proposal_store import ProposalStore, Submission
+from .proposal_store import ProposalStore, ScheduledPost, Submission
+
+# How far apart consecutive posts to the same channel are spaced when /timer
+# delayed posting is on.
+DELAYED_POST_INTERVAL_SECONDS = 30 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +29,12 @@ class ProposalBotSettings:
     main_channel: str
     shame_channel: str
     karma_chat: str
+
+
+class _ApplicationContext:
+    def __init__(self, application: Any) -> None:
+        self.application = application
+        self.bot = application.bot
 
 
 def load_settings() -> ProposalBotSettings:
@@ -72,7 +84,10 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start, filters=private_chat))
     application.add_handler(CommandHandler("pending", pending, filters=private_chat))
     application.add_handler(CommandHandler("cancel", cancel, filters=private_chat))
+    application.add_handler(CommandHandler("timer", timer_command, filters=private_chat))
+    application.add_handler(CommandHandler("scheduled", scheduled_command, filters=private_chat))
     application.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^mod:"))
+    application.add_handler(CallbackQueryHandler(scheduled_post_callback, pattern=r"^sch:"))
     application.add_handler(ChatMemberHandler(karma_member_changed, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(MessageHandler(private_chat & filters.TEXT & ~filters.COMMAND, relay_message))
     application.add_handler(MessageHandler(~private_chat & filters.VIDEO, comment_on_channel_forward))
@@ -87,10 +102,13 @@ async def _post_init(application: Any) -> None:
         ("start", "Открыть предложку"),
         ("pending", "Проверить новые видео"),
         ("cancel", "Отменить ввод сообщения"),
+        ("timer", "Вкл/выкл отложенную публикацию"),
+        ("scheduled", "Очередь отложенных постов"),
     ]
     await application.bot.set_my_commands(commands)
     asyncio.create_task(_delivery_loop(application))
     asyncio.create_task(_sync_all_karma_tags(application))
+    asyncio.create_task(_scheduled_post_loop(application))
 
 
 async def _error_handler(update: object, context: Any) -> None:
@@ -127,6 +145,157 @@ async def pending(update: Any, context: Any) -> None:
 async def cancel(update: Any, context: Any) -> None:
     context.user_data.pop("relay_submission_id", None)
     await update.effective_message.reply_text("Ввод сообщения отменён.")
+
+
+async def timer_command(update: Any, context: Any) -> None:
+    settings: ProposalBotSettings = context.application.bot_data["settings"]
+    store: ProposalStore = context.application.bot_data["store"]
+    moderator_id = getattr(update.effective_user, "id", None)
+    if not _is_moderator(settings, moderator_id):
+        return
+
+    args = context.args or []
+    action = str(args[0]).strip().lower() if args else ""
+    current = await asyncio.to_thread(store.delayed_posting_enabled)
+    if action in {"on", "off"}:
+        enabled = action == "on"
+    elif action:
+        await update.effective_message.reply_text("Использование: /timer, /timer on или /timer off.")
+        return
+    else:
+        enabled = not current
+
+    if enabled != current:
+        await asyncio.to_thread(store.set_delayed_posting_enabled, enabled)
+    state = "включена" if enabled else "выключена"
+    suffix = (
+        f" Посты в один канал теперь выходят не чаще раза в {DELAYED_POST_INTERVAL_SECONDS // 60} мин."
+        if enabled
+        else ""
+    )
+    await update.effective_message.reply_text(f"Отложенная публикация теперь {state}.{suffix}")
+
+
+def _scheduled_post_keyboard(scheduled_id: int) -> Any:
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Отправить сейчас", callback_data=f"sch:now:{scheduled_id}"),
+                InlineKeyboardButton("Отменить", callback_data=f"sch:cancel:{scheduled_id}"),
+            ]
+        ]
+    )
+
+
+async def scheduled_command(update: Any, context: Any) -> None:
+    settings: ProposalBotSettings = context.application.bot_data["settings"]
+    store: ProposalStore = context.application.bot_data["store"]
+    moderator_id = getattr(update.effective_user, "id", None)
+    if not _is_moderator(settings, moderator_id):
+        return
+
+    items = await asyncio.to_thread(store.pending_scheduled_posts)
+    if not items:
+        await update.effective_message.reply_text("Очередь отложенных постов пуста.")
+        return
+
+    channel_names = {"main": "La La School", "shame": "Ghien Mi Go"}
+    for item in items:
+        submission = await asyncio.to_thread(store.get_submission, item.submission_id)
+        label = f"№{submission.job_number}" if submission is not None else f"id{item.submission_id}"
+        when = datetime.fromtimestamp(item.scheduled_for).strftime("%d.%m %H:%M")
+        channel = channel_names.get(item.destination, item.destination)
+        await update.effective_message.reply_text(
+            f"Работа {label} → {channel}, отправка в {when}",
+            reply_markup=_scheduled_post_keyboard(item.id),
+        )
+
+
+async def scheduled_post_callback(update: Any, context: Any) -> None:
+    query = update.callback_query
+    settings: ProposalBotSettings = context.application.bot_data["settings"]
+    store: ProposalStore = context.application.bot_data["store"]
+    moderator_id = getattr(update.effective_user, "id", None)
+    if not _is_moderator(settings, moderator_id):
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = str(query.data or "").split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await query.answer("Некорректная кнопка.", show_alert=True)
+        return
+    action, scheduled_id = parts[1], int(parts[2])
+
+    if action == "cancel":
+        cancelled = await asyncio.to_thread(store.cancel_scheduled_post, scheduled_id)
+        if cancelled is None:
+            await query.answer("Уже отправлено или отменено.", show_alert=True)
+            return
+        await query.answer("Отменено.")
+        await query.edit_message_text(f"{query.message.text}\n\nОтменено.")
+        return
+
+    if action == "now":
+        item = await asyncio.to_thread(store.get_scheduled_post, scheduled_id)
+        if item is None or item.status != "pending":
+            await query.answer("Уже отправлено или отменено.", show_alert=True)
+            return
+        await query.answer("Отправляю…")
+        ok = await _process_scheduled_post(context, item)
+        text = f"{query.message.text}\n\n{'Отправлено.' if ok else 'Не удалось отправить, смотри лог.'}"
+        await query.edit_message_text(text)
+        return
+
+    await query.answer("Неизвестное действие.", show_alert=True)
+
+
+async def _scheduled_post_loop(application: Any) -> None:
+    store: ProposalStore = application.bot_data["store"]
+    context = _ApplicationContext(application)
+    while True:
+        try:
+            due = await asyncio.to_thread(store.due_scheduled_posts)
+            for item in due:
+                await _process_scheduled_post(context, item)
+        except Exception as exc:
+            print(f"Scheduled post loop failed: {type(exc).__name__}: {exc}", flush=True)
+        await asyncio.sleep(20.0)
+
+
+async def _process_scheduled_post(context: Any, item: ScheduledPost) -> bool:
+    """Actually publishes one due scheduled post. Returns whether it succeeded -
+    on failure the row stays 'pending' so the loop retries it on its next pass."""
+    store: ProposalStore = context.application.bot_data["store"]
+    submission = await asyncio.to_thread(store.get_submission, item.submission_id)
+    if submission is None:
+        await asyncio.to_thread(store.mark_scheduled_sent, item.id)
+        return False
+
+    claimed = await asyncio.to_thread(store.try_claim, item.submission_id, item.moderator_id)
+    if claimed is None:
+        # Someone is mid-decision on this submission right now - retry next tick.
+        return False
+
+    karma_before = await asyncio.to_thread(store.karma_total, claimed.user_id)
+    try:
+        updated, delta = await _finish_and_publish(
+            context, claimed, item.moderator_id, item.destination, item.target_chat
+        )
+    except Exception as exc:
+        await asyncio.to_thread(store.release_claim, item.submission_id, item.moderator_id)
+        print(f"Scheduled post {item.id} (submission {item.submission_id}) failed: {type(exc).__name__}: {exc}", flush=True)
+        return False
+
+    await asyncio.to_thread(store.mark_scheduled_sent, item.id)
+    effects_text = await _after_decision_effects(context, updated, karma_before, item.moderator_id, delta)
+    with contextlib.suppress(Exception):
+        await context.bot.send_message(
+            chat_id=item.moderator_id,
+            text=f"Отложенный пост опубликован: работа №{updated.job_number}. {effects_text}",
+        )
+    return True
 
 
 async def _delivery_loop(application: Any) -> None:
@@ -258,6 +427,39 @@ async def moderation_callback(update: Any, context: Any) -> None:
         await query.answer("Это решение уже применено.")
         return
 
+    existing_schedule = await asyncio.to_thread(store.pending_schedule_for_submission, submission_id)
+    if existing_schedule is not None:
+        when = datetime.fromtimestamp(existing_schedule.scheduled_for).strftime("%H:%M")
+        await query.answer(f"Уже запланировано на {when}. Очередь: /scheduled.", show_alert=True)
+        return
+
+    if target_chat is not None and await asyncio.to_thread(store.delayed_posting_enabled):
+        claimed = await asyncio.to_thread(store.try_claim, submission_id, int(moderator_id))
+        if claimed is None:
+            await query.answer("Эту заявку сейчас обрабатывает другой модератор.", show_alert=True)
+            return
+        # The claim only needs to guard this brief scheduling step, not the
+        # up-to-30-minute wait for the slot - release it immediately so it
+        # doesn't sit blocking other decisions until the 10-minute staleness
+        # window expires.
+        await asyncio.to_thread(store.release_claim, submission_id, int(moderator_id))
+        slot = await asyncio.to_thread(
+            store.next_available_slot, destination, interval_seconds=DELAYED_POST_INTERVAL_SECONDS
+        )
+        await asyncio.to_thread(
+            store.schedule_post,
+            submission_id=submission_id,
+            destination=destination,
+            target_chat=target_chat,
+            moderator_id=int(moderator_id),
+            scheduled_for=slot,
+        )
+        when = datetime.fromtimestamp(slot).strftime("%H:%M")
+        with contextlib.suppress(Exception):
+            await query.answer(f"Запланировано на {when}.", show_alert=True)
+        await query.message.reply_text(f"Работа №{submission.job_number} запланирована на {when}. Очередь: /scheduled.")
+        return
+
     claimed = await asyncio.to_thread(store.try_claim, submission_id, int(moderator_id))
     if claimed is None:
         await query.answer("Эту заявку сейчас обрабатывает другой модератор.", show_alert=True)
@@ -268,32 +470,52 @@ async def moderation_callback(update: Any, context: Any) -> None:
     # publish and leave the claim stuck for the full staleness window.
     with contextlib.suppress(Exception):
         await query.answer("Публикую…" if target_chat else "Отмечаю…")
+    karma_before = await asyncio.to_thread(store.karma_total, claimed.user_id)
+    try:
+        updated, delta = await _finish_and_publish(context, claimed, int(moderator_id), destination, target_chat)
+    except Exception as exc:
+        await asyncio.to_thread(store.release_claim, submission_id, int(moderator_id))
+        await query.message.reply_text(f"Не удалось применить решение: {type(exc).__name__}: {exc}")
+        return
+
+    effects_text = await _after_decision_effects(context, updated, karma_before, int(moderator_id), delta)
+    await query.message.reply_text(f"Решение применено. {effects_text}")
+
+
+async def _finish_and_publish(
+    context: Any,
+    claimed: Submission,
+    moderator_id: int,
+    destination: str,
+    target_chat: str | None,
+) -> tuple[Submission, int]:
+    """Runs the actual publish + karma-award pipeline for a claimed submission.
+    Shared by the immediate-decision path and the delayed-post sender so both
+    apply the exact same effects at the moment a post actually goes out."""
+    store: ProposalStore = context.application.bot_data["store"]
+    duration_ms = claimed.duration_ms
+    if duration_ms <= 0 and Path(claimed.video_path).is_file():
+        duration_ms = max(0, round(await asyncio.to_thread(probe_duration, Path(claimed.video_path)) * 1000))
+        claimed = await asyncio.to_thread(store.set_submission_duration, claimed.id, duration_ms)
+    award_milli = karma_milli_for_duration(duration_ms, destination)
     new_message = None
     try:
-        karma_before = await asyncio.to_thread(store.karma_total, claimed.user_id)
-        duration_ms = claimed.duration_ms
-        if duration_ms <= 0 and Path(claimed.video_path).is_file():
-            duration_ms = max(0, round(await asyncio.to_thread(probe_duration, Path(claimed.video_path)) * 1000))
-            claimed = await asyncio.to_thread(store.set_submission_duration, claimed.id, duration_ms)
-        award_milli = karma_milli_for_duration(duration_ms, destination)
         if target_chat is not None:
             new_message = await _publish_to_channel(context.bot, target_chat, claimed)
         updated, delta = await asyncio.to_thread(
             store.finish_decision,
-            submission_id=submission_id,
-            moderator_id=int(moderator_id),
+            submission_id=claimed.id,
+            moderator_id=moderator_id,
             destination=destination,
             award_milli=award_milli,
             publication_chat_id=int(new_message.chat_id) if new_message is not None else None,
             publication_message_id=int(new_message.message_id) if new_message is not None else None,
         )
-    except Exception as exc:
+    except Exception:
         if new_message is not None:
             with contextlib.suppress(Exception):
                 await context.bot.delete_message(new_message.chat_id, new_message.message_id)
-        await asyncio.to_thread(store.release_claim, submission_id, int(moderator_id))
-        await query.message.reply_text(f"Не удалось применить решение: {type(exc).__name__}: {exc}")
-        return
+        raise
 
     if (
         claimed.publication_chat_id is not None
@@ -306,16 +528,21 @@ async def moderation_callback(update: Any, context: Any) -> None:
         with contextlib.suppress(Exception):
             await context.bot.delete_message(claimed.publication_chat_id, claimed.publication_message_id)
 
+    return updated, delta
+
+
+async def _after_decision_effects(
+    context: Any, updated: Submission, karma_before: int, moderator_id: int, delta: int
+) -> str:
+    """Karma level-up notice, group karma tag, moderator message refresh - and
+    a summary line for whoever should be told the decision went through."""
+    settings: ProposalBotSettings = context.application.bot_data["settings"]
+    store: ProposalStore = context.application.bot_data["store"]
     karma_after = await asyncio.to_thread(store.karma_total, updated.user_id)
     level_message = _level_up_message(karma_before, karma_after)
     if level_message:
         try:
-            await asyncio.to_thread(
-                store.enqueue_author_message,
-                updated.id,
-                int(moderator_id),
-                level_message,
-            )
+            await asyncio.to_thread(store.enqueue_author_message, updated.id, moderator_id, level_message)
         except Exception as exc:
             print(
                 f"Could not enqueue level-up notice user={updated.user_id}: {type(exc).__name__}: {exc}",
@@ -326,7 +553,7 @@ async def moderation_callback(update: Any, context: Any) -> None:
     await _refresh_moderator_messages(context.bot, store, updated)
     delta_text = f"Карма: {format_karma_milli(delta, signed=True)}" if delta else "Карма без изменений"
     tag_text = " Тег в группе обновлён." if tag_updated else ""
-    await query.message.reply_text(f"Решение применено. {delta_text}.{tag_text}")
+    return f"{delta_text}.{tag_text}"
 
 
 async def karma_member_changed(update: Any, context: Any) -> None:

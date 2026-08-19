@@ -9,6 +9,19 @@ from typing import Any, Iterator
 
 
 @dataclass(frozen=True, slots=True)
+class ScheduledPost:
+    id: int
+    submission_id: int
+    destination: str
+    target_chat: str
+    moderator_id: int
+    scheduled_for: float
+    status: str
+    created_at: float
+    sent_at: float | None
+
+
+@dataclass(frozen=True, slots=True)
 class Submission:
     id: int
     job_number: str
@@ -122,6 +135,23 @@ class ProposalStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS scheduled_posts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    submission_id INTEGER NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
+                    destination TEXT NOT NULL,
+                    target_chat TEXT NOT NULL,
+                    moderator_id INTEGER NOT NULL,
+                    scheduled_for REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at REAL NOT NULL,
+                    sent_at REAL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_scheduled_posts_status
+                    ON scheduled_posts(status, scheduled_for);
+                CREATE INDEX IF NOT EXISTS idx_scheduled_posts_submission
+                    ON scheduled_posts(submission_id, status);
 
                 CREATE INDEX IF NOT EXISTS idx_submissions_status
                     ON submissions(status, created_at);
@@ -586,6 +616,114 @@ class ProposalStore:
             )
         return cursor.rowcount > 0
 
+    def delayed_posting_enabled(self) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM store_metadata WHERE key = 'delayed_posting_enabled'"
+            ).fetchone()
+        return row is not None and row["value"] == "1"
+
+    def set_delayed_posting_enabled(self, enabled: bool) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO store_metadata(key, value) VALUES ('delayed_posting_enabled', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("1" if enabled else "0",),
+            )
+
+    def next_available_slot(self, destination: str, *, interval_seconds: float, now: float | None = None) -> float:
+        """The earliest time a new post to this destination may go out: `now`
+        if enough time has passed since the last one, otherwise last + interval.
+        "Last" covers both already-sent posts and ones still waiting in the
+        queue, so a burst of clicks chains into consecutive slots instead of
+        piling up on the same one."""
+        now = now if now is not None else time.time()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT MAX(t) AS last_t FROM (
+                    SELECT updated_at AS t FROM submissions
+                        WHERE destination = ? AND publication_message_id IS NOT NULL
+                    UNION ALL
+                    SELECT scheduled_for AS t FROM scheduled_posts WHERE destination = ?
+                )
+                """,
+                (destination, destination),
+            ).fetchone()
+        last_t = row["last_t"] if row is not None else None
+        if last_t is None:
+            return now
+        return max(now, float(last_t) + interval_seconds)
+
+    def pending_schedule_for_submission(self, submission_id: int) -> ScheduledPost | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM scheduled_posts WHERE submission_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+                (submission_id,),
+            ).fetchone()
+        return _scheduled_post_from_row(row) if row is not None else None
+
+    def schedule_post(
+        self, *, submission_id: int, destination: str, target_chat: str, moderator_id: int, scheduled_for: float
+    ) -> ScheduledPost:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO scheduled_posts (
+                    submission_id, destination, target_chat, moderator_id, scheduled_for, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (submission_id, destination, target_chat, moderator_id, scheduled_for, time.time()),
+            )
+            row = connection.execute(
+                "SELECT * FROM scheduled_posts WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Could not create scheduled post")
+        return _scheduled_post_from_row(row)
+
+    def pending_scheduled_posts(self) -> list[ScheduledPost]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM scheduled_posts WHERE status = 'pending' ORDER BY scheduled_for ASC"
+            ).fetchall()
+        return [_scheduled_post_from_row(row) for row in rows]
+
+    def due_scheduled_posts(self, now: float | None = None) -> list[ScheduledPost]:
+        now = now if now is not None else time.time()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM scheduled_posts WHERE status = 'pending' AND scheduled_for <= ? ORDER BY scheduled_for ASC",
+                (now,),
+            ).fetchall()
+        return [_scheduled_post_from_row(row) for row in rows]
+
+    def get_scheduled_post(self, scheduled_id: int) -> ScheduledPost | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM scheduled_posts WHERE id = ?", (scheduled_id,)).fetchone()
+        return _scheduled_post_from_row(row) if row is not None else None
+
+    def mark_scheduled_sent(self, scheduled_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE scheduled_posts SET status = 'sent', sent_at = ? WHERE id = ? AND status = 'pending'",
+                (time.time(), scheduled_id),
+            )
+
+    def cancel_scheduled_post(self, scheduled_id: int) -> ScheduledPost | None:
+        """Marks a still-pending scheduled post cancelled. Returns None (a
+        no-op) if it was already sent or cancelled by someone else."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM scheduled_posts WHERE id = ? AND status = 'pending'", (scheduled_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute("UPDATE scheduled_posts SET status = 'cancelled' WHERE id = ?", (scheduled_id,))
+        return _scheduled_post_from_row(row)
+
 
 def _submission_from_row(row: sqlite3.Row) -> Submission:
     return Submission(
@@ -608,4 +746,18 @@ def _submission_from_row(row: sqlite3.Row) -> Submission:
         ),
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),
+    )
+
+
+def _scheduled_post_from_row(row: sqlite3.Row) -> ScheduledPost:
+    return ScheduledPost(
+        id=int(row["id"]),
+        submission_id=int(row["submission_id"]),
+        destination=str(row["destination"]),
+        target_chat=str(row["target_chat"]),
+        moderator_id=int(row["moderator_id"]),
+        scheduled_for=float(row["scheduled_for"]),
+        status=str(row["status"]),
+        created_at=float(row["created_at"]),
+        sent_at=float(row["sent_at"]) if row["sent_at"] is not None else None,
     )

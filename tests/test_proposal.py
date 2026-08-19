@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from laladub.bot import _find_proposal_video_path
 from laladub.karma import (
@@ -14,6 +14,7 @@ from laladub.karma import (
     visible_karma,
 )
 from laladub.proposal_bot import (
+    DELAYED_POST_INTERVAL_SECONDS,
     ProposalBotSettings,
     _author_caption,
     _find_submission_original_video,
@@ -22,9 +23,12 @@ from laladub.proposal_bot import (
     _level_up_message,
     _moderation_caption,
     _moderation_keyboard,
+    _process_scheduled_post,
     _transcript_text_for_submission,
     comment_on_channel_forward,
     moderation_callback,
+    scheduled_post_callback,
+    timer_command,
 )
 from laladub.proposal_store import ProposalStore, Submission
 
@@ -724,6 +728,363 @@ class ModerationCallbackClaimReleaseTests(unittest.IsolatedAsyncioTestCase):
         # The claim must be released immediately, not left to expire after the
         # 10-minute staleness window - a second moderator can act right away.
         self.assertIsNotNone(self.store.try_claim(submission.id, 999))
+
+
+class DelayedPostingStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = ProposalStore(Path(self._tempdir.name) / "proposal.sqlite3")
+
+    def _submission(self, job_number: str) -> Submission:
+        submission, _created = self.store.create_submission(
+            job_number=job_number, user_id=123, chat_id=123, author_name="Тест", author_username=None,
+            video_path=Path(self._tempdir.name) / f"{job_number}.mp4", output_filename="dubbed.mp4",
+        )
+        return submission
+
+    def test_disabled_by_default(self) -> None:
+        self.assertFalse(self.store.delayed_posting_enabled())
+
+    def test_toggle_persists(self) -> None:
+        self.store.set_delayed_posting_enabled(True)
+        self.assertTrue(self.store.delayed_posting_enabled())
+        self.store.set_delayed_posting_enabled(False)
+        self.assertFalse(self.store.delayed_posting_enabled())
+
+    def test_next_slot_is_now_when_nothing_scheduled(self) -> None:
+        now = 1_000_000.0
+        self.assertEqual(self.store.next_available_slot("main", interval_seconds=1800, now=now), now)
+
+    def test_next_slot_chains_after_a_pending_schedule(self) -> None:
+        now = 1_000_000.0
+        submission = self._submission("1")
+        self.store.schedule_post(
+            submission_id=submission.id, destination="main", target_chat="@x", moderator_id=1,
+            scheduled_for=now + 900,
+        )
+        # A request arriving before that slot fires chains onto +interval, not
+        # onto "now" - this is what keeps two posts from ever sharing a slot.
+        slot = self.store.next_available_slot("main", interval_seconds=1800, now=now)
+        self.assertEqual(slot, now + 900 + 1800)
+
+    def test_next_slot_is_now_when_the_last_post_is_old_enough(self) -> None:
+        now = 1_000_000.0
+        submission = self._submission("1")
+        self.store.schedule_post(
+            submission_id=submission.id, destination="main", target_chat="@x", moderator_id=1,
+            scheduled_for=now - 4000,
+        )
+        self.assertEqual(self.store.next_available_slot("main", interval_seconds=1800, now=now), now)
+
+    def test_channels_are_spaced_independently(self) -> None:
+        now = 1_000_000.0
+        submission = self._submission("1")
+        self.store.schedule_post(
+            submission_id=submission.id, destination="main", target_chat="@x", moderator_id=1,
+            scheduled_for=now + 900,
+        )
+        self.assertEqual(self.store.next_available_slot("shame", interval_seconds=1800, now=now), now)
+
+    def test_cancel_is_idempotent_and_frees_the_slot(self) -> None:
+        submission = self._submission("1")
+        item = self.store.schedule_post(
+            submission_id=submission.id, destination="main", target_chat="@x", moderator_id=1,
+            scheduled_for=1_000_000.0,
+        )
+        self.assertEqual(len(self.store.pending_scheduled_posts()), 1)
+        self.assertIsNotNone(self.store.cancel_scheduled_post(item.id))
+        self.assertEqual(self.store.pending_scheduled_posts(), [])
+        self.assertIsNone(self.store.cancel_scheduled_post(item.id))
+
+    def test_due_scheduled_posts_only_returns_items_at_or_past_their_slot(self) -> None:
+        first = self._submission("1")
+        second = self._submission("2")
+        self.store.schedule_post(
+            submission_id=first.id, destination="main", target_chat="@x", moderator_id=1, scheduled_for=1_000_000.0
+        )
+        self.store.schedule_post(
+            submission_id=second.id, destination="main", target_chat="@x", moderator_id=1, scheduled_for=2_000_000.0
+        )
+        due = self.store.due_scheduled_posts(now=1_500_000.0)
+        self.assertEqual([item.submission_id for item in due], [first.id])
+
+    def test_pending_schedule_for_submission(self) -> None:
+        submission = self._submission("1")
+        self.assertIsNone(self.store.pending_schedule_for_submission(submission.id))
+        self.store.schedule_post(
+            submission_id=submission.id, destination="main", target_chat="@x", moderator_id=1,
+            scheduled_for=1_000_000.0,
+        )
+        self.assertIsNotNone(self.store.pending_schedule_for_submission(submission.id))
+
+
+class _FakePublishedMessage:
+    def __init__(self, chat_id: object, message_id: int) -> None:
+        self.chat_id = chat_id
+        self.message_id = message_id
+
+
+class ModerationCallbackDelayedPostingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = ProposalStore(Path(self._tempdir.name) / "proposal.sqlite3")
+        self.store.set_delayed_posting_enabled(True)
+        self.settings = ProposalBotSettings(
+            token="x",
+            database=Path(self._tempdir.name) / "proposal.sqlite3",
+            moderator_ids=frozenset({631551040}),
+            main_channel="@elevenlabss",
+            shame_channel="@ghienmigo",
+            karma_chat="@lalaschoo",
+        )
+
+    def _submission(self, job_number: str) -> Submission:
+        submission, _created = self.store.create_submission(
+            job_number=job_number, user_id=123, chat_id=123, author_name="Тест", author_username=None,
+            video_path=Path(self._tempdir.name) / f"{job_number}.mp4", output_filename="dubbed.mp4",
+        )
+        return submission
+
+    def _context(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            application=SimpleNamespace(bot_data={"settings": self.settings, "store": self.store}),
+            bot=SimpleNamespace(),
+        )
+
+    def _click(self, destination_action: str, submission: Submission) -> tuple[SimpleNamespace, SimpleNamespace]:
+        query = SimpleNamespace(
+            data=f"mod:{destination_action}:{submission.id}",
+            answer=AsyncMock(),
+            message=SimpleNamespace(reply_text=AsyncMock(), text="video"),
+        )
+        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=631551040))
+        return update, query
+
+    async def test_publish_click_schedules_instead_of_publishing_immediately(self) -> None:
+        submission = self._submission("1")
+        update, query = self._click("main", submission)
+        with patch("laladub.proposal_bot._publish_to_channel", new=AsyncMock()) as publish:
+            await moderation_callback(update, self._context())
+        publish.assert_not_called()
+        self.assertIsNone(self.store.get_submission(submission.id).destination)
+        pending = self.store.pending_scheduled_posts()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].destination, "main")
+        query.message.reply_text.assert_awaited_once()
+
+    async def test_second_click_on_the_same_submission_is_rejected_not_double_scheduled(self) -> None:
+        submission = self._submission("1")
+        with patch("laladub.proposal_bot._publish_to_channel", new=AsyncMock()):
+            update, _query = self._click("main", submission)
+            await moderation_callback(update, self._context())
+            update2, query2 = self._click("main", submission)
+            await moderation_callback(update2, self._context())
+        self.assertEqual(len(self.store.pending_scheduled_posts()), 1)
+        query2.answer.assert_awaited()
+        self.assertIn("запланировано", query2.answer.call_args.args[0].lower())
+
+    async def test_second_and_third_click_chain_into_consecutive_slots(self) -> None:
+        # Three quick clicks with nothing sent yet still land on three
+        # different slots, each `DELAYED_POST_INTERVAL_SECONDS` apart - the
+        # not-yet-sent rows already reserve their place in the chain.
+        first = self._submission("1")
+        second = self._submission("2")
+        third = self._submission("3")
+        with patch("laladub.proposal_bot._publish_to_channel", new=AsyncMock()):
+            update1, _query1 = self._click("main", first)
+            await moderation_callback(update1, self._context())
+            update2, _query2 = self._click("main", second)
+            await moderation_callback(update2, self._context())
+            update3, _query3 = self._click("main", third)
+            await moderation_callback(update3, self._context())
+
+        first_slot = self.store.pending_schedule_for_submission(first.id).scheduled_for
+        second_slot = self.store.pending_schedule_for_submission(second.id).scheduled_for
+        third_slot = self.store.pending_schedule_for_submission(third.id).scheduled_for
+        self.assertAlmostEqual(second_slot - first_slot, DELAYED_POST_INTERVAL_SECONDS, delta=2)
+        self.assertAlmostEqual(third_slot - second_slot, DELAYED_POST_INTERVAL_SECONDS, delta=2)
+
+    async def test_reject_bypasses_the_delay_queue(self) -> None:
+        submission = self._submission("1")
+        update, _query = self._click("reject", submission)
+        await moderation_callback(update, self._context())
+        self.assertEqual(self.store.get_submission(submission.id).destination, "rejected")
+        self.assertEqual(self.store.pending_scheduled_posts(), [])
+
+
+class ScheduledPostCallbackTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = ProposalStore(Path(self._tempdir.name) / "proposal.sqlite3")
+        self.settings = ProposalBotSettings(
+            token="x",
+            database=Path(self._tempdir.name) / "proposal.sqlite3",
+            moderator_ids=frozenset({631551040}),
+            main_channel="@elevenlabss",
+            shame_channel="@ghienmigo",
+            karma_chat="@lalaschoo",
+        )
+
+    def _submission_and_schedule(self):
+        submission, _created = self.store.create_submission(
+            job_number="1", user_id=123, chat_id=123, author_name="Тест", author_username=None,
+            video_path=Path(self._tempdir.name) / "dubbed.mp4", output_filename="dubbed.mp4",
+        )
+        item = self.store.schedule_post(
+            submission_id=submission.id, destination="main", target_chat="@elevenlabss", moderator_id=631551040,
+            scheduled_for=1_000_000.0,
+        )
+        return submission, item
+
+    def _context(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            application=SimpleNamespace(bot_data={"settings": self.settings, "store": self.store}),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+    async def test_cancel_marks_the_schedule_cancelled(self) -> None:
+        _submission, item = self._submission_and_schedule()
+        query = SimpleNamespace(
+            data=f"sch:cancel:{item.id}",
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            message=SimpleNamespace(text="Работа №1 → La La School"),
+        )
+        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=631551040))
+        await scheduled_post_callback(update, self._context())
+        self.assertEqual(self.store.pending_scheduled_posts(), [])
+        query.edit_message_text.assert_awaited_once()
+
+    async def test_send_now_publishes_and_marks_sent(self) -> None:
+        submission, item = self._submission_and_schedule()
+        query = SimpleNamespace(
+            data=f"sch:now:{item.id}",
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            message=SimpleNamespace(text="Работа №1 → La La School"),
+        )
+        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=631551040))
+        fake_message = _FakePublishedMessage(chat_id=-1001, message_id=42)
+        with patch("laladub.proposal_bot._publish_to_channel", new=AsyncMock(return_value=fake_message)):
+            await scheduled_post_callback(update, self._context())
+        updated = self.store.get_submission(submission.id)
+        self.assertEqual(updated.destination, "main")
+        self.assertEqual(updated.publication_message_id, 42)
+        self.assertEqual(self.store.pending_scheduled_posts(), [])
+        self.assertIn("Отправлено", query.edit_message_text.call_args.args[0])
+
+    async def test_non_moderator_is_rejected(self) -> None:
+        _submission, item = self._submission_and_schedule()
+        query = SimpleNamespace(data=f"sch:cancel:{item.id}", answer=AsyncMock())
+        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=1))
+        await scheduled_post_callback(update, self._context())
+        self.assertEqual(len(self.store.pending_scheduled_posts()), 1)
+        query.answer.assert_awaited_once()
+
+
+class ProcessScheduledPostTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = ProposalStore(Path(self._tempdir.name) / "proposal.sqlite3")
+        self.settings = ProposalBotSettings(
+            token="x",
+            database=Path(self._tempdir.name) / "proposal.sqlite3",
+            moderator_ids=frozenset({631551040}),
+            main_channel="@elevenlabss",
+            shame_channel="@ghienmigo",
+            karma_chat="@lalaschoo",
+        )
+
+    def _context(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            application=SimpleNamespace(bot_data={"settings": self.settings, "store": self.store}),
+            bot=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+    async def test_due_post_is_published_and_moderator_is_notified(self) -> None:
+        submission, _created = self.store.create_submission(
+            job_number="1", user_id=123, chat_id=123, author_name="Тест", author_username=None,
+            video_path=Path(self._tempdir.name) / "dubbed.mp4", output_filename="dubbed.mp4",
+        )
+        item = self.store.schedule_post(
+            submission_id=submission.id, destination="main", target_chat="@elevenlabss", moderator_id=631551040,
+            scheduled_for=1_000_000.0,
+        )
+        fake_message = _FakePublishedMessage(chat_id=-1001, message_id=7)
+        context = self._context()
+        with patch("laladub.proposal_bot._publish_to_channel", new=AsyncMock(return_value=fake_message)):
+            ok = await _process_scheduled_post(context, item)
+        self.assertTrue(ok)
+        updated = self.store.get_submission(submission.id)
+        self.assertEqual(updated.destination, "main")
+        self.assertEqual(updated.publication_message_id, 7)
+        self.assertEqual(self.store.due_scheduled_posts(now=2_000_000.0), [])
+        context.bot.send_message.assert_awaited_once()
+        self.assertEqual(context.bot.send_message.call_args.kwargs["chat_id"], 631551040)
+
+    async def test_publish_failure_keeps_the_post_pending_for_a_retry(self) -> None:
+        submission, _created = self.store.create_submission(
+            job_number="1", user_id=123, chat_id=123, author_name="Тест", author_username=None,
+            video_path=Path(self._tempdir.name) / "dubbed.mp4", output_filename="dubbed.mp4",
+        )
+        item = self.store.schedule_post(
+            submission_id=submission.id, destination="main", target_chat="@elevenlabss", moderator_id=631551040,
+            scheduled_for=1_000_000.0,
+        )
+        context = self._context()
+        with patch("laladub.proposal_bot._publish_to_channel", new=AsyncMock(side_effect=RuntimeError("boom"))):
+            ok = await _process_scheduled_post(context, item)
+        self.assertFalse(ok)
+        self.assertEqual(self.store.get_submission(submission.id).destination, None)
+        self.assertEqual(len(self.store.due_scheduled_posts(now=2_000_000.0)), 1)
+
+
+class TimerCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = ProposalStore(Path(self._tempdir.name) / "proposal.sqlite3")
+        self.settings = ProposalBotSettings(
+            token="x",
+            database=Path(self._tempdir.name) / "proposal.sqlite3",
+            moderator_ids=frozenset({631551040}),
+            main_channel="@elevenlabss",
+            shame_channel="@ghienmigo",
+            karma_chat="@lalaschoo",
+        )
+
+    def _context(self, args: list[str] | None = None) -> SimpleNamespace:
+        return SimpleNamespace(
+            application=SimpleNamespace(bot_data={"settings": self.settings, "store": self.store}),
+            args=args or [],
+        )
+
+    async def test_bare_command_toggles_state(self) -> None:
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=631551040), effective_message=message)
+        await timer_command(update, self._context())
+        self.assertTrue(self.store.delayed_posting_enabled())
+        await timer_command(update, self._context())
+        self.assertFalse(self.store.delayed_posting_enabled())
+
+    async def test_explicit_on_and_off(self) -> None:
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=631551040), effective_message=message)
+        await timer_command(update, self._context(["on"]))
+        self.assertTrue(self.store.delayed_posting_enabled())
+        await timer_command(update, self._context(["off"]))
+        self.assertFalse(self.store.delayed_posting_enabled())
+
+    async def test_non_moderator_cannot_toggle(self) -> None:
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=1), effective_message=message)
+        await timer_command(update, self._context(["on"]))
+        self.assertFalse(self.store.delayed_posting_enabled())
+        message.reply_text.assert_not_awaited()
 
 
 class FindOriginalVideoTests(unittest.TestCase):
