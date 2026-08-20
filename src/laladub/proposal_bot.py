@@ -95,6 +95,7 @@ def main() -> None:
     application.add_handler(CommandHandler("post", post_command, filters=private_chat))
     application.add_handler(CommandHandler("unpost", unpost_command, filters=private_chat))
     application.add_handler(CommandHandler("show", show_command, filters=private_chat))
+    application.add_handler(CommandHandler("clean", clean_command, filters=private_chat))
     application.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^mod:"))
     application.add_handler(ChatMemberHandler(karma_member_changed, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(MessageHandler(private_chat & filters.TEXT & ~filters.COMMAND, relay_message))
@@ -115,6 +116,7 @@ async def _post_init(application: Any) -> None:
         ("post", "Отправить отложенный пост сейчас"),
         ("unpost", "Снять пост с отложенной публикации"),
         ("show", "Показать готовую работу из библиотеки"),
+        ("clean", "Очистить чат от лишних сообщений"),
     ]
     await application.bot.set_my_commands(commands)
     asyncio.create_task(_delivery_loop(application))
@@ -130,32 +132,49 @@ def _is_moderator(settings: ProposalBotSettings, user_id: int | None) -> bool:
     return user_id is not None and user_id in settings.moderator_ids
 
 
+async def _note(store: ProposalStore, moderator_id: int, message: Any) -> None:
+    """Tracks a status/confirmation message the bot just sent a moderator, so
+    /clean can find and remove it later without touching still-pending videos."""
+    if message is None:
+        return
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(store.record_bot_note, moderator_id, int(message.chat_id), int(message.message_id))
+
+
 async def start(update: Any, context: Any) -> None:
     settings: ProposalBotSettings = context.application.bot_data["settings"]
+    store: ProposalStore = context.application.bot_data["store"]
     user_id = getattr(update.effective_user, "id", None)
     if not _is_moderator(settings, user_id):
         await update.effective_message.reply_text("Этот бот предназначен только для модераторов предложки.")
         return
-    await update.effective_message.reply_text(
+    sent = await update.effective_message.reply_text(
         "Предложка La La School запущена. Новые видео будут появляться здесь автоматически."
     )
+    await _note(store, int(user_id), sent)
     await _deliver_for_moderator(context.application, int(user_id))
 
 
 async def pending(update: Any, context: Any) -> None:
     settings: ProposalBotSettings = context.application.bot_data["settings"]
+    store: ProposalStore = context.application.bot_data["store"]
     user_id = getattr(update.effective_user, "id", None)
     if not _is_moderator(settings, user_id):
         await update.effective_message.reply_text("Нет доступа.")
         return
     delivered = await _deliver_for_moderator(context.application, int(user_id))
     if delivered == 0:
-        await update.effective_message.reply_text("Новых видео пока нет.")
+        sent = await update.effective_message.reply_text("Новых видео пока нет.")
+        await _note(store, int(user_id), sent)
 
 
 async def cancel(update: Any, context: Any) -> None:
     context.user_data.pop("relay_submission_id", None)
-    await update.effective_message.reply_text("Ввод сообщения отменён.")
+    store: ProposalStore = context.application.bot_data["store"]
+    user_id = getattr(update.effective_user, "id", None)
+    sent = await update.effective_message.reply_text("Ввод сообщения отменён.")
+    if user_id is not None:
+        await _note(store, int(user_id), sent)
 
 
 async def timer_command(update: Any, context: Any) -> None:
@@ -171,7 +190,8 @@ async def timer_command(update: Any, context: Any) -> None:
     if action in {"on", "off"}:
         enabled = action == "on"
     elif action:
-        await update.effective_message.reply_text("Использование: /timer, /timer on или /timer off.")
+        sent = await update.effective_message.reply_text("Использование: /timer, /timer on или /timer off.")
+        await _note(store, int(moderator_id), sent)
         return
     else:
         enabled = not current
@@ -184,7 +204,8 @@ async def timer_command(update: Any, context: Any) -> None:
         if enabled
         else ""
     )
-    await update.effective_message.reply_text(f"Отложенная публикация теперь {state}.{suffix}")
+    sent = await update.effective_message.reply_text(f"Отложенная публикация теперь {state}.{suffix}")
+    await _note(store, int(moderator_id), sent)
 
 
 async def scheduled_command(update: Any, context: Any) -> None:
@@ -196,7 +217,8 @@ async def scheduled_command(update: Any, context: Any) -> None:
 
     items = await asyncio.to_thread(store.pending_scheduled_posts)
     if not items:
-        await update.effective_message.reply_text("Очередь отложенных постов пуста.")
+        sent = await update.effective_message.reply_text("Очередь отложенных постов пуста.")
+        await _note(store, int(moderator_id), sent)
         return
 
     channel_names = {"main": "La La School", "shame": "Ghien Mi Go"}
@@ -209,7 +231,8 @@ async def scheduled_command(update: Any, context: Any) -> None:
         lines.append(f"Работа {label} → {channel}, отправка в {when}")
     lines.append("")
     lines.append("Отправить сейчас: /post номер\nОтменить: /unpost номер")
-    await update.effective_message.reply_text("\n".join(lines))
+    sent = await update.effective_message.reply_text("\n".join(lines))
+    await _note(store, int(moderator_id), sent)
 
 
 async def post_command(update: Any, context: Any) -> None:
@@ -222,19 +245,22 @@ async def post_command(update: Any, context: Any) -> None:
     args = context.args or []
     job_number = str(args[0]).strip() if args else ""
     if not job_number:
-        await update.effective_message.reply_text("Использование: /post номер_работы")
+        sent = await update.effective_message.reply_text("Использование: /post номер_работы")
+        await _note(store, int(moderator_id), sent)
         return
 
     item = await asyncio.to_thread(store.find_pending_schedule_by_job_number, job_number)
     if item is None:
-        await update.effective_message.reply_text(f"Работа №{job_number} не найдена в очереди отложенных постов.")
+        sent = await update.effective_message.reply_text(f"Работа №{job_number} не найдена в очереди отложенных постов.")
+        await _note(store, int(moderator_id), sent)
         return
 
     ok = await _process_scheduled_post(context, item)
     if ok:
-        await update.effective_message.reply_text(f"Работа №{job_number} отправлена.")
+        sent = await update.effective_message.reply_text(f"Работа №{job_number} отправлена.")
     else:
-        await update.effective_message.reply_text(f"Не удалось отправить работу №{job_number}, смотри лог.")
+        sent = await update.effective_message.reply_text(f"Не удалось отправить работу №{job_number}, смотри лог.")
+    await _note(store, int(moderator_id), sent)
 
 
 async def unpost_command(update: Any, context: Any) -> None:
@@ -247,25 +273,71 @@ async def unpost_command(update: Any, context: Any) -> None:
     args = context.args or []
     job_number = str(args[0]).strip() if args else ""
     if not job_number:
-        await update.effective_message.reply_text("Использование: /unpost номер_работы")
+        sent = await update.effective_message.reply_text("Использование: /unpost номер_работы")
+        await _note(store, int(moderator_id), sent)
         return
 
     item = await asyncio.to_thread(store.find_pending_schedule_by_job_number, job_number)
     if item is None:
-        await update.effective_message.reply_text(f"Работа №{job_number} не найдена в очереди отложенных постов.")
+        sent = await update.effective_message.reply_text(f"Работа №{job_number} не найдена в очереди отложенных постов.")
+        await _note(store, int(moderator_id), sent)
         return
 
     cancelled = await asyncio.to_thread(store.cancel_scheduled_post, item.id)
     if cancelled is None:
-        await update.effective_message.reply_text(f"Работа №{job_number} уже отправлена или отменена.")
+        sent = await update.effective_message.reply_text(f"Работа №{job_number} уже отправлена или отменена.")
+        await _note(store, int(moderator_id), sent)
         return
 
-    await update.effective_message.reply_text(f"Работа №{job_number} снята с отложенной публикации.")
+    sent = await update.effective_message.reply_text(f"Работа №{job_number} снята с отложенной публикации.")
+    await _note(store, int(moderator_id), sent)
     # Give the decision buttons back on the moderator's copy of the post -
     # scheduling had hidden them, and the submission is unresolved again.
     submission = await asyncio.to_thread(store.get_submission, cancelled.submission_id)
     if submission is not None:
         await _refresh_moderator_messages(context.bot, store, submission)
+
+
+async def clean_command(update: Any, context: Any) -> None:
+    """Deletes every status/confirmation message the bot has sent this
+    moderator, plus video posts whose decision is already final - anything
+    still 'pending' (awaiting a decision, or scheduled but not yet posted)
+    is left alone. Only covers messages sent since this command shipped:
+    there's no way to look up a chat's older history through the Bot API."""
+    settings: ProposalBotSettings = context.application.bot_data["settings"]
+    store: ProposalStore = context.application.bot_data["store"]
+    moderator_id = getattr(update.effective_user, "id", None)
+    if not _is_moderator(settings, moderator_id):
+        return
+    moderator_id = int(moderator_id)
+
+    deleted = 0
+    failed = 0
+
+    notes = await asyncio.to_thread(store.take_bot_notes, moderator_id)
+    for chat_id, message_id in notes:
+        try:
+            await context.bot.delete_message(chat_id, message_id)
+            deleted += 1
+        except Exception:
+            failed += 1
+
+    resolved = await asyncio.to_thread(store.resolved_moderator_video_messages, moderator_id)
+    for submission_id, chat_id, message_id in resolved:
+        try:
+            await context.bot.delete_message(chat_id, message_id)
+            deleted += 1
+        except Exception:
+            failed += 1
+        await asyncio.to_thread(store.forget_moderator_message, submission_id, moderator_id)
+
+    summary = f"Очищено сообщений: {deleted}."
+    if failed:
+        summary += f" Не удалось удалить: {failed}."
+    sent = await update.effective_message.reply_text(summary)
+    # Tracked for the *next* /clean, not this one - deleting your own receipt
+    # immediately after showing it would just be confusing.
+    await _note(store, moderator_id, sent)
 
 
 async def _scheduled_post_loop(application: Any) -> None:
@@ -308,10 +380,11 @@ async def _process_scheduled_post(context: Any, item: ScheduledPost) -> bool:
     await asyncio.to_thread(store.mark_scheduled_sent, item.id)
     effects_text = await _after_decision_effects(context, updated, karma_before, item.moderator_id, delta)
     with contextlib.suppress(Exception):
-        await context.bot.send_message(
+        sent = await context.bot.send_message(
             chat_id=item.moderator_id,
             text=f"Отложенный пост опубликован: работа №{updated.job_number}. {effects_text}",
         )
+        await _note(store, item.moderator_id, sent)
     return True
 
 
@@ -405,10 +478,11 @@ async def moderation_callback(update: Any, context: Any) -> None:
         await query.answer()
         from telegram import ForceReply
 
-        await query.message.reply_text(
+        sent = await query.message.reply_text(
             f"Напиши сообщение автору работы №{submission.job_number}. Я передам его через основной бот.",
             reply_markup=ForceReply(selective=True),
         )
+        await _note(store, int(moderator_id), sent)
         return
 
     decisions = {
@@ -458,7 +532,10 @@ async def moderation_callback(update: Any, context: Any) -> None:
         with contextlib.suppress(Exception):
             await query.answer(f"Запланировано на {when}.", show_alert=True)
         await _refresh_moderator_messages(context.bot, store, submission, scheduled_for=slot)
-        await query.message.reply_text(f"Работа №{submission.job_number} запланирована на {when}. Очередь: /scheduled.")
+        sent = await query.message.reply_text(
+            f"Работа №{submission.job_number} запланирована на {when}. Очередь: /scheduled."
+        )
+        await _note(store, int(moderator_id), sent)
         return
 
     claimed = await asyncio.to_thread(store.try_claim, submission_id, int(moderator_id))
@@ -476,11 +553,13 @@ async def moderation_callback(update: Any, context: Any) -> None:
         updated, delta = await _finish_and_publish(context, claimed, int(moderator_id), destination, target_chat)
     except Exception as exc:
         await asyncio.to_thread(store.release_claim, submission_id, int(moderator_id))
-        await query.message.reply_text(f"Не удалось применить решение: {type(exc).__name__}: {exc}")
+        sent = await query.message.reply_text(f"Не удалось применить решение: {type(exc).__name__}: {exc}")
+        await _note(store, int(moderator_id), sent)
         return
 
     effects_text = await _after_decision_effects(context, updated, karma_before, int(moderator_id), delta)
-    await query.message.reply_text(f"Решение применено. {effects_text}")
+    sent = await query.message.reply_text(f"Решение применено. {effects_text}")
+    await _note(store, int(moderator_id), sent)
 
 
 async def _finish_and_publish(
@@ -686,16 +765,19 @@ async def relay_message(update: Any, context: Any) -> None:
         return
     text = str(update.effective_message.text or "").strip()
     if not text:
-        await update.effective_message.reply_text("Пустое сообщение не отправлено.")
+        sent = await update.effective_message.reply_text("Пустое сообщение не отправлено.")
+        await _note(store, int(moderator_id), sent)
         return
     submission = await asyncio.to_thread(store.get_submission, int(submission_id))
     if submission is None:
-        await update.effective_message.reply_text("Заявка уже не найдена.")
+        sent = await update.effective_message.reply_text("Заявка уже не найдена.")
+        await _note(store, int(moderator_id), sent)
         return
     await asyncio.to_thread(store.enqueue_author_message, submission.id, int(moderator_id), text)
-    await update.effective_message.reply_text(
+    sent = await update.effective_message.reply_text(
         f"Сообщение для автора работы №{submission.job_number} поставлено на отправку."
     )
+    await _note(store, int(moderator_id), sent)
 
 
 def _moderation_keyboard(submission_id: int) -> Any:

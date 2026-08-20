@@ -25,6 +25,7 @@ from laladub.proposal_bot import (
     _moderation_keyboard,
     _process_scheduled_post,
     _transcript_text_for_submission,
+    clean_command,
     comment_on_channel_forward,
     moderation_callback,
     post_command,
@@ -846,6 +847,50 @@ class DelayedPostingStoreTests(unittest.TestCase):
         self.assertIsNotNone(self.store.pending_schedule_for_submission(submission.id))
 
 
+class BotNotesAndCleanupStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = ProposalStore(Path(self._tempdir.name) / "proposal.sqlite3")
+
+    def _submission(self, job_number: str) -> Submission:
+        submission, _created = self.store.create_submission(
+            job_number=job_number, user_id=123, chat_id=123, author_name="Тест", author_username=None,
+            video_path=Path(self._tempdir.name) / f"{job_number}.mp4", output_filename="dubbed.mp4",
+        )
+        return submission
+
+    def test_take_bot_notes_returns_and_clears_them(self) -> None:
+        self.store.record_bot_note(631551040, -100, 1)
+        self.store.record_bot_note(631551040, -100, 2)
+        self.store.record_bot_note(999, -100, 3)  # a different moderator - untouched
+        notes = self.store.take_bot_notes(631551040)
+        self.assertEqual(sorted(notes), [(-100, 1), (-100, 2)])
+        self.assertEqual(self.store.take_bot_notes(631551040), [])
+        self.assertEqual(self.store.take_bot_notes(999), [(-100, 3)])
+
+    def test_resolved_moderator_video_messages_excludes_pending(self) -> None:
+        pending_submission = self._submission("1")
+        self.store.record_moderator_message(pending_submission.id, 631551040, -100, 10)
+
+        rejected_submission = self._submission("2")
+        self.store.try_claim(rejected_submission.id, 631551040)
+        self.store.finish_decision(
+            submission_id=rejected_submission.id, moderator_id=631551040, destination="rejected", award_milli=0,
+            publication_chat_id=None, publication_message_id=None,
+        )
+        self.store.record_moderator_message(rejected_submission.id, 631551040, -100, 20)
+
+        resolved = self.store.resolved_moderator_video_messages(631551040)
+        self.assertEqual(resolved, [(rejected_submission.id, -100, 20)])
+
+    def test_forget_moderator_message_removes_the_tracking_row(self) -> None:
+        submission = self._submission("1")
+        self.store.record_moderator_message(submission.id, 631551040, -100, 10)
+        self.store.forget_moderator_message(submission.id, 631551040)
+        self.assertEqual(self.store.moderator_messages(submission.id), [])
+
+
 class _FakePublishedMessage:
     def __init__(self, chat_id: object, message_id: int) -> None:
         self.chat_id = chat_id
@@ -1040,6 +1085,85 @@ class ScheduledQueueCommandsTests(unittest.IsolatedAsyncioTestCase):
         await unpost_command(update, self._context(["42"]))
         self.assertEqual(len(self.store.pending_scheduled_posts()), 1)
         message.reply_text.assert_not_awaited()
+
+
+class CleanCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = ProposalStore(Path(self._tempdir.name) / "proposal.sqlite3")
+        self.settings = ProposalBotSettings(
+            token="x",
+            database=Path(self._tempdir.name) / "proposal.sqlite3",
+            moderator_ids=frozenset({631551040}),
+            main_channel="@elevenlabss",
+            shame_channel="@ghienmigo",
+            karma_chat="@lalaschoo",
+        )
+
+    def _submission(self, job_number: str) -> Submission:
+        submission, _created = self.store.create_submission(
+            job_number=job_number, user_id=123, chat_id=123, author_name="Тест", author_username=None,
+            video_path=Path(self._tempdir.name) / f"{job_number}.mp4", output_filename="dubbed.mp4",
+        )
+        return submission
+
+    def _context(self, delete_message: AsyncMock | None = None) -> SimpleNamespace:
+        return SimpleNamespace(
+            application=SimpleNamespace(bot_data={"settings": self.settings, "store": self.store}),
+            bot=SimpleNamespace(delete_message=delete_message or AsyncMock()),
+        )
+
+    def _update(self, user_id: int = 631551040) -> tuple[SimpleNamespace, SimpleNamespace]:
+        message = SimpleNamespace(reply_text=AsyncMock())
+        return SimpleNamespace(effective_user=SimpleNamespace(id=user_id), effective_message=message), message
+
+    async def test_deletes_notes_and_resolved_videos_but_keeps_pending(self) -> None:
+        pending_submission = self._submission("1")
+        self.store.record_moderator_message(pending_submission.id, 631551040, -100, 10)
+
+        rejected_submission = self._submission("2")
+        self.store.try_claim(rejected_submission.id, 631551040)
+        self.store.finish_decision(
+            submission_id=rejected_submission.id, moderator_id=631551040, destination="rejected", award_milli=0,
+            publication_chat_id=None, publication_message_id=None,
+        )
+        self.store.record_moderator_message(rejected_submission.id, 631551040, -100, 20)
+
+        self.store.record_bot_note(631551040, -100, 30)
+        self.store.record_bot_note(631551040, -100, 31)
+
+        update, message = self._update()
+        context = self._context()
+        await clean_command(update, context)
+
+        deleted_ids = {call.args[1] for call in context.bot.delete_message.call_args_list}
+        self.assertEqual(deleted_ids, {20, 30, 31})
+        self.assertIn("Очищено сообщений: 3", message.reply_text.call_args.args[0])
+        # The pending video's tracking row survives - it's still awaiting a decision.
+        self.assertEqual(self.store.moderator_messages(pending_submission.id), [(-100, 10)])
+        # The resolved video's tracking row is gone now that the message is deleted.
+        self.assertEqual(self.store.moderator_messages(rejected_submission.id), [])
+
+    async def test_a_failed_delete_is_counted_but_does_not_abort(self) -> None:
+        self.store.record_bot_note(631551040, -100, 30)
+        self.store.record_bot_note(631551040, -100, 31)
+        delete_message = AsyncMock(side_effect=[Exception("gone"), None])
+        update, message = self._update()
+        await clean_command(update, self._context(delete_message))
+        self.assertIn("Очищено сообщений: 1", message.reply_text.call_args.args[0])
+        self.assertIn("Не удалось удалить: 1", message.reply_text.call_args.args[0])
+
+    async def test_non_moderator_does_nothing(self) -> None:
+        self.store.record_bot_note(1, -100, 30)
+        update, message = self._update(user_id=1)
+        context = self._context()
+        await clean_command(update, context)
+        context.bot.delete_message.assert_not_called()
+        message.reply_text.assert_not_awaited()
+        # The note wasn't consumed either - a real moderator running /clean
+        # later could still see it (not that a non-moderator should have one).
+        self.assertEqual(self.store.take_bot_notes(1), [(-100, 30)])
 
 
 class ProcessScheduledPostTests(unittest.IsolatedAsyncioTestCase):

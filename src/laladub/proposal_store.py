@@ -98,6 +98,17 @@ class ProposalStore:
                     PRIMARY KEY(submission_id, moderator_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS bot_notes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    moderator_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    created_at REAL NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_bot_notes_moderator
+                    ON bot_notes(moderator_id);
+
                 CREATE TABLE IF NOT EXISTS karma_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     submission_id INTEGER NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
@@ -301,6 +312,48 @@ class ProposalStore:
                 "SELECT chat_id, message_id FROM moderator_messages WHERE submission_id = ?",
                 (submission_id,),
             ).fetchall()
+        return [(int(row["chat_id"]), int(row["message_id"])) for row in rows]
+
+    def forget_moderator_message(self, submission_id: int, moderator_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM moderator_messages WHERE submission_id = ? AND moderator_id = ?",
+                (submission_id, moderator_id),
+            )
+
+    def resolved_moderator_video_messages(self, moderator_id: int) -> list[tuple[int, int, int]]:
+        """(submission_id, chat_id, message_id) for this moderator's video posts
+        whose decision is already final (not 'pending') - /clean removes these,
+        never a submission still awaiting or mid-schedule."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT m.submission_id, m.chat_id, m.message_id
+                FROM moderator_messages m
+                JOIN submissions s ON s.id = m.submission_id
+                WHERE m.moderator_id = ? AND s.status != 'pending'
+                """,
+                (moderator_id,),
+            ).fetchall()
+        return [(int(row["submission_id"]), int(row["chat_id"]), int(row["message_id"])) for row in rows]
+
+    def record_bot_note(self, moderator_id: int, chat_id: int, message_id: int) -> None:
+        """Tracks a non-video message the bot sent a moderator (status texts,
+        confirmations, etc.) so /clean can find and delete it later."""
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO bot_notes (moderator_id, chat_id, message_id, created_at) VALUES (?, ?, ?, ?)",
+                (moderator_id, chat_id, message_id, time.time()),
+            )
+
+    def take_bot_notes(self, moderator_id: int) -> list[tuple[int, int]]:
+        """Returns and forgets every tracked note for this moderator."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT chat_id, message_id FROM bot_notes WHERE moderator_id = ?",
+                (moderator_id,),
+            ).fetchall()
+            connection.execute("DELETE FROM bot_notes WHERE moderator_id = ?", (moderator_id,))
         return [(int(row["chat_id"]), int(row["message_id"])) for row in rows]
 
     def try_claim(self, submission_id: int, moderator_id: int) -> Submission | None:
