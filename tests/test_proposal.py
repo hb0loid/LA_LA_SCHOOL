@@ -884,6 +884,23 @@ class BotNotesAndCleanupStoreTests(unittest.TestCase):
         resolved = self.store.resolved_moderator_video_messages(631551040)
         self.assertEqual(resolved, [(rejected_submission.id, -100, 20)])
 
+    def test_resolved_moderator_video_messages_includes_scheduled(self) -> None:
+        # A submission sitting in the delayed queue is still 'pending' (the
+        # decision hasn't actually been applied yet), but it no longer shows
+        # live buttons, so /clean should sweep it up too.
+        scheduled_submission = self._submission("1")
+        self.store.record_moderator_message(scheduled_submission.id, 631551040, -100, 10)
+        self.store.schedule_post(
+            submission_id=scheduled_submission.id, destination="main", target_chat="@x", moderator_id=631551040,
+            scheduled_for=1_000_000.0,
+        )
+
+        still_pending_submission = self._submission("2")
+        self.store.record_moderator_message(still_pending_submission.id, 631551040, -100, 20)
+
+        resolved = self.store.resolved_moderator_video_messages(631551040)
+        self.assertEqual(resolved, [(scheduled_submission.id, -100, 10)])
+
     def test_forget_moderator_message_removes_the_tracking_row(self) -> None:
         submission = self._submission("1")
         self.store.record_moderator_message(submission.id, 631551040, -100, 10)
@@ -1130,6 +1147,13 @@ class CleanCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         self.store.record_moderator_message(rejected_submission.id, 631551040, -100, 20)
 
+        scheduled_submission = self._submission("3")
+        self.store.record_moderator_message(scheduled_submission.id, 631551040, -100, 40)
+        self.store.schedule_post(
+            submission_id=scheduled_submission.id, destination="main", target_chat="@elevenlabss",
+            moderator_id=631551040, scheduled_for=1_000_000.0,
+        )
+
         self.store.record_bot_note(631551040, -100, 30)
         self.store.record_bot_note(631551040, -100, 31)
 
@@ -1138,12 +1162,15 @@ class CleanCommandTests(unittest.IsolatedAsyncioTestCase):
         await clean_command(update, context)
 
         deleted_ids = {call.args[1] for call in context.bot.delete_message.call_args_list}
-        self.assertEqual(deleted_ids, {20, 30, 31})
-        self.assertIn("Очищено сообщений: 3", message.reply_text.call_args.args[0])
+        self.assertEqual(deleted_ids, {20, 30, 31, 40})
+        self.assertIn("Очищено сообщений: 4", message.reply_text.call_args.args[0])
         # The pending video's tracking row survives - it's still awaiting a decision.
         self.assertEqual(self.store.moderator_messages(pending_submission.id), [(-100, 10)])
-        # The resolved video's tracking row is gone now that the message is deleted.
+        # The resolved and scheduled videos' tracking rows are gone with the messages.
         self.assertEqual(self.store.moderator_messages(rejected_submission.id), [])
+        self.assertEqual(self.store.moderator_messages(scheduled_submission.id), [])
+        # Cancelling it is still possible by job number even though the chat message is gone.
+        self.assertIsNotNone(self.store.find_pending_schedule_by_job_number("3"))
 
     async def test_a_failed_delete_is_counted_but_does_not_abort(self) -> None:
         self.store.record_bot_note(631551040, -100, 30)

@@ -323,15 +323,24 @@ class ProposalStore:
 
     def resolved_moderator_video_messages(self, moderator_id: int) -> list[tuple[int, int, int]]:
         """(submission_id, chat_id, message_id) for this moderator's video posts
-        whose decision is already final (not 'pending') - /clean removes these,
-        never a submission still awaiting or mid-schedule."""
+        that no longer need a decision button - the decision is already final,
+        or the post is sitting in the delayed queue (still manageable via
+        /post and /unpost by job number). /clean removes these; it only ever
+        keeps a video that's still showing live decision buttons."""
         with self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT m.submission_id, m.chat_id, m.message_id
                 FROM moderator_messages m
                 JOIN submissions s ON s.id = m.submission_id
-                WHERE m.moderator_id = ? AND s.status != 'pending'
+                WHERE m.moderator_id = ?
+                  AND (
+                    s.status != 'pending'
+                    OR EXISTS (
+                        SELECT 1 FROM scheduled_posts sp
+                        WHERE sp.submission_id = s.id AND sp.status = 'pending'
+                    )
+                  )
                 """,
                 (moderator_id,),
             ).fetchall()

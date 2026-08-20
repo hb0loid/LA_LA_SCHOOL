@@ -300,10 +300,12 @@ async def unpost_command(update: Any, context: Any) -> None:
 
 async def clean_command(update: Any, context: Any) -> None:
     """Deletes every status/confirmation message the bot has sent this
-    moderator, plus video posts whose decision is already final - anything
-    still 'pending' (awaiting a decision, or scheduled but not yet posted)
-    is left alone. Only covers messages sent since this command shipped:
-    there's no way to look up a chat's older history through the Bot API."""
+    moderator, plus any video post that no longer needs a decision - the
+    decision is already final, or it's sitting in the delayed queue (still
+    reachable by job number via /post and /unpost). Only a video still
+    showing live decision buttons is left alone. Only covers messages sent
+    since this command shipped: there's no way to look up a chat's older
+    history through the Bot API."""
     settings: ProposalBotSettings = context.application.bot_data["settings"]
     store: ProposalStore = context.application.bot_data["store"]
     moderator_id = getattr(update.effective_user, "id", None)
