@@ -860,6 +860,22 @@ class BotNotesAndCleanupStoreTests(unittest.TestCase):
         )
         return submission
 
+    def test_forgetting_a_scheduled_submissions_message_does_not_make_it_look_new(self) -> None:
+        # Regression: /clean forgets a scheduled post's tracking row so it no
+        # longer needs live decision buttons - but the submission is still
+        # 'pending' under the hood (the decision applies only when it
+        # actually posts). Without this guard, the 5s delivery loop would
+        # see "pending, no tracked message" and resend it as if brand new,
+        # over and over, every time /clean ran.
+        submission = self._submission("1")
+        self.store.record_moderator_message(submission.id, 631551040, -100, 10)
+        self.store.schedule_post(
+            submission_id=submission.id, destination="main", target_chat="@x", moderator_id=631551040,
+            scheduled_for=1_000_000.0,
+        )
+        self.store.forget_moderator_message(submission.id, 631551040)
+        self.assertEqual(self.store.pending_for_moderator(631551040), [])
+
     def test_take_bot_notes_returns_and_clears_them(self) -> None:
         self.store.record_bot_note(631551040, -100, 1)
         self.store.record_bot_note(631551040, -100, 2)

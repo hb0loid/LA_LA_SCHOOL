@@ -270,6 +270,10 @@ class ProposalStore:
         return _submission_from_row(row) if row is not None else None
 
     def pending_for_moderator(self, moderator_id: int, *, limit: int = 20) -> list[Submission]:
+        """Submissions that still need their first moderation-video delivery.
+        Excludes anything with an active schedule even if it has no tracked
+        message yet (e.g. after /clean forgot it) - a scheduled post doesn't
+        need a fresh decision video, so it must never look like a new one."""
         with self._connect() as connection:
             rows = connection.execute(
                 """
@@ -278,6 +282,10 @@ class ProposalStore:
                 LEFT JOIN moderator_messages AS m
                     ON m.submission_id = s.id AND m.moderator_id = ?
                 WHERE s.status = 'pending' AND m.submission_id IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM scheduled_posts sp
+                      WHERE sp.submission_id = s.id AND sp.status = 'pending'
+                  )
                 ORDER BY s.created_at ASC
                 LIMIT ?
                 """,
