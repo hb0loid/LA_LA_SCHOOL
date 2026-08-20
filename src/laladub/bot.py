@@ -236,7 +236,7 @@ def main() -> None:
     application.add_handler(CommandHandler("watermark", watermark_command, filters=private_chat))
     application.add_handler(CommandHandler("mycensor", mycensor_command, filters=private_chat))
     application.add_handler(CommandHandler("preset", preset_command, filters=private_chat))
-    application.add_handler(CommandHandler("show", show_command, filters=private_chat))
+    application.add_handler(CommandHandler("show", show_command))
     application.add_handler(CallbackQueryHandler(premium_buy_callback, pattern=r"^premium_buy$"))
     application.add_handler(PreCheckoutQueryHandler(premium_precheckout))
     application.add_handler(MessageHandler(private_chat & filters.SUCCESSFUL_PAYMENT, premium_successful_payment))

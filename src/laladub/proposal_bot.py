@@ -94,7 +94,7 @@ def main() -> None:
     application.add_handler(CommandHandler("scheduled", scheduled_command, filters=private_chat))
     application.add_handler(CommandHandler("post", post_command, filters=private_chat))
     application.add_handler(CommandHandler("unpost", unpost_command, filters=private_chat))
-    application.add_handler(CommandHandler("show", show_command, filters=private_chat))
+    application.add_handler(CommandHandler("show", show_command))
     application.add_handler(CommandHandler("clean", clean_command, filters=private_chat))
     application.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^mod:"))
     application.add_handler(ChatMemberHandler(karma_member_changed, ChatMemberHandler.CHAT_MEMBER))
