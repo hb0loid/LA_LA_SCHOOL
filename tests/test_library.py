@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from laladub.bot import _archive_finished_dub
-from laladub.library import LibraryStore, show_command
+from laladub.library import LibraryStore, _last_show_call, show_command
 
 
 class LibraryStoreTests(unittest.TestCase):
@@ -53,6 +53,8 @@ class ShowCommandTests(unittest.IsolatedAsyncioTestCase):
         self._tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self._tempdir.cleanup)
         self.store = LibraryStore(Path(self._tempdir.name) / "library.sqlite3")
+        _last_show_call.clear()
+        self.addCleanup(_last_show_call.clear)
 
     def _context(self, args: list[str] | None = None) -> SimpleNamespace:
         return SimpleNamespace(
@@ -61,9 +63,16 @@ class ShowCommandTests(unittest.IsolatedAsyncioTestCase):
             args=args or [],
         )
 
-    def _update(self) -> tuple[SimpleNamespace, SimpleNamespace]:
+    def _update(self, user_id: int = 777) -> tuple[SimpleNamespace, SimpleNamespace]:
         message = SimpleNamespace(reply_text=AsyncMock())
-        return SimpleNamespace(effective_message=message, effective_chat=SimpleNamespace(id=555)), message
+        return (
+            SimpleNamespace(
+                effective_message=message,
+                effective_chat=SimpleNamespace(id=555),
+                effective_user=SimpleNamespace(id=user_id),
+            ),
+            message,
+        )
 
     async def test_no_argument_asks_for_usage(self) -> None:
         update, message = self._update()
@@ -109,6 +118,31 @@ class ShowCommandTests(unittest.IsolatedAsyncioTestCase):
         context.application.bot_data.pop("library_store")
         await show_command(update, context)
         message.reply_text.assert_not_awaited()
+
+    async def test_second_call_within_the_cooldown_is_rejected(self) -> None:
+        update, _message = self._update(user_id=42)
+        await show_command(update, self._context(["999"]))  # consumes the cooldown slot
+
+        update2, message2 = self._update(user_id=42)
+        await show_command(update2, self._context(["999"]))
+        self.assertIn("Слишком часто", message2.reply_text.call_args.args[0])
+
+    async def test_different_users_have_independent_cooldowns(self) -> None:
+        update, _message = self._update(user_id=1)
+        await show_command(update, self._context(["999"]))
+
+        update2, message2 = self._update(user_id=2)
+        await show_command(update2, self._context(["999"]))
+        self.assertIn("не найдена", message2.reply_text.call_args.args[0])
+
+    async def test_call_after_the_cooldown_expires_goes_through(self) -> None:
+        update, _message = self._update(user_id=42)
+        await show_command(update, self._context(["999"]))
+        _last_show_call[42] -= 31  # pretend the cooldown already elapsed
+
+        update2, message2 = self._update(user_id=42)
+        await show_command(update2, self._context(["999"]))
+        self.assertIn("не найдена", message2.reply_text.call_args.args[0])
 
 
 class ArchiveFinishedDubTests(unittest.IsolatedAsyncioTestCase):

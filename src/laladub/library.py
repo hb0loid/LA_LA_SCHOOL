@@ -11,6 +11,13 @@ from typing import Any, Iterator
 # Shared between the main dub bot and the proposal bot - both point at the
 # same files by default so /show works no matter which one receives it.
 
+# /show is open to any user and now works in group chats too, so it needs its
+# own spam guard. Per-process and in-memory is enough: the two bots run as
+# separate processes anyway, so a shared cooldown would need its own storage
+# for no real benefit - this already stops the repeated-tap pattern it's for.
+_SHOW_COOLDOWN_SECONDS = 30.0
+_last_show_call: dict[int, float] = {}
+
 
 @dataclass(frozen=True, slots=True)
 class LibraryEntry:
@@ -102,6 +109,18 @@ async def show_command(update: Any, context: Any) -> None:
     library_store: LibraryStore | None = context.application.bot_data.get("library_store")
     if library_store is None:
         return
+
+    user = update.effective_user
+    user_id = int(user.id) if user is not None else None
+    if user_id is not None:
+        now = time.time()
+        elapsed = now - _last_show_call.get(user_id, 0.0)
+        if elapsed < _SHOW_COOLDOWN_SECONDS:
+            await update.effective_message.reply_text(
+                f"Слишком часто — подожди ещё {round(_SHOW_COOLDOWN_SECONDS - elapsed)} сек."
+            )
+            return
+        _last_show_call[user_id] = now
 
     args = context.args or []
     job_number = str(args[0]).strip() if args else ""
