@@ -3201,6 +3201,10 @@ def _safe_upload_name(value: str) -> str:
 
 
 def _job_status_counts(workdir: Path) -> dict[str, int]:
+    """Counts job.json files by status, skipping terminal ones (done/failed/
+    rejected) - this feeds the "stuck job" cross-check against the live
+    scheduler, and the retention window means those already number in the
+    thousands, drowning out anything actually relevant to /queue."""
     counts: dict[str, int] = {}
     if not workdir.exists():
         return counts
@@ -3211,6 +3215,8 @@ def _job_status_counts(workdir: Path) -> dict[str, int]:
             status = "bad_json"
         else:
             status = str(data.get("status") or "unknown")
+        if status in CLEANUP_JOB_STATUSES:
+            continue
         counts[status] = counts.get(status, 0) + 1
     return counts
 
@@ -3218,7 +3224,7 @@ def _job_status_counts(workdir: Path) -> dict[str, int]:
 def _format_status_counts(counts: dict[str, int]) -> str:
     if not counts:
         return "нет задач"
-    preferred = ["running", "starting", "queued", "select_source", "select_method", "ready", "failed", "rejected", "done"]
+    preferred = ["running", "starting", "queued", "select_source", "select_method", "ready"]
     parts = [f"{status}={counts[status]}" for status in preferred if counts.get(status)]
     parts.extend(f"{status}={count}" for status, count in sorted(counts.items()) if status not in preferred)
     return ", ".join(parts)
