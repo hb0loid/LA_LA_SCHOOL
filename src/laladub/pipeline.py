@@ -598,11 +598,40 @@ def _restore_cached_file(cache_entry: Path | None, cache_name: str, destination:
     return _file_ready(destination, min_size=min_size)
 
 
-def _store_cached_file(cache_entry: Path | None, source: Path, cache_name: str, min_size: int = 1024) -> None:
+# Extracted audio is a hair shorter than its video often enough (container
+# padding, a trailing video-only frame) that an exact match would reject good
+# cache entries; a real truncation loses far more than this.
+_MEDIA_CACHE_DURATION_TOLERANCE = 5.0
+
+
+def _covers_source_duration(audio_path: Path, video_path: Path) -> bool:
+    """Whether cached audio actually spans the whole video it is keyed on.
+
+    A job that ran on a trimmed copy of its input (the daily-quota trim) keeps
+    the untrimmed original next to it, so the cache can end up keyed on the
+    full file while holding audio for only the first minute of it. Restoring
+    that silently dubs the opening and leaves the rest in the original voice."""
+    try:
+        audio_seconds = probe_duration(audio_path)
+        video_seconds = probe_duration(video_path)
+    except Exception:
+        return True  # can't tell - don't block the normal path over it
+    if audio_seconds <= 0 or video_seconds <= 0:
+        return True
+    return video_seconds - audio_seconds <= _MEDIA_CACHE_DURATION_TOLERANCE
+
+
+def _store_cached_file(
+    cache_entry: Path | None,
+    source: Path,
+    cache_name: str,
+    min_size: int = 1024,
+    overwrite: bool = False,
+) -> None:
     if cache_entry is None or not _file_ready(source, min_size=min_size):
         return
     destination = cache_entry / cache_name
-    if _file_ready(destination, min_size=min_size):
+    if _file_ready(destination, min_size=min_size) and not overwrite:
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
     temp_path = destination.with_name(destination.name + ".tmp")
@@ -628,6 +657,11 @@ def _restore_cached_separation(
     vocals_cache = cache_dir / "vocals.wav"
     no_vocals_cache = cache_dir / "no_vocals.wav"
     if not (_file_ready(vocals_cache) and _file_ready(no_vocals_cache)):
+        return None
+    if not _covers_source_duration(vocals_cache, mix_audio):
+        # Separated from a truncated mix by an older run - redo it rather than
+        # dub against stems that stop partway through the video.
+        print("      Media cache: ignoring separation that does not cover the full audio")
         return None
 
     stem_dir = config.workdir / "separated" / config.demucs_model / mix_audio.stem
@@ -702,7 +736,7 @@ def _seed_media_cache_from_legacy_jobs(video_path: Path, cache_entry: Path | Non
                     continue
             except Exception:
                 continue
-            if _store_legacy_media_cache(cache_entry, job_dir / "work", config):
+            if _store_legacy_media_cache(cache_entry, job_dir / "work", config, candidate):
                 print(f"      Media cache: seeded from previous job {job_dir}")
                 return True
             matched_without_work = True
@@ -718,9 +752,25 @@ def _restore_cached_separation_ready(cache_entry: Path | None, config: DubConfig
     return _file_ready(cache_dir / "vocals.wav") and _file_ready(cache_dir / "no_vocals.wav")
 
 
-def _store_legacy_media_cache(cache_entry: Path, legacy_workdir: Path, config: DubConfig) -> bool:
-    stored = False
+def _store_legacy_media_cache(
+    cache_entry: Path,
+    legacy_workdir: Path,
+    config: DubConfig,
+    video_path: Path | None = None,
+) -> bool:
     source_audio = legacy_workdir / "source_16k.wav"
+    if (
+        video_path is not None
+        and _file_ready(source_audio)
+        and not _covers_source_duration(source_audio, video_path)
+    ):
+        # That job matched by hash on its untrimmed input but actually ran on a
+        # trimmed copy of it, so its audio and separation cover only the first
+        # stretch. Seeding from it would truncate every future dub of the file.
+        print("      Media cache: skipped seeding from a job that ran on a trimmed input")
+        return False
+
+    stored = False
     if _file_ready(source_audio) and not _file_ready(cache_entry / "source_16k.wav"):
         _store_cached_file(cache_entry, source_audio, "source_16k.wav")
         stored = True
@@ -774,11 +824,15 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     source_audio = config.workdir / "source_16k.wav"
     if config.resume and _file_ready(source_audio):
         print(f"      Resume: using existing audio {source_audio}")
-    elif _restore_cached_file(media_cache, "source_16k.wav", source_audio):
+    elif _restore_cached_file(media_cache, "source_16k.wav", source_audio) and _covers_source_duration(
+        source_audio, video_path
+    ):
         print("      Media cache: restored source_16k.wav")
     else:
+        # Also the repair path for a cache entry poisoned by an older trimmed
+        # run: overwrite it with audio that covers the whole file.
         extract_audio(video_path, source_audio)
-        _store_cached_file(media_cache, source_audio, "source_16k.wav")
+        _store_cached_file(media_cache, source_audio, "source_16k.wav", overwrite=True)
     mix_audio = config.workdir / "source_mix.wav"
     separation_result = None
     bed_path = None
@@ -790,11 +844,13 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         _report_progress(config, "Разделяю голос и фон", 10, 100, f"provider={config.separation}")
         if config.resume and _file_ready(mix_audio):
             print(f"      Resume: using existing mix audio {mix_audio}")
-        elif _restore_cached_file(media_cache, "source_mix.wav", mix_audio):
+        elif _restore_cached_file(media_cache, "source_mix.wav", mix_audio) and _covers_source_duration(
+            mix_audio, video_path
+        ):
             print("      Media cache: restored source_mix.wav")
         else:
             extract_audio_track(video_path, mix_audio)
-            _store_cached_file(media_cache, mix_audio, "source_mix.wav")
+            _store_cached_file(media_cache, mix_audio, "source_mix.wav", overwrite=True)
         if needs_separation:
             separation_result = _existing_separation_result(mix_audio, config) if config.resume else None
             if separation_result is not None:
