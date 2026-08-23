@@ -644,7 +644,8 @@ async def maintenance(update: Any, context: Any) -> None:
     await scheduler.maintenance_changed(context)
     state = "включён" if enabled else "выключен"
     details = (
-        "Обычные пользователи временно заблокированы. Текущие задачи продолжат работу."
+        "Обычные пользователи временно заблокированы. Текущие задачи прерваны, "
+        "авторы могут продолжить их через /resume НОМЕР."
         if enabled
         else "Приём новых задач восстановлен, сохранённая очередь продолжит работу."
     )
@@ -2575,6 +2576,9 @@ class _QueuedJob:
         self.execution_kind: str | None = None
         self.progress: _ProgressState | None = None
         self.progress_task: asyncio.Task[Any] | None = None
+        # The task running this job locally, kept so maintenance can cancel it
+        # mid-flight instead of waiting for the pipeline to finish on its own.
+        self.runner_task: asyncio.Task[Any] | None = None
         self.remote_last_seen_at: float | None = None
         self.remote_heartbeat_seen = False
 
@@ -2711,9 +2715,24 @@ class _JobScheduler:
             await self._refresh_pending_locked()
 
     async def maintenance_changed(self, context: Any) -> None:
+        interrupted = 0
         async with self._lock:
+            if _maintenance_enabled(self._settings):
+                # Turning maintenance on stops the machine now rather than
+                # letting whatever is mid-render keep the GPU busy for another
+                # hour. Cancelling the runner unwinds _run_pipeline_isolated,
+                # whose finally kills the pipeline process tree.
+                for item in list(self._items_by_key.values()):
+                    if self._settings.is_admin(item.user_id):
+                        continue
+                    task = item.runner_task
+                    if task is not None and not task.done():
+                        task.cancel()
+                        interrupted += 1
             await self._dispatch_locked(context)
             await self._refresh_pending_locked()
+        if interrupted:
+            print(f"Maintenance: interrupted {interrupted} running job(s)", flush=True)
 
     async def watch_remote_leases(self, context: Any) -> None:
         while True:
@@ -2964,7 +2983,7 @@ class _JobScheduler:
             _save_job_snapshot(Path(item.job["job_dir"]), item.job, status="starting")
             title = "Сырой Whisper" if item.job.get("mode") == "raw_text" else "Полноценный дубляж"
             item.progress = _ProgressState(title, _job_number(item.job))
-            context.application.create_task(self._run_item(context, item))
+            item.runner_task = context.application.create_task(self._run_item(context, item))
 
     def _can_start_local_worker(self) -> bool:
         if self._settings.executor_mode == "remote":
@@ -3013,6 +3032,7 @@ class _JobScheduler:
         return self._active_by_user.get(item.user_id, 0) < self._settings.max_active_jobs_per_user
 
     async def _run_item(self, context: Any, item: _QueuedJob) -> None:
+        interrupted = False
         try:
             if item.progress is None:
                 title = "Сырой Whisper" if item.job.get("mode") == "raw_text" else "Полноценный дубляж"
@@ -3045,8 +3065,31 @@ class _JobScheduler:
                 _save_job_snapshot(Path(str(item.job["job_dir"])), snapshot, status="done")
             if snapshot is not None and str(snapshot.get("status") or "") == "failed":
                 await _release_daily_allowance(context, item.user_id, item.job)
+        except asyncio.CancelledError:
+            interrupted = True
+            raise
         finally:
-            await self.finish(context, item)
+            if interrupted:
+                # This task is already unwinding a cancellation, so awaiting the
+                # cleanup here would be cut short - hand it to a fresh task.
+                context.application.create_task(self._finish_interrupted(context, item))
+            else:
+                await self.finish(context, item)
+
+    async def _finish_interrupted(self, context: Any, item: _QueuedJob) -> None:
+        """Puts a maintenance-cancelled job back into a resumable state."""
+        job_dir = Path(str(item.job["job_dir"]))
+        with contextlib.suppress(Exception):
+            # "queued" is recoverable, so the pipeline picks up from its resume
+            # state instead of redoing the stages it already paid for.
+            _save_job_snapshot(job_dir, item.job, status="queued", interrupted_by="maintenance")
+        await self.finish(context, item)
+        with contextlib.suppress(Exception):
+            await _safe_edit_status(
+                item.status_message,
+                f"Задача №{_job_number(item.job)} остановлена: включены технические работы.\n"
+                f"Продолжить, когда работы закончатся: /resume {_job_number(item.job)}",
+            )
 
     async def _refresh_pending_locked(self) -> None:
         pending = sorted((priority, sequence, item) for priority, sequence, item in self._pending)
