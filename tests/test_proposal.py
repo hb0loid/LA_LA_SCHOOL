@@ -30,6 +30,7 @@ from laladub.proposal_bot import (
     moderation_callback,
     post_command,
     scheduled_command,
+    send_due_scheduled_posts,
     timer_command,
     unpost_command,
 )
@@ -1207,6 +1208,113 @@ class CleanCommandTests(unittest.IsolatedAsyncioTestCase):
         # The note wasn't consumed either - a real moderator running /clean
         # later could still see it (not that a non-moderator should have one).
         self.assertEqual(self.store.take_bot_notes(1), [(-100, 30)])
+
+
+class BacklogSpacingStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = ProposalStore(Path(self._tempdir.name) / "proposal.sqlite3")
+
+    def _submission(self, job_number: str) -> Submission:
+        submission, _created = self.store.create_submission(
+            job_number=job_number, user_id=123, chat_id=123, author_name="Тест", author_username=None,
+            video_path=Path(self._tempdir.name) / f"{job_number}.mp4", output_filename="dubbed.mp4",
+        )
+        return submission
+
+    def test_no_publications_yet_means_nothing_blocks_the_first_post(self) -> None:
+        self.assertIsNone(self.store.last_published_at("main"))
+
+    def test_only_counts_what_actually_went_out(self) -> None:
+        # A merely *planned* post must not look like a recent publication,
+        # otherwise the very post waiting to go out would block itself.
+        submission = self._submission("1")
+        self.store.schedule_post(
+            submission_id=submission.id, destination="main", target_chat="@x", moderator_id=1,
+            scheduled_for=1_000_000.0,
+        )
+        self.assertIsNone(self.store.last_published_at("main"))
+
+    def test_a_sent_post_counts(self) -> None:
+        submission = self._submission("1")
+        item = self.store.schedule_post(
+            submission_id=submission.id, destination="main", target_chat="@x", moderator_id=1,
+            scheduled_for=1_000_000.0,
+        )
+        self.store.mark_scheduled_sent(item.id)
+        self.assertIsNotNone(self.store.last_published_at("main"))
+
+    def test_channels_are_tracked_separately(self) -> None:
+        submission = self._submission("1")
+        item = self.store.schedule_post(
+            submission_id=submission.id, destination="main", target_chat="@x", moderator_id=1,
+            scheduled_for=1_000_000.0,
+        )
+        self.store.mark_scheduled_sent(item.id)
+        self.assertIsNotNone(self.store.last_published_at("main"))
+        self.assertIsNone(self.store.last_published_at("shame"))
+
+
+class BacklogSendingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = ProposalStore(Path(self._tempdir.name) / "proposal.sqlite3")
+        self.settings = ProposalBotSettings(
+            token="x",
+            database=Path(self._tempdir.name) / "proposal.sqlite3",
+            moderator_ids=frozenset({631551040}),
+            main_channel="@elevenlabss",
+            shame_channel="@ghienmigo",
+            karma_chat="@lalaschoo",
+        )
+
+    def _context(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            application=SimpleNamespace(bot_data={"settings": self.settings, "store": self.store}),
+            bot=SimpleNamespace(send_message=AsyncMock(), edit_message_caption=AsyncMock()),
+        )
+
+    def _overdue(self, job_number: str, destination: str = "main") -> None:
+        submission, _created = self.store.create_submission(
+            job_number=job_number, user_id=123, chat_id=123, author_name="Тест", author_username=None,
+            video_path=Path(self._tempdir.name) / f"{job_number}.mp4", output_filename="dubbed.mp4",
+        )
+        self.store.schedule_post(
+            submission_id=submission.id, destination=destination,
+            target_chat="@elevenlabss" if destination == "main" else "@ghienmigo",
+            moderator_id=631551040, scheduled_for=1_000_000.0,  # long past
+        )
+
+    async def test_a_backlog_goes_out_one_at_a_time_not_in_a_burst(self) -> None:
+        # Regression: after the bot was down, every overdue post fired at once,
+        # dumping the whole queue into the channel back to back.
+        for n in ("1", "2", "3", "4", "5"):
+            self._overdue(n)
+        self.assertEqual(len(self.store.due_scheduled_posts()), 5)
+
+        published = _FakePublishedMessage(chat_id=-1001, message_id=7)
+        with patch("laladub.proposal_bot._publish_to_channel", new=AsyncMock(return_value=published)):
+            sent = await send_due_scheduled_posts(self._context())
+        self.assertEqual(sent, 1)
+        self.assertEqual(len(self.store.pending_scheduled_posts()), 4)
+
+    async def test_each_channel_gets_its_own_first_post(self) -> None:
+        self._overdue("1", destination="main")
+        self._overdue("2", destination="shame")
+
+        published = _FakePublishedMessage(chat_id=-1001, message_id=7)
+        with patch("laladub.proposal_bot._publish_to_channel", new=AsyncMock(return_value=published)):
+            sent = await send_due_scheduled_posts(self._context())
+        self.assertEqual(sent, 2)
+        self.assertEqual(self.store.pending_scheduled_posts(), [])
+
+    async def test_nothing_due_sends_nothing(self) -> None:
+        with patch("laladub.proposal_bot._publish_to_channel", new=AsyncMock()) as publish:
+            sent = await send_due_scheduled_posts(self._context())
+        self.assertEqual(sent, 0)
+        publish.assert_not_called()
 
 
 class ProcessScheduledPostTests(unittest.IsolatedAsyncioTestCase):

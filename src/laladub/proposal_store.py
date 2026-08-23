@@ -740,6 +740,27 @@ class ProposalStore:
             ).fetchone()
         return _scheduled_post_from_row(row) if row is not None else None
 
+    def last_published_at(self, destination: str) -> float | None:
+        """When something last actually went out to this channel.
+
+        Unlike next_available_slot this ignores what is merely *planned*, so
+        the sender can tell whether enough time has passed to post right now."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT MAX(t) AS last_t FROM (
+                    SELECT updated_at AS t FROM submissions
+                        WHERE destination = ? AND publication_message_id IS NOT NULL
+                    UNION ALL
+                    SELECT sent_at AS t FROM scheduled_posts
+                        WHERE destination = ? AND status = 'sent' AND sent_at IS NOT NULL
+                )
+                """,
+                (destination, destination),
+            ).fetchone()
+        last_t = row["last_t"] if row is not None else None
+        return float(last_t) if last_t is not None else None
+
     def pending_schedule_for_submission(self, submission_id: int) -> ScheduledPost | None:
         with self._connect() as connection:
             row = connection.execute(

@@ -5,6 +5,7 @@ import contextlib
 import html
 import os
 import re
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -342,14 +343,30 @@ async def clean_command(update: Any, context: Any) -> None:
     await _note(store, moderator_id, sent)
 
 
+async def send_due_scheduled_posts(context: Any) -> int:
+    """Publishes whatever is due, keeping the channel spacing. Returns how many
+    actually went out."""
+    store: ProposalStore = context.application.bot_data["store"]
+    due = await asyncio.to_thread(store.due_scheduled_posts)
+    sent = 0
+    for item in due:
+        # Several posts come due at once whenever the bot was down for a while.
+        # Publishing that backlog back to back is the very thing the delay
+        # exists to prevent, so keep honouring the spacing and let the rest
+        # wait for their turn.
+        last_sent = await asyncio.to_thread(store.last_published_at, item.destination)
+        if last_sent is not None and time.time() - last_sent < DELAYED_POST_INTERVAL_SECONDS:
+            continue
+        if await _process_scheduled_post(context, item):
+            sent += 1
+    return sent
+
+
 async def _scheduled_post_loop(application: Any) -> None:
-    store: ProposalStore = application.bot_data["store"]
     context = _ApplicationContext(application)
     while True:
         try:
-            due = await asyncio.to_thread(store.due_scheduled_posts)
-            for item in due:
-                await _process_scheduled_post(context, item)
+            await send_due_scheduled_posts(context)
         except Exception as exc:
             print(f"Scheduled post loop failed: {type(exc).__name__}: {exc}", flush=True)
         await asyncio.sleep(20.0)
