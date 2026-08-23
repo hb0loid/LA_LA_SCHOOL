@@ -13,9 +13,13 @@ $ErrLog = Join-Path $LogDir "proposal-bot.err.log"
 $PidFile = Join-Path $RuntimeDir "proposal-bot.pid"
 $WatchdogScript = Join-Path $PSScriptRoot "Watchdog.ps1"
 $TokenFile = Join-Path $Root ".secrets\Proposal-Bot-Token.ps1"
+$HoldFile = Join-Path $RuntimeDir "proposal-bot.hold"
 
 Set-Location -LiteralPath $Root
 New-Item -ItemType Directory -Force -Path $RuntimeDir,$LogDir,(Join-Path $Root "runs\proposal") | Out-Null
+# Starting on purpose clears the "stopped by operator" hold left by the stop
+# script, so the autostart health check resumes keeping the bot alive.
+Remove-Item -LiteralPath $HoldFile -Force -ErrorAction SilentlyContinue
 foreach ($logPath in @($OutLog, $ErrLog)) {
   if (-not (Test-Path -LiteralPath $logPath)) { New-Item -ItemType File -Path $logPath | Out-Null }
   $item = Get-Item -LiteralPath $logPath -ErrorAction SilentlyContinue

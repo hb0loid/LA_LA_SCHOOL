@@ -15,9 +15,13 @@ $WatchdogScript = Join-Path $PSScriptRoot "Watchdog.ps1"
 $TokenFile = Join-Path $Root ".secrets\Release-Bot-Token.ps1"
 $WorkerTokenFile = Join-Path $Root ".secrets\Worker-Api-Token.txt"
 $WorkDir = Join-Path $Root "runs\bot-release"
+$HoldFile = Join-Path $RuntimeDir "bot.hold"
 
 Set-Location -LiteralPath $Root
 New-Item -ItemType Directory -Force -Path $WorkDir,$RuntimeDir,$LogDir | Out-Null
+# Starting on purpose clears the "stopped by operator" hold that Stop-Bot left,
+# so the autostart health check resumes keeping the bot alive.
+Remove-Item -LiteralPath $HoldFile -Force -ErrorAction SilentlyContinue
 if (-not (Test-Path -LiteralPath $OutLog)) { New-Item -ItemType File -Path $OutLog | Out-Null }
 if (-not (Test-Path -LiteralPath $ErrLog)) { New-Item -ItemType File -Path $ErrLog | Out-Null }
 

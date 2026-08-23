@@ -5,6 +5,10 @@ $RuntimeDir = Join-Path $Root "work\runtime"
 $LogDir = Join-Path $Root "logs"
 $OutLog = Join-Path $LogDir "bot.out.log"
 $PidFile = Join-Path $RuntimeDir "bot.pid"
+# Stopping by hand means "stay down". The autostart health check runs every 5
+# minutes and would otherwise bring the bot straight back up, so it looks for
+# this marker and skips the launcher while it exists. Start-Bot removes it.
+$HoldFile = Join-Path $RuntimeDir "bot.hold"
 
 Set-Location -LiteralPath $Root
 New-Item -ItemType Directory -Force -Path $RuntimeDir,$LogDir | Out-Null
@@ -61,6 +65,9 @@ do {
 if (-not $stopped) {
   Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Release bot was not running."
 }
+
+Set-Content -LiteralPath $HoldFile -Value "$(Get-Date -Format s) stopped by operator" -Encoding utf8
+Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Autostart hold set: the health check will not restart the bot until Start-Bot runs."
 } finally {
   if ($hasOperationMutex) { $operationMutex.ReleaseMutex() }
   $operationMutex.Dispose()

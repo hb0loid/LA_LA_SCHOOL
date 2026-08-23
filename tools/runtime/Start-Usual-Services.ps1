@@ -19,8 +19,17 @@ function Invoke-ServiceLauncher {
   param(
     [string]$Name,
     [string]$Script,
-    [string[]]$Arguments = @()
+    [string[]]$Arguments = @(),
+    [string]$HoldFile
   )
+
+  # A stop script leaves this marker to say the bot was taken down on purpose.
+  # Without the check, this health check (every 5 minutes) would undo a manual
+  # stop within minutes and there would be no way to keep the bot off.
+  if ($HoldFile -and (Test-Path -LiteralPath $HoldFile)) {
+    Write-AutostartLog "Held ${Name}: stopped by operator, leaving it down until it is started by hand."
+    return
+  }
 
   if (-not (Test-Path -LiteralPath $Script)) {
     Write-AutostartLog "Skipped ${Name}: launcher is missing: $Script"
@@ -47,11 +56,13 @@ Write-AutostartLog "Autostart health check began as $([Security.Principal.Window
 
 Invoke-ServiceLauncher `
   -Name "La La School release bot" `
-  -Script (Join-Path $Root "tools\runtime\Start-Bot.ps1")
+  -Script (Join-Path $Root "tools\runtime\Start-Bot.ps1") `
+  -HoldFile (Join-Path $Root "work\runtime\bot.hold")
 
 Invoke-ServiceLauncher `
   -Name "La La School proposal bot" `
-  -Script (Join-Path $Root "tools\runtime\Start-Proposal-Bot.ps1")
+  -Script (Join-Path $Root "tools\runtime\Start-Proposal-Bot.ps1") `
+  -HoldFile (Join-Path $Root "work\runtime\proposal-bot.hold")
 
 $tgAllRoot = "C:\Users\HBoloid\Documents\TG ALL BOT"
 if (
