@@ -1235,30 +1235,49 @@ async def queue_status(update: Any, context: Any) -> None:
     disk_counts = await asyncio.to_thread(_job_status_counts, settings.workdir)
 
     live_total = live["active_total"] + live["pending_total"]
-    lines = [
-        "Очередь задач",
-        f"Машины заняты: {live['busy_machines']}/{live['online_machines']}",
-        f"Основной ПК: {live['local_machine_busy']}/{live['local_machine_total']} (слоты {live['active_local']}/{live['max_local_jobs']})",
-        f"Воркеры: занято {live['remote_workers_busy']}/{live['remote_workers_online']}, свободно {live['remote_workers_idle']}",
-        f"В работе сейчас: {live['active_total']}/{live['max_active_jobs']}",
-        f"Ждёт в живой очереди: {live['pending_total']}",
-        f"Всего в живом процессе: {live_total}",
-        f"Премиум в очереди: {live['pending_premium']}",
-        f"Обычных в очереди: {live['pending_normal']}",
-        f"Пользователей с активными задачами: {live['active_users']}",
-        "",
-        "По файлам:",
-        _format_status_counts(disk_counts),
-    ]
-    if live["remote_workers_stale"]:
-        lines.insert(4, f"Воркеры без свежего пинга: {live['remote_workers_stale']}")
-    if disk_counts.get("running", 0) + disk_counts.get("queued", 0) > live_total:
-        lines.extend(
-            [
-                "",
-                "Примечание: файловые running/queued могут включать зависшие задачи после перезапуска. Их можно подхватить через /resume.",
-            ]
+
+    lines = [f"🎬 Сейчас в работе: {live['active_total']} из {live['max_active_jobs']}", ""]
+
+    local_state = "занят" if live["local_machine_busy"] else "свободен"
+    lines.append(f"💻 Основной ПК — {local_state} ({live['active_local']}/{live['max_local_jobs']})")
+
+    if live["remote_workers_online"]:
+        worker_state = "занят" if live["remote_workers_busy"] else "свободен"
+        lines.append(
+            f"📡 Воркер — {worker_state} "
+            f"({live['remote_workers_busy']}/{live['remote_workers_online']})"
         )
+    else:
+        lines.append("📡 Воркер — не на связи")
+    if live["remote_workers_stale"]:
+        lines.append(f"   ⚠️ без свежего пинга: {live['remote_workers_stale']}")
+
+    lines.append("")
+    if live["pending_total"]:
+        waiting = f"⏳ Ждут очереди: {live['pending_total']}"
+        # Only worth splitting out when the mix actually matters.
+        if live["pending_premium"] and live["pending_normal"]:
+            waiting += f" (премиум {live['pending_premium']}, обычных {live['pending_normal']})"
+        lines.append(waiting)
+    else:
+        lines.append("⏳ Очередь пуста")
+    lines.append(f"👤 Пользователей с задачами: {live['active_users']}")
+
+    # Anything on disk that the live scheduler does not know about is a job left
+    # behind by a restart - that is the only part of the file scan worth showing.
+    stuck = max(0, sum(disk_counts.get(name, 0) for name in ("running", "starting", "queued", "ready")) - live_total)
+    unfinished = sum(count for name, count in disk_counts.items() if name.startswith("select_"))
+    broken = disk_counts.get("bad_json", 0)
+
+    if stuck or unfinished or broken:
+        lines.append("")
+        if stuck:
+            lines.append(f"🔁 Зависли после перезапуска: {stuck} — подхватить: /resume НОМЕР")
+        if unfinished:
+            lines.append(f"💤 Брошенные диалоги: {unfinished} (прислали видео, но не выбрали настройки)")
+        if broken:
+            lines.append(f"⚠️ Повреждённых записей: {broken}")
+
     await update.effective_message.reply_text("\n".join(lines), reply_markup=_remove_reply_keyboard())
 
 
@@ -3262,15 +3281,6 @@ def _job_status_counts(workdir: Path) -> dict[str, int]:
             continue
         counts[status] = counts.get(status, 0) + 1
     return counts
-
-
-def _format_status_counts(counts: dict[str, int]) -> str:
-    if not counts:
-        return "нет задач"
-    preferred = ["running", "starting", "queued", "select_source", "select_method", "ready"]
-    parts = [f"{status}={counts[status]}" for status in preferred if counts.get(status)]
-    parts.extend(f"{status}={count}" for status, count in sorted(counts.items()) if status not in preferred)
-    return ", ".join(parts)
 
 
 class _ProgressState:
