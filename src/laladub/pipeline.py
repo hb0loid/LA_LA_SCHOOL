@@ -2240,7 +2240,18 @@ def _artifact_family(text: str) -> str:
         return "thanks_subtitles"
     if "подогнал" in normalized:
         return "subtitle_sync"
-    if "подпис" in normalized or "subscribe" in normalized or "abonnieren" in normalized:
+    # "подпишитесь"/"подпишись" share no prefix with "подписаться", so matching
+    # only "подпис" split one family in two and doubled how many of these the
+    # per-family cap let through. Whisper's channel-outro hallucinations are
+    # almost always some phrasing of this, so they need to count as one family.
+    if (
+        "подпис" in normalized
+        or "подпиш" in normalized
+        or "subscribe" in normalized
+        or "abonnieren" in normalized
+        or "dang ky" in normalized
+        or "đăng ký" in normalized  # the signature keeps Vietnamese diacritics
+    ):
         return "subscribe"
     if "amara" in normalized:
         return "amara"
