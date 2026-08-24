@@ -567,8 +567,35 @@ _RU_BAD_SUBTITLE_CREDIT_RE = re.compile(
 )
 
 
+# Cyrillic that survived a CP1251 -> Latin-1 misread comes back as runs of
+# accented Latin letters; real words give several long Cyrillic runs once the
+# bytes are re-decoded, while an ordinary accented word yields at most one or
+# two stray letters. That difference is what makes the repair safe to apply.
+_CYRILLIC_RUN_RE = re.compile(r"[А-Яа-яЁё]{4,}")
+
+
+def _repair_mojibake(text: str) -> str:
+    """Undoes a CP1251 payload that was decoded as Latin-1.
+
+    MyMemory returns translation-memory hits exactly as whoever uploaded them
+    stored them, so Russian entries can arrive as "Óñòàíîâêà Windows" instead
+    of "Установка Windows". The text is already broken when it reaches us."""
+    if not text or any("Ѐ" <= character <= "ӿ" for character in text):
+        return text
+    try:
+        candidate = text.encode("latin-1").decode("cp1251")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+    if len(_CYRILLIC_RUN_RE.findall(candidate)) >= 2:
+        return candidate
+    return text
+
+
 def _postprocess_translated_text(text: str, target_lang: str) -> str:
-    if target_lang != "ru" or not text:
+    if not text:
+        return text
+    text = _repair_mojibake(text)
+    if target_lang != "ru":
         return text
     return _RU_BAD_SUBTITLE_CREDIT_RE.sub("Субтитры М.К.", text)
 
