@@ -129,6 +129,7 @@ class BotSettings:
     artifact_min_gap_seconds: float
     distort_translation: bool
     translation_pivots: str
+    max_translation_hops: int
     translation_second_pass_ratio: float
 
     def is_paid(self, user_id: int | None) -> bool:
@@ -310,6 +311,7 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
             "LALADUB_TRANSLATION_PIVOTS",
             "input,en|input,ja,en|input,tr,de,en|en,de|en,fr|en,es|en,ja,ko|en,tr,ar|input,en,de|input,ja,ko,en|input,tr,ar,en|en,ms,he,en",
         ),
+        max_translation_hops=max(2, int(os.environ.get("LALADUB_MAX_TRANSLATION_HOPS", "3"))),
         translation_second_pass_ratio=max(
             0.0,
             min(1.0, float(os.environ.get("LALADUB_TRANSLATION_SECOND_PASS_RATIO", "0.0"))),

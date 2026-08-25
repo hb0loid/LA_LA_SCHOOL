@@ -2635,6 +2635,7 @@ def _translation_distortion_chains(config: DubConfig) -> list[list[str]]:
     if not target:
         return []
 
+    max_hops = max(2, int(getattr(config, "max_translation_hops", 3) or 3))
     chains: list[list[str]] = []
     seen: set[tuple[str, ...]] = set()
     for raw_variant in config.translation_pivots.split("|"):
@@ -2647,6 +2648,9 @@ def _translation_distortion_chains(config: DubConfig) -> list[list[str]]:
         for pivot in pivots:
             if pivot and pivot != chain[-1]:
                 chain.append(pivot)
+        # One hop = one request to the translation API, so trim the tail rather
+        # than let a long variant spend seven of them on a single line.
+        del chain[max_hops:]
         if chain[-1] != target:
             chain.append(target)
         key = tuple(chain)

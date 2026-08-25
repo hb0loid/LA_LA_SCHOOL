@@ -3813,6 +3813,7 @@ async def _process_job(
         translation_chaos=_translation_chaos_value(job.get("translation_chaos")) or "crooked",
         translation_seed=_ensure_translation_seed(job),
         translation_pivots=settings.translation_pivots,
+        max_translation_hops=settings.max_translation_hops,
         translation_second_pass_ratio=settings.translation_second_pass_ratio,
         collapse_repetitions=settings.collapse_repetitions,
         max_phrase_repeats=settings.max_phrase_repeats,

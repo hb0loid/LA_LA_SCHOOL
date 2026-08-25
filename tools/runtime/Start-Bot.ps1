@@ -290,6 +290,9 @@ $env:LALADUB_ARTIFACT_MIN_SOURCE_SEGMENTS = "5"
 $env:LALADUB_ARTIFACT_MIN_GAP_SECONDS = "0.5"
 $env:LALADUB_DISTORT_TRANSLATION = "1"
 $env:LALADUB_TRANSLATION_PIVOTS = "input,en|input,ja,en|input,tr,de,en|en,de|en,fr|en,es|en,ja,ko|en,tr,ar|input,en,de|input,ja,ko,en|input,tr,ar,en|en,ms,he,en"
+# Each hop is one call to a free translation API; longer chains are what got the
+# bot rate-limited. Chains above this length are trimmed, not dropped.
+$env:LALADUB_MAX_TRANSLATION_HOPS = "3"
 $env:LALADUB_TRANSLATION_SECOND_PASS_RATIO = "0.45"
 $env:LALADUB_ASR_BACKEND = "faster-whisper"
 $env:LALADUB_DEFAULT_ASR_METHOD = "ow-large-v3-chaos-backbone"
