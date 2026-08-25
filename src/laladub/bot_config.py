@@ -28,6 +28,7 @@ class BotSettings:
     premium_db: Path
     preset_db: Path
     library_db: Path
+    review_db: Path
     library_dir: Path
     premium_price_stars: int
     premium_days: int
@@ -179,6 +180,7 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         premium_db=Path(os.environ.get("LALADUB_PREMIUM_DB", "runs/premium/subscriptions.sqlite3")),
         preset_db=Path(os.environ.get("LALADUB_PRESET_DB", "runs/presets/presets.sqlite3")),
         library_db=Path(os.environ.get("LALADUB_LIBRARY_DB", "runs/library/library.sqlite3")),
+        review_db=Path(os.environ.get("LALADUB_REVIEW_DB", "runs/reviews/text_reviews.sqlite3")),
         library_dir=Path(os.environ.get("LALADUB_LIBRARY_DIR", "runs/library/videos")),
         premium_price_stars=max(1, int(os.environ.get("LALADUB_PREMIUM_PRICE_STARS", "250"))),
         premium_days=max(1, int(os.environ.get("LALADUB_PREMIUM_DAYS", "30"))),

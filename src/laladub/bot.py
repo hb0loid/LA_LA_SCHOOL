@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hashlib
 import heapq
+import html
 import json
 import multiprocessing
 import re
@@ -34,6 +35,7 @@ from .models import DubConfig
 from .pipeline import run_dub, run_transcript
 from .premium_store import PremiumStore, Subscription, UserSettings
 from .preset_store import PRESET_FIELDS, PresetStore, UserPreset
+from .text_review import TextReviewStore
 from .proposal_store import ProposalStore
 from .tts import clear_tts_model_caches
 from .watermark import add_watermark
@@ -119,6 +121,15 @@ TTS_METHODS = [
 # reference-voice-dependent stall, not a fluke of the run) and f5 is Ukrainian's
 # only compatible engine, auto-picked without asking - see select_target_lang.
 TTS_METHOD_CHOICES = [("moss", "MOSS — лучше качество, дольше ждать"), ("cosyvoice", "CosyVoice — быстрее, но попроще")]
+
+# The last step of the setup wizard: озвучка занимает больше всего времени, so
+# the text can be shown first and voiced only if it is worth voicing.
+REVIEW_MODE_OPTIONS = [
+    ("direct", "🎬 Сразу дубляж"),
+    ("review", "📝 Сначала показать текст"),
+]
+# Each rejected variant costs a full ASR+translation pass, so retries are capped.
+MAX_TEXT_REVIEW_ATTEMPTS = 3
 
 TELEGRAM_SAFE_VIDEO_BYTES = 45 * 1024 * 1024
 TELEGRAM_DIRECT_DOWNLOAD_SAFE_BYTES = 20 * 1024 * 1024
@@ -214,6 +225,7 @@ def main() -> None:
     application.bot_data["premium_store"] = PremiumStore(settings.premium_db)
     application.bot_data["preset_store"] = PresetStore(settings.preset_db)
     application.bot_data["library_store"] = LibraryStore(settings.library_db)
+    application.bot_data["review_store"] = TextReviewStore(settings.review_db)
     private_chat = filters.ChatType.PRIVATE
     application.add_error_handler(_telegram_error_handler)
     application.add_handler(MessageHandler(private_chat, maintenance_message_gate), group=-1)
@@ -232,6 +244,7 @@ def main() -> None:
     application.add_handler(CommandHandler("revoke_premium", admin_revoke_premium, filters=private_chat))
     application.add_handler(CommandHandler("refund_premium", admin_refund_premium, filters=private_chat))
     application.add_handler(CommandHandler("prem_owners", admin_prem_owners, filters=private_chat))
+    application.add_handler(CommandHandler("reviews", admin_reviews, filters=private_chat))
     application.add_handler(CommandHandler("starbalance", admin_star_balance, filters=private_chat))
     application.add_handler(CommandHandler("watermark", watermark_command, filters=private_chat))
     application.add_handler(CommandHandler("mycensor", mycensor_command, filters=private_chat))
@@ -252,6 +265,8 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(select_speaker_count, pattern=r"^spk:"))
     application.add_handler(CallbackQueryHandler(select_target_lang, pattern=r"^tgt:"))
     application.add_handler(CallbackQueryHandler(select_tts_method, pattern=r"^tts:"))
+    application.add_handler(CallbackQueryHandler(select_review_mode, pattern=r"^rev:"))
+    application.add_handler(CallbackQueryHandler(text_review_callback, pattern=r"^rv:"))
     application.add_handler(CallbackQueryHandler(preset_wizard_callback, pattern=r"^pset:"))
     application.add_handler(CallbackQueryHandler(resume_callback, pattern=r"^resume:"))
     application.add_handler(CallbackQueryHandler(proposal_callback, pattern=r"^proposal:"))
@@ -814,6 +829,45 @@ async def admin_refund_premium(update: Any, context: Any) -> None:
     await update.effective_message.reply_text(f"Звёзды возвращены, премиум для {target_id} отключён.")
 
 
+async def admin_reviews(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    review_store: TextReviewStore | None = context.application.bot_data.get("review_store")
+    user = update.effective_user
+    if user is None or not settings.is_admin(user.id):
+        await update.effective_message.reply_text("Команда доступна только администратору.")
+        return
+    if review_store is None:
+        await update.effective_message.reply_text("Сбор статистики не настроен.")
+        return
+
+    summary = await asyncio.to_thread(review_store.summary)
+    if not summary:
+        await update.effective_message.reply_text("Пока никто не пользовался проверкой текста.")
+        return
+
+    approved = summary.get("approved", 0)
+    rejected = summary.get("rejected", 0)
+    cancelled = summary.get("cancelled", 0)
+    total = approved + rejected + cancelled
+    lines = [
+        "📝 Проверка текста перед озвучкой",
+        "",
+        f"✅ Принято: {approved}",
+        f"🔄 Отклонено вариантов: {rejected}",
+        f"❌ Задач отменено: {cancelled}",
+    ]
+    if total:
+        lines.append(f"Доля принятых: {approved * 100 // total}%")
+
+    accepted = await asyncio.to_thread(review_store.recent, "approved", 3)
+    if accepted:
+        lines.extend(["", "Последние принятые:"])
+        for record in accepted:
+            preview = re.sub(r"\s+", " ", record.text)[:70]
+            lines.append(f"№{record.job_number} (вариант {record.attempt}): {preview}")
+    await update.effective_message.reply_text("\n".join(lines), reply_markup=_remove_reply_keyboard())
+
+
 async def admin_prem_owners(update: Any, context: Any) -> None:
     settings: BotSettings = context.application.bot_data["settings"]
     premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
@@ -1018,6 +1072,7 @@ PRESET_WIZARD_STEPS: list[tuple[str, str, list[tuple[str, str]], int]] = [
     ("speaker_count", "Количество голосов", SPEAKER_COUNT_OPTIONS, 5),
     ("target_lang", "Язык озвучки", TARGET_LANGS, 2),
     ("tts_provider", "Движок озвучки", TTS_METHOD_CHOICES, 1),
+    ("review_mode", "Проверка текста", REVIEW_MODE_OPTIONS, 1),
 ]
 
 
@@ -1045,6 +1100,8 @@ def _preset_field_label(field: str, value: str) -> str:
         return _target_lang_label(value)
     if field == "tts_provider":
         return _tts_method_label(value)
+    if field == "review_mode":
+        return next((label for code, label in REVIEW_MODE_OPTIONS if code == value), value)
     return value
 
 
@@ -1932,6 +1989,18 @@ async def _show_tts_screen(target: Any, job: dict[str, Any]) -> None:
     )
 
 
+async def _show_review_mode_screen(target: Any, job: dict[str, Any]) -> None:
+    _save_job_snapshot(Path(job["job_dir"]), job, status="select_review")
+    await _show_selection_screen(
+        target,
+        "Последний шаг.\n"
+        "«Сразу дубляж» — как обычно.\n"
+        "«Сначала показать текст» — пришлю распознанный текст до озвучки, "
+        "чтобы не тратить время на заведомо неудачный вариант.",
+        _language_keyboard("rev", REVIEW_MODE_OPTIONS, columns=1, back_callback="back:target"),
+    )
+
+
 async def _advance_selection(update: Any, context: Any, job: dict[str, Any], target: Any) -> None:
     """Drives the video-setup wizard one step at a time: any field the user's
     saved /preset already answers is filled in and skipped silently, and the
@@ -1988,6 +2057,14 @@ async def _advance_selection(update: Any, context: Any, job: dict[str, Any], tar
             job["tts_provider"] = choice
         else:
             await _show_tts_screen(target, job)
+            return
+
+    if "review_mode" not in job:
+        choice = _preset_choice(job, "review_mode")
+        if choice and choice in {code for code, _label in REVIEW_MODE_OPTIONS}:
+            job["review_mode"] = choice
+        else:
+            await _show_review_mode_screen(target, job)
             return
 
     job.pop("_preset", None)
@@ -2170,6 +2247,143 @@ async def select_tts_method(update: Any, context: Any) -> None:
     job["translation_chaos"] = _translation_chaos_value(job.get("translation_chaos")) or "crooked"
     _ensure_translation_seed(job)
     await _advance_selection(update, context, job, query.message)
+
+
+async def select_review_mode(update: Any, context: Any) -> None:
+    query = update.callback_query
+    await query.answer()
+    job = context.user_data.get("job")
+    if not job:
+        await query.edit_message_text("Нет активной задачи. Сначала пришли видео.")
+        return
+
+    mode = query.data.split(":", 1)[1]
+    if mode not in {code for code, _label in REVIEW_MODE_OPTIONS}:
+        await query.edit_message_text("Неизвестный режим. Пришли видео ещё раз.")
+        return
+
+    job["review_mode"] = mode
+    await _advance_selection(update, context, job, query.message)
+
+
+def _text_review_keyboard(job_number: str, attempt: int) -> Any:
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    rows = [[InlineKeyboardButton("✅ Озвучить этот текст", callback_data=f"rv:ok:{job_number}")]]
+    if attempt < MAX_TEXT_REVIEW_ATTEMPTS:
+        rows.append([InlineKeyboardButton("🔄 Другой вариант", callback_data=f"rv:again:{job_number}")])
+    rows.append([InlineKeyboardButton("❌ Отменить задачу", callback_data=f"rv:drop:{job_number}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _send_text_for_review(context: Any, chat_id: int | str, job: dict[str, Any]) -> None:
+    """Shows the prepared dub text and waits for the author's verdict."""
+    job_dir = Path(str(job["job_dir"]))
+    job_number = _job_number(job)
+    attempt = int(job.get("review_attempt") or 1)
+    text = _read_transcript_text(job_dir / "work" / "translated.srt") or "(текст пустой)"
+
+    header = f"📝 Вариант {attempt} из {MAX_TEXT_REVIEW_ATTEMPTS} — работа №{job_number}"
+    body = text if len(text) <= 3200 else text[:3200] + "…"
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"{header}\n\n<blockquote expandable>{html.escape(body)}</blockquote>",
+        parse_mode="HTML",
+        reply_markup=_text_review_keyboard(job_number, attempt),
+    )
+
+
+async def text_review_callback(update: Any, context: Any) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    settings: BotSettings = context.application.bot_data["settings"]
+    review_store: TextReviewStore | None = context.application.bot_data.get("review_store")
+
+    parts = str(query.data or "").split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Некорректная кнопка.", show_alert=True)
+        return
+    action, job_number = parts[1], parts[2]
+
+    job_dir = settings.workdir / str(user.id) / job_number
+    job = _load_job_snapshot(job_dir)
+    if job is None:
+        await query.answer("Задача не найдена.", show_alert=True)
+        return
+    if str(job.get("status") or "") != "awaiting_review":
+        await query.answer("Этот вариант уже не ждёт решения.")
+        return
+
+    attempt = int(job.get("review_attempt") or 1)
+    text = _read_transcript_text(job_dir / "work" / "translated.srt") or ""
+
+    def remember(decision: str) -> None:
+        if review_store is None:
+            return
+        with contextlib.suppress(Exception):
+            review_store.record(
+                job_number=job_number,
+                user_id=int(user.id),
+                attempt=attempt,
+                decision=decision,
+                text=text,
+                source_lang=str(job.get("source_lang") or ""),
+                target_lang=str(job.get("target_lang") or ""),
+            )
+
+    if action == "drop":
+        await query.answer("Отменяю.")
+        remember("cancelled")
+        _save_job_snapshot(job_dir, job, status="rejected", error="text_review_cancelled")
+        await _release_daily_allowance(context, user.id, job)
+        await query.edit_message_text(f"Задача №{job_number} отменена.")
+        return
+
+    if action == "again":
+        if attempt >= MAX_TEXT_REVIEW_ATTEMPTS:
+            await query.answer("Больше вариантов не осталось.", show_alert=True)
+            return
+        await query.answer("Готовлю другой вариант…")
+        remember("rejected")
+        job["review_attempt"] = attempt + 1
+        # A fresh seed is what makes the distortion chains land differently;
+        # without it the same text would simply be rebuilt.
+        job["translation_seed"] = f"{job_number}-v{attempt + 1}"
+        _reset_translation_outputs(job_dir)
+        await query.edit_message_text(f"Вариант {attempt} отклонён. Готовлю следующий…")
+        await _enqueue_job(update, context, job, query.message)
+        return
+
+    if action == "ok":
+        await query.answer("Запускаю озвучку…")
+        remember("approved")
+        job["review_approved"] = True
+        await query.edit_message_text(f"Вариант {attempt} принят. Озвучиваю работу №{job_number}…")
+        await _enqueue_job(update, context, job, query.message)
+        return
+
+    await query.answer("Неизвестное действие.", show_alert=True)
+
+
+def _reset_translation_outputs(job_dir: Path) -> None:
+    """Drops the prepared text so the next run rebuilds it from the audio.
+
+    The extracted audio and separated stems are deliberately kept - they do not
+    change between variants, and redoing them would waste the expensive part.
+    """
+    work = job_dir / "work"
+    for name in ("translated.srt", "source.srt"):
+        with contextlib.suppress(Exception):
+            (work / name).unlink(missing_ok=True)
+    state_path = work / "resume_state.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    for key in ("translated", "source_asr", "artifacts", "preprocess_complete", "segment_count", "sparse_fill"):
+        state.pop(key, None)
+    with contextlib.suppress(Exception):
+        state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 async def _enqueue_job(update: Any, context: Any, job: dict[str, Any], status_message: Any) -> None:
@@ -3928,6 +4142,25 @@ async def _process_job(
         else:
             status_message = await context.bot.send_message(chat_id=chat_id, text=progress.render())
         progress_task = asyncio.create_task(_progress_updater(status_message, progress))
+
+        # "Показать текст" stops the pipeline at the point the text is ready and
+        # hands the decision back to the author. The machine is released while
+        # they think - voicing resumes as a fresh run over the same workdir.
+        awaiting_review = (
+            str(job.get("review_mode") or "direct") == "review" and not job.get("review_approved")
+        )
+        if awaiting_review:
+            config.preprocess_only = True
+            config.resume = True
+            await _run_pipeline_isolated("dub", Path(job["input_path"]), config, progress)
+            job.setdefault("review_attempt", 1)
+            _save_job_snapshot(job_dir, job, status="awaiting_review")
+            await _finish_progress(
+                progress, progress_task, status_message, "Текст готов", detail="жду решения"
+            )
+            await _send_text_for_review(context, chat_id, job)
+            return
+
         [result] = await _run_pipeline_isolated(
             "dub",
             Path(job["input_path"]),

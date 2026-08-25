@@ -38,6 +38,7 @@ class SelectTargetLangTests(unittest.IsolatedAsyncioTestCase):
             "visual_mode": "original",
             "source_lang": None,
             "speaker_count": "auto",
+            "review_mode": "direct",
         }
 
     async def test_ru_shows_the_engine_choice_instead_of_enqueueing(self) -> None:
@@ -92,6 +93,7 @@ class SelectTtsMethodTests(unittest.IsolatedAsyncioTestCase):
             "source_lang": None,
             "speaker_count": "auto",
             "target_lang": "ru",
+            "review_mode": "direct",
         }
 
     async def test_moss_choice_enqueues_with_moss(self) -> None:
