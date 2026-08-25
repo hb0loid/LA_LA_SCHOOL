@@ -54,10 +54,10 @@ class SelectTargetLangTests(unittest.IsolatedAsyncioTestCase):
         labels_and_data = [
             (button.text, button.callback_data) for row in markup.inline_keyboard for button in row
         ]
-        # Only moss and cosyvoice are offered - qwen3 hung in testing, f5 is
-        # Ukrainian-only and picked automatically, not via this menu.
+        # Only MOSS is offered now: cosyvoice is hidden, qwen3 hung in testing,
+        # and f5 is Ukrainian-only and picked automatically, not via this menu.
         codes = [data.split(":", 1)[1] for _text, data in labels_and_data if data != "back:target"]
-        self.assertEqual(set(codes), {"moss", "cosyvoice"})
+        self.assertEqual(set(codes), {"moss"})
 
     async def test_uk_auto_selects_f5_without_a_choice_screen(self) -> None:
         query = _Query("tgt:uk")
@@ -105,14 +105,16 @@ class SelectTtsMethodTests(unittest.IsolatedAsyncioTestCase):
         enqueue.assert_awaited_once()
         self.assertEqual(self.job["tts_provider"], "moss")
 
-    async def test_cosyvoice_choice_enqueues_with_cosyvoice(self) -> None:
+    async def test_hidden_cosyvoice_is_rejected(self) -> None:
+        # Still a working engine, just not offered - a stale button from an
+        # older message must not slip it back in.
         query = _Query("tts:cosyvoice")
         context = _context(self.job)
         update = SimpleNamespace(callback_query=query)
         with patch("laladub.bot._enqueue_job", new=AsyncMock()) as enqueue:
             await select_tts_method(update, context)
-        enqueue.assert_awaited_once()
-        self.assertEqual(self.job["tts_provider"], "cosyvoice")
+        enqueue.assert_not_called()
+        self.assertNotIn("tts_provider", self.job)
 
     async def test_unoffered_engine_is_rejected_even_if_the_code_is_valid(self) -> None:
         # qwen3 is a real provider the pipeline still supports, but it hung
@@ -130,8 +132,8 @@ class SelectTtsMethodTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TtsMethodChoicesTests(unittest.TestCase):
-    def test_only_moss_and_cosyvoice_are_offered(self) -> None:
-        self.assertEqual([code for code, _label in TTS_METHOD_CHOICES], ["moss", "cosyvoice"])
+    def test_only_moss_is_offered(self) -> None:
+        self.assertEqual([code for code, _label in TTS_METHOD_CHOICES], ["moss"])
 
 
 if __name__ == "__main__":

@@ -120,7 +120,11 @@ TTS_METHODS = [
 # What's actually offered to the user: qwen3 hung mid-batch during testing (a
 # reference-voice-dependent stall, not a fluke of the run) and f5 is Ukrainian's
 # only compatible engine, auto-picked without asking - see select_target_lang.
-TTS_METHOD_CHOICES = [("moss", "MOSS — лучше качество, дольше ждать"), ("cosyvoice", "CosyVoice — быстрее, но попроще")]
+# CosyVoice is hidden for now - MOSS got fast enough that the trade-off it
+# offered (quicker, rougher) no longer buys anything. Re-add its tuple here to
+# bring it back; the engine itself is untouched and still works.
+TTS_METHOD_CHOICES = [("moss", "MOSS — лучше качество, дольше ждать")]
+_HIDDEN_TTS_CHOICES = [("cosyvoice", "CosyVoice — быстрее, но попроще")]
 
 # The last step of the setup wizard: озвучка занимает больше всего времени, so
 # the text can be shown first and voiced only if it is worth voicing.
@@ -128,6 +132,10 @@ REVIEW_MODE_OPTIONS = [
     ("direct", "🎬 Сразу дубляж"),
     ("review", "📝 Сначала показать текст"),
 ]
+# Hidden for now: with MOSS this fast, the extra confirmation step costs more
+# attention than the voicing it saves. Flip to True to offer it again - the
+# whole review flow (buttons, retries, stats) stays in place either way.
+REVIEW_STEP_OFFERED = False
 # Each rejected variant costs a full ASR+translation pass, so retries are capped.
 MAX_TEXT_REVIEW_ATTEMPTS = 3
 
@@ -1072,8 +1080,9 @@ PRESET_WIZARD_STEPS: list[tuple[str, str, list[tuple[str, str]], int]] = [
     ("speaker_count", "Количество голосов", SPEAKER_COUNT_OPTIONS, 5),
     ("target_lang", "Язык озвучки", TARGET_LANGS, 2),
     ("tts_provider", "Движок озвучки", TTS_METHOD_CHOICES, 1),
-    ("review_mode", "Проверка текста", REVIEW_MODE_OPTIONS, 1),
 ]
+if REVIEW_STEP_OFFERED:
+    PRESET_WIZARD_STEPS.append(("review_mode", "Проверка текста", REVIEW_MODE_OPTIONS, 1))
 
 
 def _preset_step_keyboard(field: str, options: list[tuple[str, str]], columns: int) -> Any:
@@ -1110,7 +1119,9 @@ _PRESET_FIELD_TITLES = {field: title for field, title, _options, _columns in PRE
 
 def _preset_summary_text(preset: UserPreset) -> str:
     lines = ["Пресет сохранён:"]
-    for field in PRESET_FIELDS:
+    # Only the steps the wizard actually asks about - a hidden step (see
+    # REVIEW_STEP_OFFERED) has no title and nothing to report.
+    for field in _PRESET_FIELD_TITLES:
         value = getattr(preset, field)
         shown = "спрашивать каждый раз" if value is None else _preset_field_label(field, value)
         lines.append(f"{_PRESET_FIELD_TITLES[field]}: {shown}")
@@ -2061,7 +2072,9 @@ async def _advance_selection(update: Any, context: Any, job: dict[str, Any], tar
 
     if "review_mode" not in job:
         choice = _preset_choice(job, "review_mode")
-        if choice and choice in {code for code, _label in REVIEW_MODE_OPTIONS}:
+        if not REVIEW_STEP_OFFERED:
+            job["review_mode"] = "direct"
+        elif choice and choice in {code for code, _label in REVIEW_MODE_OPTIONS}:
             job["review_mode"] = choice
         else:
             await _show_review_mode_screen(target, job)

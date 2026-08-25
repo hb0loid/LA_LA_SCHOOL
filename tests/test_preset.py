@@ -128,7 +128,7 @@ class PresetCommandTests(unittest.IsolatedAsyncioTestCase):
         await preset_command(update, _context(self.store))
         self.assertEqual(len(message.replies), 1)
         text, markup = message.replies[0]
-        self.assertIn("шаг 1/6", text)
+        self.assertIn("шаг 1/5", text)
         self.assertIn("Видеоряд", text)
         codes = {button.callback_data for row in markup.inline_keyboard for button in row}
         self.assertIn("pset:visual_mode:ask", codes)
@@ -163,7 +163,7 @@ class PresetWizardCallbackTests(unittest.IsolatedAsyncioTestCase):
         args, kwargs = query.edit_message_text.call_args
         text = args[0]
         markup = kwargs["reply_markup"]
-        self.assertIn("шаг 2/6", text)
+        self.assertIn("шаг 2/5", text)
         self.assertIn("Входной", text)
         codes = {button.callback_data for row in markup.inline_keyboard for button in row}
         self.assertIn("pset:source_lang:vi", codes)
@@ -177,8 +177,7 @@ class PresetWizardCallbackTests(unittest.IsolatedAsyncioTestCase):
         await self._answer(1, "pset:source_lang:vi")
         await self._answer(1, "pset:speaker_count:auto")
         await self._answer(1, "pset:target_lang:ru")
-        await self._answer(1, "pset:tts_provider:moss")
-        query = await self._answer(1, "pset:review_mode:direct")
+        query = await self._answer(1, "pset:tts_provider:moss")
         text = query.edit_message_text.call_args.args[0]
         self.assertIn("Пресет сохранён", text)
         self.assertIn("Видеоряд: Оставить исходный видеоряд", text)
