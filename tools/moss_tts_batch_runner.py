@@ -77,6 +77,22 @@ def main() -> None:
     edge_padding_seconds = max(0.0, float(manifest.get("edge_padding_seconds", 0.04)))
     natural_max_new_tokens = max(128, int(manifest.get("natural_max_new_tokens", 512)))
     total = len(items)
+    # Diarization already gives one reference per character, so the same file
+    # comes back for every line that character speaks. Handing the processor a
+    # path makes it re-encode that file each time - and the audio tokenizer
+    # runs on CPU here, so it is the slowest fixed cost per line. The processor
+    # also accepts pre-encoded codes, so each reference is encoded once.
+    reference_codes: dict[str, "torch.Tensor"] = {}
+
+    def encoded_reference(path: Path) -> "torch.Tensor":
+        key = str(path)
+        codes = reference_codes.get(key)
+        if codes is None:
+            codes = processor.encode_audios_from_path([key])[0]
+            reference_codes[key] = codes
+            print(f"MOSS_REFERENCE_ENCODED\t{path.name}\t{len(reference_codes)}", flush=True)
+        return codes
+
     with torch.inference_mode():
         for index, item in enumerate(items, start=1):
             output_path = Path(item["output"]).resolve()
@@ -107,7 +123,7 @@ def main() -> None:
             print(f"MOSS_START\t{index}\t{total}", flush=True)
             user_message = {
                 "text": generation_text,
-                "reference": [str(reference)],
+                "reference": [encoded_reference(reference)],
                 "language": language,
             }
             if duration_control:
