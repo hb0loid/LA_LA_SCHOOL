@@ -1,15 +1,97 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import sqlite3
+import time
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 from .models import DubConfig, Segment
 
 
 class TranslationError(RuntimeError):
     pass
+
+
+_TRANSLATION_CACHE_READY: set[str] = set()
+
+
+def _translation_cache_path(config: DubConfig) -> Path | None:
+    cache_root = getattr(config, "media_cache_dir", None)
+    if not cache_root:
+        return None
+    return Path(cache_root).parent / "translations.sqlite3"
+
+
+def _translation_cache_connect(config: DubConfig) -> sqlite3.Connection | None:
+    path = _translation_cache_path(config)
+    if path is None:
+        return None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(path, timeout=10.0)
+        key = str(path)
+        if key not in _TRANSLATION_CACHE_READY:
+            # Pipeline stages run as separate spawned processes, so WAL is what
+            # lets them share this file without blocking each other.
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA busy_timeout = 10000")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS translations ("
+                "key TEXT PRIMARY KEY, translated TEXT NOT NULL, created_at REAL NOT NULL)"
+            )
+            connection.commit()
+            _TRANSLATION_CACHE_READY.add(key)
+        return connection
+    except Exception:
+        return None
+
+
+def _translation_cache_key(text: str, source_lang: str, target_lang: str) -> str:
+    payload = f"{source_lang}\x00{target_lang}\x00{text}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _translation_cache_get(text: str, source_lang: str, target_lang: str, config: DubConfig) -> str | None:
+    connection = _translation_cache_connect(config)
+    if connection is None:
+        return None
+    try:
+        row = connection.execute(
+            "SELECT translated FROM translations WHERE key = ?",
+            (_translation_cache_key(text, source_lang, target_lang),),
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+    except Exception:
+        return None
+    finally:
+        connection.close()
+
+
+def _translation_cache_put(
+    text: str, source_lang: str, target_lang: str, translated: str, config: DubConfig
+) -> None:
+    # Never cache a failure: a rate-limited or over-long request comes back as
+    # the translator's own error text, and storing it would make one bad moment
+    # permanent for that phrase.
+    if not translated.strip() or _looks_bad_machine_translation(translated):
+        return
+    connection = _translation_cache_connect(config)
+    if connection is None:
+        return
+    try:
+        connection.execute(
+            "INSERT OR REPLACE INTO translations (key, translated, created_at) VALUES (?, ?, ?)",
+            (_translation_cache_key(text, source_lang, target_lang), translated, time.time()),
+        )
+        connection.commit()
+    except Exception:
+        pass
+    finally:
+        connection.close()
 
 
 _ARGOS_INDEX_UPDATED = False
@@ -98,6 +180,20 @@ def _translate_hybrid_text(text: str, source_lang: str, target_lang: str, config
     if known is not None:
         return known
 
+    # Distortion runs every segment through 15 chains of 3-7 languages, so the
+    # same short phrase is translated over and over, both inside one video and
+    # across videos. Reusing earlier answers is what keeps the free translation
+    # APIs from answering 429 halfway through a job.
+    cached = _translation_cache_get(text, source_lang, target_lang, config)
+    if cached is not None:
+        return cached
+
+    result = _translate_hybrid_text_uncached(text, source_lang, target_lang, config)
+    _translation_cache_put(text, source_lang, target_lang, result, config)
+    return result
+
+
+def _translate_hybrid_text_uncached(text: str, source_lang: str, target_lang: str, config: DubConfig) -> str:
     online_errors: list[Exception] = []
     try:
         translated = _translate_googleweb_text(text, source_lang, target_lang)
@@ -629,5 +725,21 @@ def _looks_bad_machine_translation(text: str) -> bool:
         return True
     if "�" in compact:
         return True
+    if _looks_like_translator_error(compact):
+        return True
     question_marks = compact.count("?")
     return question_marks >= 3 and question_marks / max(1, len(compact)) > 0.03
+
+
+# MyMemory answers over-long or rate-limited requests with HTTP 200 and puts its
+# own error message where the translation belongs, so it reads as a successful
+# result. Left unchecked it becomes a subtitle line - and, worse, gets cached.
+_TRANSLATOR_ERROR_RE = re.compile(
+    r"query length limit exceeded|максимально допустимое количество запросов"
+    r"|превышен лимит длины запроса|mymemory warning|please contact us",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_translator_error(text: str) -> bool:
+    return bool(_TRANSLATOR_ERROR_RE.search(text))
