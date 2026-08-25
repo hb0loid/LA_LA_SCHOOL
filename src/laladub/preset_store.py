@@ -66,6 +66,13 @@ class PresetStore:
                 );
                 """
             )
+            # CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a
+            # database written before a field was added still lacks its column
+            # and every read of that field would raise.
+            existing = {str(row["name"]) for row in connection.execute("PRAGMA table_info(presets)")}
+            for field in PRESET_FIELDS:
+                if field not in existing:
+                    connection.execute(f"ALTER TABLE presets ADD COLUMN {field} TEXT")
 
     def get_preset(self, user_id: int) -> UserPreset:
         with self._connect() as connection:

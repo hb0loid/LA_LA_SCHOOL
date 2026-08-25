@@ -77,6 +77,38 @@ class PresetStoreTests(unittest.TestCase):
         preset = self.store.get_preset(1)
         self.assertEqual(preset.target_lang, None)
 
+    def test_database_written_before_a_field_existed_is_migrated(self) -> None:
+        # Regression: adding review_mode to PRESET_FIELDS broke every read on
+        # existing databases, because CREATE TABLE IF NOT EXISTS leaves an
+        # older table untouched and the column was simply missing.
+        import sqlite3
+
+        legacy_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(legacy_dir.cleanup)
+        path = Path(legacy_dir.name) / "legacy.sqlite3"
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute(
+                "CREATE TABLE presets (user_id INTEGER PRIMARY KEY, visual_mode TEXT,"
+                " source_lang TEXT, speaker_count TEXT, target_lang TEXT, tts_provider TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO presets (user_id, target_lang, tts_provider) VALUES (1, 'ru', 'moss')"
+            )
+            connection.commit()
+        finally:
+            # Windows will not delete the temp dir while a handle is open.
+            connection.close()
+
+        store = PresetStore(path)
+        preset = store.get_preset(1)
+        self.assertEqual(preset.target_lang, "ru")
+        self.assertEqual(preset.tts_provider, "moss")
+        self.assertIsNone(preset.review_mode)
+        # And the new field is writable afterwards.
+        store.set_preset_field(1, "review_mode", "review")
+        self.assertEqual(store.get_preset(1).review_mode, "review")
+
     def test_presets_are_isolated_per_user(self) -> None:
         self.store.set_preset_field(1, "target_lang", "ru")
         self.store.set_preset_field(2, "target_lang", "en")
