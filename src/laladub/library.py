@@ -128,6 +128,16 @@ async def show_command(update: Any, context: Any) -> None:
         await update.effective_message.reply_text("Использование: /show номер_работы")
         return
 
+    # Who asks for what, so a work that keeps reappearing in a chat can be
+    # traced back to whoever is asking for it.
+    chat = update.effective_chat
+    print(
+        f"/show {job_number} by user={user_id} "
+        f"({getattr(user, 'username', None) or getattr(user, 'first_name', '')}) "
+        f"in chat={getattr(chat, 'id', None)} ({getattr(chat, 'title', None) or 'личка'})",
+        flush=True,
+    )
+
     entry = await asyncio.to_thread(library_store.get, job_number)
     if entry is None:
         await update.effective_message.reply_text(f"Работа №{job_number} не найдена в библиотеке.")
