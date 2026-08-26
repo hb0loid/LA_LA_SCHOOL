@@ -16,6 +16,7 @@ from datetime import datetime
 from .ffmpeg import probe_duration
 from .karma import format_karma_milli, karma_milli_for_duration, level_for_karma, visible_karma
 from .library import LibraryStore, show_command
+from .update_dedupe import UpdateDeduplicator, build_replay_guard
 from .proposal_store import ProposalStore, ScheduledPost, Submission
 
 # How far apart consecutive posts to the same channel are spaced when /timer
@@ -69,6 +70,7 @@ def main() -> None:
             ChatMemberHandler,
             CommandHandler,
             MessageHandler,
+            TypeHandler,
             filters,
         )
     except ImportError as exc:
@@ -88,6 +90,17 @@ def main() -> None:
     application.bot_data["library_store"] = LibraryStore(settings.library_db)
     private_chat = filters.ChatType.PRIVATE
     application.add_error_handler(_error_handler)
+    # Before every other handler: an update Telegram redelivered after a hard
+    # restart must not publish or post a second time.
+    application.add_handler(
+        TypeHandler(
+            Update,
+            build_replay_guard(
+                UpdateDeduplicator(settings.database.parent / "last_update.json")
+            ),
+        ),
+        group=-100,
+    )
     application.add_handler(CommandHandler("start", start, filters=private_chat))
     application.add_handler(CommandHandler("pending", pending, filters=private_chat))
     application.add_handler(CommandHandler("cancel", cancel, filters=private_chat))

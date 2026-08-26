@@ -36,6 +36,7 @@ from .pipeline import run_dub, run_transcript
 from .premium_store import PremiumStore, Subscription, UserSettings
 from .preset_store import PRESET_FIELDS, PresetStore, UserPreset
 from .text_review import TextReviewStore
+from .update_dedupe import UpdateDeduplicator, build_replay_guard
 from .proposal_store import ProposalStore
 from .tts import clear_tts_model_caches
 from .watermark import add_watermark
@@ -168,6 +169,7 @@ def main() -> None:
             CommandHandler,
             MessageHandler,
             PreCheckoutQueryHandler,
+            TypeHandler,
             filters,
         )
     except ImportError as exc:
@@ -236,6 +238,15 @@ def main() -> None:
     application.bot_data["review_store"] = TextReviewStore(settings.review_db)
     private_chat = filters.ChatType.PRIVATE
     application.add_error_handler(_telegram_error_handler)
+    # Before every other handler: an update Telegram redelivered after a hard
+    # restart must not run its side effects a second time.
+    application.add_handler(
+        TypeHandler(
+            Update,
+            build_replay_guard(UpdateDeduplicator(settings.workdir / "last_update.json")),
+        ),
+        group=-100,
+    )
     application.add_handler(MessageHandler(private_chat, maintenance_message_gate), group=-1)
     application.add_handler(CallbackQueryHandler(maintenance_callback_gate), group=-1)
     application.add_handler(CommandHandler("start", start, filters=private_chat))
