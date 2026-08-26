@@ -262,7 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument("--max-word-repeats", type=int, default=3, help="Maximum consecutive repeated single words.")
     dub.add_argument(
         "--translation-pivots",
-        default="input,en|input,ja,en|input,tr,de,en|en,de|en,fr|en,es|en,ja,ko|en,tr,ar|input,en,de|input,ja,ko,en|input,tr,ar,en|en,ms,he,en",
+        default="input,en|input,ja,en|input,tr,de,en|en,de|en,fr|en,es|en,ja,ko|en,tr,ar|input,en,de|input,ja,ko,en|input,tr,ar,en|en,th,he,en",
         help="Round-trip pivot chains separated by |.",
     )
     dub.add_argument(

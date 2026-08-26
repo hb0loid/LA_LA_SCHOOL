@@ -101,3 +101,25 @@ class UnparseablePivotTests(unittest.TestCase):
             unfiltered = _translation_distortion_chains(_config(3))
         self.assertEqual(_translation_distortion_chains(_config(3)), unfiltered)
 
+
+class ShippedPivotDefaultsTests(unittest.TestCase):
+    def test_no_shipped_default_pivots_through_an_unparseable_language(self) -> None:
+        # The Malay chain was written into six places - two launch scripts, the
+        # settings default, the CLI default, and both job builders. Fixing one
+        # left the worker, which is what actually runs the translation, still
+        # on the broken chain. Any copy that drifts back trips this.
+        root = Path(__file__).resolve().parent.parent
+        offenders: list[str] = []
+        for path in [*root.glob("src/laladub/*.py"), *root.glob("tools/**/*.ps1"), *root.glob("*.ps1")]:
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+                if "|" not in line or "en," not in line:
+                    continue
+                for variant in line.split("|"):
+                    hops = [hop.strip().strip("\"'") for hop in variant.split(",")]
+                    # Only the hops a chain reads out of matter; the last one is
+                    # the target it lands on.
+                    if any(hop in pipeline.UNPARSEABLE_PIVOT_LANGS for hop in hops[:-1]):
+                        offenders.append(f"{path.relative_to(root)}:{number}")
+                        break
+        self.assertEqual(offenders, [], f"pivot chains through unparseable languages: {offenders}")
+

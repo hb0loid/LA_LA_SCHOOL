@@ -315,7 +315,7 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         distort_translation=_parse_bool(os.environ.get("LALADUB_DISTORT_TRANSLATION", "1")),
         translation_pivots=os.environ.get(
             "LALADUB_TRANSLATION_PIVOTS",
-            "input,en|input,ja,en|input,tr,de,en|en,de|en,fr|en,es|en,ja,ko|en,tr,ar|input,en,de|input,ja,ko,en|input,tr,ar,en|en,ms,he,en",
+            "input,en|input,ja,en|input,tr,de,en|en,de|en,fr|en,es|en,ja,ko|en,tr,ar|input,en,de|input,ja,ko,en|input,tr,ar,en|en,th,he,en",
         ),
         max_translation_hops=max(2, int(os.environ.get("LALADUB_MAX_TRANSLATION_HOPS", "3"))),
         # Share of foreign-channel mentions in artifacts renamed to ours.
