@@ -64,6 +64,8 @@ class DubConfig:
     # for one line. Capping the length is what keeps the free translators from
     # rate-limiting a job halfway through.
     max_translation_hops: int = 3
+    # Share of foreign-channel mentions in artifacts rebranded to ours (0..1).
+    channel_rebrand_share: float = 0.5
     translation_second_pass_ratio: float = 0.0
     collapse_repetitions: bool = True
     max_phrase_repeats: int = 2

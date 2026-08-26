@@ -132,6 +132,7 @@ class BotSettings:
     distort_translation: bool
     translation_pivots: str
     max_translation_hops: int
+    channel_rebrand_share: float
     translation_second_pass_ratio: float
 
     def is_paid(self, user_id: int | None) -> bool:
@@ -317,6 +318,10 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
             "input,en|input,ja,en|input,tr,de,en|en,de|en,fr|en,es|en,ja,ko|en,tr,ar|input,en,de|input,ja,ko,en|input,tr,ar,en|en,ms,he,en",
         ),
         max_translation_hops=max(2, int(os.environ.get("LALADUB_MAX_TRANSLATION_HOPS", "3"))),
+        # Share of foreign-channel mentions in artifacts renamed to ours.
+        channel_rebrand_share=min(
+            1.0, max(0.0, float(os.environ.get("LALADUB_CHANNEL_REBRAND_SHARE", "0.5")))
+        ),
         translation_second_pass_ratio=max(
             0.0,
             min(1.0, float(os.environ.get("LALADUB_TRANSLATION_SECOND_PASS_RATIO", "0.0"))),

@@ -1670,6 +1670,40 @@ def _load_resumable_artifact_source(config: DubConfig, _artifact_lang: str) -> l
     return []
 
 
+# Ghiền Mì Gõ is a real Vietnamese channel whose videos are the usual input,
+# so Whisper faithfully transcribes its outro - the dub ends up advertising a
+# competitor, 168 times against 16 of our own across 2644 jobs. Whisper also
+# latches onto the name and stutters it ("Ghiền Mì Ghiền Mì Ghiền Mì Ghiền"),
+# so the repeats are folded back into one mention before the swap.
+_VI_E = "eêềếệểễ"
+_VI_I = "iìíịỉĩ"
+_VI_O = "oòóọỏõôồốộổỗơờớợởỡ"
+_CHANNEL_WORD = f"(?:ghi[{_VI_E}]n|m[{_VI_I}]|g[{_VI_O}])"
+_FOREIGN_CHANNEL_RE = re.compile(
+    rf"ghi[{_VI_E}]n(?:\s+{_CHANNEL_WORD})*",
+    re.IGNORECASE | re.UNICODE,
+)
+OUR_CHANNEL_NAME = "La La School"
+# Half the mentions keep the original name: the artifacts are meant to feel
+# like something that slipped through, and a name that is always ours reads
+# as deliberate branding instead.
+CHANNEL_REBRAND_SHARE = 0.5
+
+
+def _rebrand_foreign_channel(text: str, config: DubConfig) -> str:
+    if not text or not _FOREIGN_CHANNEL_RE.search(text):
+        return text
+    share = float(getattr(config, "channel_rebrand_share", CHANNEL_REBRAND_SHARE))
+    if share <= 0.0:
+        return text
+    # Seeded on the line itself, so a rerun of the same job rebrands the same
+    # mentions rather than reshuffling them.
+    digest = hashlib.sha256(f"{_translation_seed_base(config)}|{text}".encode("utf-8")).digest()
+    if share < 1.0 and (int.from_bytes(digest[:4], "big") / 0xFFFFFFFF) >= share:
+        return text
+    return _FOREIGN_CHANNEL_RE.sub(OUR_CHANNEL_NAME, text)
+
+
 def _translate_and_clean_artifacts(
     artifacts: list[Segment],
     artifact_config: DubConfig,
@@ -1688,6 +1722,9 @@ def _translate_and_clean_artifacts(
             max_phrase_repeats=2,
             max_word_repeats=2,
         )
+    for artifact in artifacts:
+        if artifact.translated_text:
+            artifact.translated_text = _rebrand_foreign_channel(artifact.translated_text, artifact_config)
     write_srt(output_path, artifacts, translated=True)
     return artifacts
 
