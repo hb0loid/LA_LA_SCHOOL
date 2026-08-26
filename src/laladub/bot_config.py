@@ -38,6 +38,7 @@ class BotSettings:
     watermark_text: str
     watermark_image: Path | None
     max_file_mb: int
+    max_file_mb_premium: int
     translator: str
     tts: str
     voice: str | None
@@ -191,6 +192,8 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         watermark_text=os.environ.get("LALADUB_WATERMARK_TEXT", "La La Local Dub"),
         watermark_image=_optional_path(os.environ.get("LALADUB_WATERMARK_IMAGE")),
         max_file_mb=int(os.environ.get("LALADUB_MAX_FILE_MB", "200")),
+        # 0 means no limit. Premium users and admins are trusted with the disk.
+        max_file_mb_premium=int(os.environ.get("LALADUB_MAX_FILE_MB_PREMIUM", "0")),
         translator=os.environ.get("LALADUB_TRANSLATOR", "hybrid"),
         tts=os.environ.get("LALADUB_TTS", "moss"),
         voice=_empty_to_none(os.environ.get("LALADUB_VOICE", "Microsoft Irina Desktop")),

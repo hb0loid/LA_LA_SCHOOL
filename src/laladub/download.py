@@ -36,12 +36,13 @@ def extract_url(text: str) -> str | None:
 
 
 def download_video_url(url: str, output_dir: Path, max_file_mb: int) -> Path:
+    """max_file_mb of 0 or less means no size limit at all."""
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise DownloadError("Это не похоже на корректную ссылку.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    max_bytes = max_file_mb * 1024 * 1024
+    max_bytes = max_file_mb * 1024 * 1024 if max_file_mb > 0 else 0
     cached_path = _restore_cached_download(url, output_dir, max_bytes)
     if cached_path is not None:
         print(f"Download cache hit: {url} -> {cached_path}", flush=True)
@@ -60,7 +61,7 @@ def download_video_url(url: str, output_dir: Path, max_file_mb: int) -> Path:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "max_filesize": max_bytes,
+        **({"max_filesize": max_bytes} if max_bytes else {}),
         "windowsfilenames": True,
         "js_runtimes": {"node": {}, "deno": {}},
         "remote_components": ["ejs:github"],
@@ -117,7 +118,7 @@ def download_video_url(url: str, output_dir: Path, max_file_mb: int) -> Path:
             encoding="utf-8",
         )
 
-    if video_path.stat().st_size > max_bytes:
+    if max_bytes and video_path.stat().st_size > max_bytes:
         size_mb = video_path.stat().st_size / 1024 / 1024
         video_path.unlink(missing_ok=True)
         raise DownloadError(f"Видео получилось слишком большим: {size_mb:.1f} МБ. Лимит: {max_file_mb} МБ.")
@@ -133,7 +134,7 @@ def _restore_cached_download(url: str, output_dir: Path, max_bytes: int) -> Path
     cached_video = _find_downloaded_video(cache_dir)
     if cached_video is None:
         return None
-    if cached_video.stat().st_size > max_bytes:
+    if max_bytes and cached_video.stat().st_size > max_bytes:
         return None
 
     for candidate in output_dir.glob("input.*"):

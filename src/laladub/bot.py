@@ -1007,6 +1007,15 @@ def _is_premium_user(settings: BotSettings, premium_store: PremiumStore | None, 
     return premium_store is not None and premium_store.active_subscription(user_id) is not None
 
 
+def _max_file_mb_for(
+    settings: BotSettings, premium_store: PremiumStore | None, user_id: int | None
+) -> int:
+    """Download size cap for this user, in MB. 0 means no cap."""
+    if _is_premium_user(settings, premium_store, user_id):
+        return settings.max_file_mb_premium
+    return settings.max_file_mb
+
+
 _PREMIUM_ONLY_TEXT = "Это премиум-функция. Оформить: /premium"
 
 
@@ -1708,8 +1717,10 @@ async def receive_link(update: Any, context: Any) -> None:
     job_dir.mkdir(parents=True, exist_ok=True)
 
     status = await message.reply_text("Скачиваю видео по ссылке на основном ПК...")
+    premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
+    max_file_mb = _max_file_mb_for(settings, premium_store, user_id)
     try:
-        input_path = await asyncio.to_thread(download_video_url, url, job_dir, settings.max_file_mb)
+        input_path = await asyncio.to_thread(download_video_url, url, job_dir, max_file_mb)
         source_title = _source_title_from_download(job_dir, input_path, url)
     except Exception as exc:
         traceback_text = traceback.format_exc()
@@ -1845,6 +1856,7 @@ async def _ensure_job_input_video(
     job: dict[str, Any],
     settings: BotSettings,
     input_path: Path,
+    max_file_mb: int | None = None,
 ) -> Path | None:
     if await asyncio.to_thread(has_video_and_audio, input_path):
         return input_path
@@ -1863,7 +1875,12 @@ async def _ensure_job_input_video(
         "Скачанный файл оказался не видео, а отдельной дорожкой. Перекачиваю ссылку заново...",
     )
     try:
-        redownloaded_path = await asyncio.to_thread(download_video_url, source_url, job_dir, settings.max_file_mb)
+        redownloaded_path = await asyncio.to_thread(
+            download_video_url,
+            source_url,
+            job_dir,
+            settings.max_file_mb if max_file_mb is None else max_file_mb,
+        )
     except Exception as exc:
         details = "".join(traceback.format_exception_only(type(exc), exc)).strip()
         await _safe_edit_status(status, f"Не смог перекачать видео по ссылке:\n{details}")
@@ -2447,7 +2464,18 @@ async def _enqueue_job(update: Any, context: Any, job: dict[str, Any], status_me
             job["input_path"] = str(input_path)
             _save_job_snapshot(job_dir, job, status="queued", audio_visual=True)
         else:
-            input_path = await _ensure_job_input_video(status_message, job, settings, input_path)
+            input_path = await _ensure_job_input_video(
+                status_message,
+                job,
+                settings,
+                input_path,
+                # Re-downloading must not hit a cap the first download cleared.
+                _max_file_mb_for(
+                    settings,
+                    context.application.bot_data.get("premium_store"),
+                    user.id if user else None,
+                ),
+            )
             if input_path is None:
                 _save_job_snapshot(job_dir, job, status="rejected", error="invalid_input_media")
                 return
