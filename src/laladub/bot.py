@@ -2711,16 +2711,26 @@ def _cleanup_finished_jobs_once(settings: BotSettings) -> tuple[int, int]:
         except ValueError:
             continue
 
+        # A job.json that no longer parses is dead weight: nothing can resume
+        # it and every scan re-reads it. Age it by the file itself.
         try:
             job = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            continue
+            job = None
         if not isinstance(job, dict):
+            if path.stat().st_mtime > cutoff:
+                continue
+            size = _directory_size(job_dir)
+            shutil.rmtree(job_dir, ignore_errors=True)
+            deleted += 1
+            bytes_freed += size
             continue
 
-        status = str(job.get("status") or "")
-        if status not in CLEANUP_JOB_STATUSES:
-            continue
+        # Past the retention window every job goes, whatever its status. Only
+        # done/failed/rejected used to be swept, so a job left in running or
+        # queued by a restart - or a dialog the user never answered - stayed on
+        # disk and in /queue forever. A live job updates itself constantly, so
+        # nothing running can be this old.
         finished_at = _coerce_float(job.get("finished_at"))
         updated_at = _coerce_float(job.get("updated_at"))
         marker = finished_at or updated_at or path.stat().st_mtime
