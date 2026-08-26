@@ -1079,8 +1079,11 @@ PRESET_WIZARD_STEPS: list[tuple[str, str, list[tuple[str, str]], int]] = [
     ("source_lang", "Входной язык", SOURCE_LANGS, 2),
     ("speaker_count", "Количество голосов", SPEAKER_COUNT_OPTIONS, 5),
     ("target_lang", "Язык озвучки", TARGET_LANGS, 2),
-    ("tts_provider", "Движок озвучки", TTS_METHOD_CHOICES, 1),
 ]
+# Nothing to decide while a step has a single answer - the normal flow picks it
+# without asking, so a preset for it would only ever restate that pick.
+if len(TTS_METHOD_CHOICES) > 1:
+    PRESET_WIZARD_STEPS.append(("tts_provider", "Движок озвучки", TTS_METHOD_CHOICES, 1))
 if REVIEW_STEP_OFFERED:
     PRESET_WIZARD_STEPS.append(("review_mode", "Проверка текста", REVIEW_MODE_OPTIONS, 1))
 
@@ -2066,6 +2069,10 @@ async def _advance_selection(update: Any, context: Any, job: dict[str, Any], tar
         choice = _preset_choice(job, "tts_provider")
         if choice and choice in {code for code, _label in TTS_METHOD_CHOICES}:
             job["tts_provider"] = choice
+        elif len(TTS_METHOD_CHOICES) == 1:
+            # A screen offering a single button is just an extra tap. It comes
+            # back on its own the moment a second engine is offered again.
+            job["tts_provider"] = TTS_METHOD_CHOICES[0][0]
         else:
             await _show_tts_screen(target, job)
             return

@@ -128,7 +128,7 @@ class PresetCommandTests(unittest.IsolatedAsyncioTestCase):
         await preset_command(update, _context(self.store))
         self.assertEqual(len(message.replies), 1)
         text, markup = message.replies[0]
-        self.assertIn("шаг 1/5", text)
+        self.assertIn("шаг 1/4", text)
         self.assertIn("Видеоряд", text)
         codes = {button.callback_data for row in markup.inline_keyboard for button in row}
         self.assertIn("pset:visual_mode:ask", codes)
@@ -163,7 +163,7 @@ class PresetWizardCallbackTests(unittest.IsolatedAsyncioTestCase):
         args, kwargs = query.edit_message_text.call_args
         text = args[0]
         markup = kwargs["reply_markup"]
-        self.assertIn("шаг 2/5", text)
+        self.assertIn("шаг 2/4", text)
         self.assertIn("Входной", text)
         codes = {button.callback_data for row in markup.inline_keyboard for button in row}
         self.assertIn("pset:source_lang:vi", codes)
@@ -176,15 +176,16 @@ class PresetWizardCallbackTests(unittest.IsolatedAsyncioTestCase):
         await self._answer(1, "pset:visual_mode:original")
         await self._answer(1, "pset:source_lang:vi")
         await self._answer(1, "pset:speaker_count:auto")
-        await self._answer(1, "pset:target_lang:ru")
-        query = await self._answer(1, "pset:tts_provider:moss")
+        query = await self._answer(1, "pset:target_lang:ru")
         text = query.edit_message_text.call_args.args[0]
         self.assertIn("Пресет сохранён", text)
         self.assertIn("Видеоряд: Оставить исходный видеоряд", text)
         self.assertIn("Входной язык: Вьетнамский", text)
         self.assertIn("Количество голосов: Авто", text)
         self.assertIn("Язык озвучки: Русский", text)
-        self.assertIn("Движок озвучки: MOSS", text)
+        # No engine line: with a single engine the wizard does not ask, so
+        # there is nothing to restate here.
+        self.assertNotIn("Движок озвучки", text)
 
 
 class AdvanceSelectionPresetTests(unittest.IsolatedAsyncioTestCase):

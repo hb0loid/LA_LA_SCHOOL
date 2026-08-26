@@ -41,23 +41,17 @@ class SelectTargetLangTests(unittest.IsolatedAsyncioTestCase):
             "review_mode": "direct",
         }
 
-    async def test_ru_shows_the_engine_choice_instead_of_enqueueing(self) -> None:
+    async def test_ru_skips_the_engine_screen_while_only_one_engine_is_offered(self) -> None:
+        # A screen with a single button is just an extra tap; the choice is
+        # made for the user and the job goes straight into the queue.
         query = _Query("tgt:ru")
         context = _context(self.job)
         update = SimpleNamespace(callback_query=query)
         with patch("laladub.bot._enqueue_job", new=AsyncMock()) as enqueue:
             await select_target_lang(update, context)
-        enqueue.assert_not_called()
-        self.assertEqual(context.user_data["job"]["target_lang"], "ru")
-        self.assertNotIn("tts_provider", context.user_data["job"])
-        markup = query.message.edit_text.call_args.kwargs["reply_markup"]
-        labels_and_data = [
-            (button.text, button.callback_data) for row in markup.inline_keyboard for button in row
-        ]
-        # Only MOSS is offered now: cosyvoice is hidden, qwen3 hung in testing,
-        # and f5 is Ukrainian-only and picked automatically, not via this menu.
-        codes = [data.split(":", 1)[1] for _text, data in labels_and_data if data != "back:target"]
-        self.assertEqual(set(codes), {"moss"})
+        enqueue.assert_awaited_once()
+        self.assertEqual(self.job["target_lang"], "ru")
+        self.assertEqual(self.job["tts_provider"], "moss")
 
     async def test_uk_auto_selects_f5_without_a_choice_screen(self) -> None:
         query = _Query("tgt:uk")
@@ -71,13 +65,26 @@ class SelectTargetLangTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.job["target_lang"], "uk")
         self.assertEqual(self.job["tts_provider"], "f5")
 
-    async def test_en_also_shows_the_engine_choice(self) -> None:
+    async def test_en_skips_it_too(self) -> None:
         query = _Query("tgt:en")
         context = _context(self.job)
         update = SimpleNamespace(callback_query=query)
         with patch("laladub.bot._enqueue_job", new=AsyncMock()) as enqueue:
             await select_target_lang(update, context)
+        enqueue.assert_awaited_once()
+        self.assertEqual(self.job["tts_provider"], "moss")
+
+    async def test_the_screen_returns_once_a_second_engine_is_offered(self) -> None:
+        # The skip is driven by the offer list, not hardcoded - restoring an
+        # engine must bring the choice back without touching this branch.
+        query = _Query("tgt:ru")
+        context = _context(self.job)
+        update = SimpleNamespace(callback_query=query)
+        two = [*TTS_METHOD_CHOICES, ("cosyvoice", "CosyVoice")]
+        with patch("laladub.bot.TTS_METHOD_CHOICES", two),              patch("laladub.bot._enqueue_job", new=AsyncMock()) as enqueue:
+            await select_target_lang(update, context)
         enqueue.assert_not_called()
+        self.assertNotIn("tts_provider", self.job)
         self.assertIn("Выбери движок озвучки", query.message.edit_text.call_args.args[0])
 
 
