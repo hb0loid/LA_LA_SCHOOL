@@ -2630,6 +2630,16 @@ def _apply_deep_phonetic_chaos(segments: list[Segment], config: DubConfig) -> li
     return segments
 
 
+# Argos splits text into sentences before translating, and its sentence
+# splitter simply has no model for these languages - "No processors to load
+# for language ms". They translate fine *into*, so a chain reaching one is
+# only broken on the hop back out. Online translators handle them, so a chain
+# through one works right up until the online side hits its rate limit; then
+# the local fallback cannot run either and the whole chain collapses into
+# mechanical text mangling. That was 99% of every collapsed chain in the logs.
+UNPARSEABLE_PIVOT_LANGS = frozenset({"ms", "az"})
+
+
 def _translation_distortion_chains(config: DubConfig) -> list[list[str]]:
     target = config.target_lang.strip()
     if not target:
@@ -2653,6 +2663,18 @@ def _translation_distortion_chains(config: DubConfig) -> list[list[str]]:
         del chain[max_hops:]
         if chain[-1] != target:
             chain.append(target)
+        # A chain is only as good as its weakest hop: one language the local
+        # translator cannot read makes the whole variant collapse whenever the
+        # online side is rate-limited. Better to drop the variant than to serve
+        # mangled text from it.
+        blocked = [lang for lang in chain[:-1] if lang in UNPARSEABLE_PIVOT_LANGS]
+        if blocked:
+            print(
+                f"      Skipping pivot chain {' -> '.join(chain)}: "
+                f"no local sentence splitter for {', '.join(sorted(set(blocked)))}"
+            )
+            continue
+
         key = tuple(chain)
         if len(chain) >= 3 and key not in seen:
             seen.add(key)

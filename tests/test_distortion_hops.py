@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from laladub import pipeline
 from laladub.models import DubConfig
 from laladub.pipeline import _translation_distortion_chains
 
 # The live configuration, including the variants that used to cost 5-7 calls.
 LIVE_PIVOTS = (
     "input,en|input,ja,en|input,tr,de,en|en,de|en,fr|en,es|en,ja,ko|en,tr,ar"
-    "|input,en,de|input,ja,ko,en|input,tr,ar,en|en,ms,he,en"
+    "|input,en,de|input,ja,ko,en|input,tr,ar,en|en,th,he,en"
 )
 
 
@@ -67,3 +69,35 @@ class DistortionHopCapTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnparseablePivotTests(unittest.TestCase):
+    def test_a_chain_through_malay_is_dropped(self) -> None:
+        # Argos has no sentence splitter for Malay, so this chain could only
+        # ever run online. Once the online side hit its rate limit the whole
+        # chain collapsed and the line was replaced with mangled text - 253 of
+        # the 256 collapses in the logs came from exactly this variant.
+        chains = _translation_distortion_chains(_config(9, "en,ms,he,en"))
+        self.assertEqual(chains, [])
+
+    def test_a_chain_through_azerbaijani_is_dropped(self) -> None:
+        chains = _translation_distortion_chains(_config(9, "en,az,en"))
+        self.assertEqual(chains, [])
+
+    def test_the_thai_replacement_survives(self) -> None:
+        chains = _translation_distortion_chains(_config(9, "en,th,he,en"))
+        self.assertEqual(chains, [["ru", "en", "th", "he", "en", "ru"]])
+
+    def test_dubbing_into_an_unparseable_language_distorts_nothing(self) -> None:
+        # A chain starts at the target and comes back to it, so dubbing into
+        # Malay means reading Malay on the first hop. Leaving the translation
+        # undistorted is the honest outcome; mangled text is not.
+        config = _config(9, "en,de")
+        config.target_lang = "ms"
+        self.assertEqual(_translation_distortion_chains(config), [])
+
+    def test_the_live_configuration_loses_no_variant_to_the_filter(self) -> None:
+        with patch.object(pipeline, "UNPARSEABLE_PIVOT_LANGS", frozenset()):
+            unfiltered = _translation_distortion_chains(_config(3))
+        self.assertEqual(_translation_distortion_chains(_config(3)), unfiltered)
+
