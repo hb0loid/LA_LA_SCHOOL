@@ -1105,7 +1105,7 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
                 config,
                 source_duration=source_duration,
             )
-        segments = _fill_sparse_dub_segments(segments, config, source_audio, source_duration)
+        segments = _fill_sparse_dub_segments_safely(segments, config, source_audio, source_duration)
         if config.tts.lower() not in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
             segments = _fit_segment_text_budgets(segments, config)
         segments, repeat_clamp_changed = clamp_obvious_word_repeats_in_segments(
@@ -1439,6 +1439,23 @@ def _retry_sparse_source_asr(
     if detected_lang:
         config.source_lang = detected_lang
     return merged_segments
+
+
+def _fill_sparse_dub_segments_safely(
+    segments: list[Segment],
+    config: DubConfig,
+    source_audio: Path,
+    source_duration: float,
+) -> list[Segment]:
+    """Sparse fill only tops up gaps the main ASR left thin, so its failure
+    must not cost a finished dub. Whisper misdetecting the fallback language -
+    nn on music, say - used to take the whole job down with "Argos package is
+    missing for nn->id"."""
+    try:
+        return _fill_sparse_dub_segments(segments, config, source_audio, source_duration)
+    except Exception as exc:
+        print(f"      Sparse fill skipped after failure: {type(exc).__name__}: {exc}", flush=True)
+        return segments
 
 
 def _fill_sparse_dub_segments(
