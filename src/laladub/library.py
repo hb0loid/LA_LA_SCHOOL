@@ -129,12 +129,25 @@ async def show_command(update: Any, context: Any) -> None:
         return
 
     # Who asks for what, so a work that keeps reappearing in a chat can be
-    # traced back to whoever is asking for it.
+    # traced back to whoever is asking for it. The message's own date and id
+    # tell a live command apart from an old one being redelivered, and the
+    # forward/edit fields say whether it arrived as something other than a
+    # freshly typed message.
     chat = update.effective_chat
+    message = update.effective_message
+    sent_at = getattr(message, "date", None)
     print(
         f"/show {job_number} by user={user_id} "
         f"({getattr(user, 'username', None) or getattr(user, 'first_name', '')}) "
-        f"in chat={getattr(chat, 'id', None)} ({getattr(chat, 'title', None) or 'личка'})",
+        f"in chat={getattr(chat, 'id', None)} ({getattr(chat, 'title', None) or 'личка'}) "
+        f"update_id={getattr(update, 'update_id', None)} "
+        f"message_id={getattr(message, 'message_id', None)} "
+        f"sent={sent_at.isoformat() if sent_at is not None else None} "
+        f"edited={getattr(message, 'edit_date', None) is not None} "
+        f"auto_forward={bool(getattr(message, 'is_automatic_forward', False))} "
+        f"forward_origin={type(getattr(message, 'forward_origin', None)).__name__} "
+        f"via_bot={getattr(getattr(message, 'via_bot', None), 'username', None)} "
+        f"text={(getattr(message, 'text', None) or '')[:60]!r}",
         flush=True,
     )
 
