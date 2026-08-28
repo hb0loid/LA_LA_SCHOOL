@@ -76,12 +76,18 @@ async def karma_command(update: Any, context: Any) -> None:
         await message.reply_text("Пока никто не заработал карму.")
         return
 
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    lines = ["🏆 Таблица лидеров по карме", ""]
+    # Grouped by the levels the karma system already defines, rather than by
+    # medals: the level is the thing people are actually climbing towards, and
+    # a podium says nothing about where someone stands in it.
+    lines = ["🏆 Таблица лидеров по карме"]
+    current_level: str | None = None
     for place, (row_user_id, total_milli, name) in enumerate(rows, start=1):
-        marker = medals.get(place, f"{place}.")
+        level = level_for_karma(total_milli)
+        if level.name != current_level:
+            current_level = level.name
+            lines.extend(["", f"— {level.name} —"])
         mine = " ← ты" if row_user_id == user_id else ""
-        lines.append(f"{marker} {_shorten_name(name)} — {visible_karma(total_milli)}{mine}")
+        lines.append(f"{place}. {_shorten_name(name)} — {visible_karma(total_milli)}{mine}")
 
     if all(row_user_id != user_id for row_user_id, _total, _name in rows):
         # Being outside the top is the interesting case, so it gets its own line

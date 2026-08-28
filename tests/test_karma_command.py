@@ -80,6 +80,21 @@ class KarmaCommandTests(unittest.IsolatedAsyncioTestCase):
         said = await self._say(1, ["all"])
         self.assertLess(said.index("Первый"), said.index("Второй"))
 
+    async def test_the_list_is_grouped_by_level_not_by_medals(self) -> None:
+        self._award(1, "Верхний", 400_000)
+        self._award(2, "Нижний", 1_000)
+        said = await self._say(1, ["all"])
+        self.assertIn("Любимчик редакции", said)
+        self.assertIn("Участник", said)
+        for medal in ("🥇", "🥈", "🥉"):
+            self.assertNotIn(medal, said)
+
+    async def test_people_on_one_level_share_a_single_heading(self) -> None:
+        for n in range(1, 5):
+            self._award(n, f"Юзер{n}", 10_000 + n)
+        said = await self._say(1, ["all"])
+        self.assertEqual(said.count("— Автор —"), 1)
+
     async def test_the_caller_is_marked_in_the_list(self) -> None:
         self._award(1, "Первый", 9000)
         self._award(2, "Второй", 3000)
