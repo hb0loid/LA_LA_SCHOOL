@@ -1337,7 +1337,7 @@ class ProcessScheduledPostTests(unittest.IsolatedAsyncioTestCase):
             bot=SimpleNamespace(send_message=AsyncMock()),
         )
 
-    async def test_due_post_is_published_and_moderator_is_notified(self) -> None:
+    async def test_due_post_is_published_without_pestering_the_moderator(self) -> None:
         submission, _created = self.store.create_submission(
             job_number="1", user_id=123, chat_id=123, author_name="Тест", author_username=None,
             video_path=Path(self._tempdir.name) / "dubbed.mp4", output_filename="dubbed.mp4",
@@ -1355,8 +1355,10 @@ class ProcessScheduledPostTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated.destination, "main")
         self.assertEqual(updated.publication_message_id, 7)
         self.assertEqual(self.store.due_scheduled_posts(now=2_000_000.0), [])
-        context.bot.send_message.assert_awaited_once()
-        self.assertEqual(context.bot.send_message.call_args.kwargs["chat_id"], 631551040)
+        # The post going out is visible in the channel; a "published, karma +N"
+        # message to the moderator was only something to scroll past and clean
+        # up later. It now goes to the log instead.
+        context.bot.send_message.assert_not_awaited()
 
     async def test_publish_failure_keeps_the_post_pending_for_a_retry(self) -> None:
         submission, _created = self.store.create_submission(

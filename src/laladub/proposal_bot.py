@@ -411,12 +411,7 @@ async def _process_scheduled_post(context: Any, item: ScheduledPost) -> bool:
 
     await asyncio.to_thread(store.mark_scheduled_sent, item.id)
     effects_text = await _after_decision_effects(context, updated, karma_before, item.moderator_id, delta)
-    with contextlib.suppress(Exception):
-        sent = await context.bot.send_message(
-            chat_id=item.moderator_id,
-            text=f"Отложенный пост опубликован: работа №{updated.job_number}. {effects_text}",
-        )
-        await _note(store, item.moderator_id, sent)
+    print(f"Scheduled post published: job {updated.job_number}, {effects_text}", flush=True)
     return True
 
 
@@ -589,9 +584,11 @@ async def moderation_callback(update: Any, context: Any) -> None:
         await _note(store, int(moderator_id), sent)
         return
 
+    # The decision is already visible on the card itself, so the extra
+    # "applied, karma +N" message was just another thing to scroll past and
+    # later clean up. Everything it used to say now goes to the log.
     effects_text = await _after_decision_effects(context, updated, karma_before, int(moderator_id), delta)
-    sent = await query.message.reply_text(f"Решение применено. {effects_text}")
-    await _note(store, int(moderator_id), sent)
+    print(f"Decision applied: job {updated.job_number}, {effects_text}", flush=True)
 
 
 async def _finish_and_publish(

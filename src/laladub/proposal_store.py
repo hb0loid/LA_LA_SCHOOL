@@ -651,6 +651,39 @@ class ProposalStore:
             return 0, 0
         return int(row["total"] or 0), int(row["event_count"] or 0)
 
+    def karma_leaderboard(self, limit: int = 20) -> list[tuple[int, int, str]]:
+        """Top karma holders as (user_id, total_milli, display name).
+
+        The name comes from that user's most recent submission - karma_events
+        stores no names of its own - and falls back to the bare id for someone
+        who earned karma without a submission on record.
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    e.user_id AS user_id,
+                    COALESCE(SUM(e.delta), 0) AS total,
+                    (
+                        SELECT COALESCE(NULLIF(s.author_name, ''), NULLIF(s.author_username, ''))
+                        FROM submissions s
+                        WHERE s.user_id = e.user_id
+                        ORDER BY s.created_at DESC
+                        LIMIT 1
+                    ) AS name
+                FROM karma_events e
+                GROUP BY e.user_id
+                HAVING total > 0
+                ORDER BY total DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [
+            (int(row["user_id"]), int(row["total"] or 0), str(row["name"] or row["user_id"]))
+            for row in rows
+        ]
+
     def karma_users(self) -> list[int]:
         with self._connect() as connection:
             rows = connection.execute(

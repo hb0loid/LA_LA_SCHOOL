@@ -251,6 +251,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(maintenance_callback_gate), group=-1)
     application.add_handler(CommandHandler("start", start, filters=private_chat))
     application.add_handler(CommandHandler("me", me, filters=private_chat))
+    application.add_handler(CommandHandler("karma", karma_command, filters=private_chat))
     application.add_handler(CommandHandler("queue", queue_status, filters=private_chat))
     application.add_handler(CommandHandler("resume", resume, filters=private_chat))
     application.add_handler(CommandHandler("send", send_to_proposal, filters=private_chat))
@@ -512,6 +513,7 @@ async def _setup_bot_commands(application: Any) -> None:
         ("resume", "Продолжить задачу по номеру"),
         ("send", "Отправить старую работу в предложку"),
         ("me", "Показать профиль и карму"),
+        ("karma", "Своя карма, /karma all — таблица лидеров"),
         ("cancel", "Сбросить текущую задачу"),
         ("preset", "Настроить пресет выбора"),
         ("show", "Показать готовую работу из библиотеки"),
@@ -1223,6 +1225,65 @@ def _effective_level(
         if subscription is not None:
             return PREMIUM_LEVEL, subscription
     return level_for_karma(karma_milli), None
+
+
+KARMA_LEADERBOARD_SIZE = 20
+
+
+async def karma_command(update: Any, context: Any) -> None:
+    """/karma shows your own karma, /karma all the leaderboard."""
+    user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None:
+        return
+    store: ProposalStore | None = context.application.bot_data.get("proposal_store")
+    if store is None:
+        await message.reply_text("Карма сейчас недоступна.", reply_markup=_remove_reply_keyboard())
+        return
+
+    wants_all = bool(context.args) and str(context.args[0]).strip().casefold() in {"all", "все", "всё"}
+    if not wants_all:
+        karma_milli = await asyncio.to_thread(store.karma_total, user.id)
+        level = level_for_karma(karma_milli)
+        lines = [f"⭐ Твоя карма: {visible_karma(karma_milli)}", f"Уровень: {level.name}"]
+        next_level = next_level_for_karma(karma_milli)
+        if next_level is None:
+            lines.append("Достигнут максимальный уровень.")
+        else:
+            remaining = max(0, next_level.minimum * KARMA_SCALE - karma_milli)
+            lines.append(
+                f"До уровня «{next_level.name}»: {(remaining + KARMA_SCALE - 1) // KARMA_SCALE}"
+            )
+        lines.append("")
+        lines.append("Таблица лидеров: /karma all")
+        await message.reply_text("\n".join(lines), reply_markup=_remove_reply_keyboard())
+        return
+
+    rows = await asyncio.to_thread(store.karma_leaderboard, KARMA_LEADERBOARD_SIZE)
+    if not rows:
+        await message.reply_text("Пока никто не заработал карму.", reply_markup=_remove_reply_keyboard())
+        return
+
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = ["🏆 Таблица лидеров по карме", ""]
+    for place, (user_id, total_milli, name) in enumerate(rows, start=1):
+        marker = medals.get(place, f"{place}.")
+        mine = " ← ты" if user_id == user.id else ""
+        lines.append(f"{marker} {_shorten_karma_name(name)} — {visible_karma(total_milli)}{mine}")
+
+    if all(user_id != user.id for user_id, _total, _name in rows):
+        # Being outside the top is the interesting case, so it gets its own line
+        # rather than leaving the reader to wonder where they stand.
+        own = await asyncio.to_thread(store.karma_total, user.id)
+        lines.extend(["", f"Твоя карма: {visible_karma(own)}"])
+    await message.reply_text("\n".join(lines), reply_markup=_remove_reply_keyboard())
+
+
+def _shorten_karma_name(name: str) -> str:
+    # Display names carry emoji and decoration; the list stays readable when
+    # every row is about the same width.
+    cleaned = " ".join(str(name).split())
+    return cleaned[:24] if len(cleaned) <= 24 else cleaned[:23] + "…"
 
 
 async def me(update: Any, context: Any) -> None:
