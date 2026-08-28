@@ -13,7 +13,7 @@ from typing import Any
 from .karma import KARMA_SCALE, level_for_karma, next_level_for_karma, visible_karma
 from .proposal_store import ProposalStore
 
-KARMA_LEADERBOARD_SIZE = 20
+KARMA_LEADERBOARD_SIZE = 50
 # The leaderboard is a chunky message and the command works in groups, so one
 # person cannot make the bot post it over and over.
 KARMA_COOLDOWN_SECONDS = 15.0

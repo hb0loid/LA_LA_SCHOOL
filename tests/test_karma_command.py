@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from laladub import karma_command as karma_module
-from laladub.karma_command import karma_command
+from laladub.karma_command import KARMA_LEADERBOARD_SIZE, karma_command
 from laladub.proposal_store import ProposalStore
 
 
@@ -95,6 +95,14 @@ class KarmaCommandTests(unittest.IsolatedAsyncioTestCase):
         said = await self._say(1, ["all"])
         self.assertEqual(said.count("— Автор —"), 1)
 
+    async def test_a_full_leaderboard_fits_in_one_telegram_message(self) -> None:
+        # 50 rows with the longest name each row allows, plus a heading per
+        # level - Telegram rejects anything past 4096 characters.
+        for n in range(1, KARMA_LEADERBOARD_SIZE + 5):
+            self._award(n, "И" * 40, n * 20_000)
+        said = await self._say(1, ["all"])
+        self.assertLessEqual(len(said), 4096)
+
     async def test_the_caller_is_marked_in_the_list(self) -> None:
         self._award(1, "Первый", 9000)
         self._award(2, "Второй", 3000)
@@ -103,7 +111,9 @@ class KarmaCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("← ты", said)
 
     async def test_someone_outside_the_top_still_sees_their_own(self) -> None:
-        for n in range(3, 30):
+        # Enough people to fill the list whatever its size, then one who is
+        # comfortably below all of them.
+        for n in range(3, KARMA_LEADERBOARD_SIZE + 5):
             self._award(n, f"Юзер{n}", n * 1000)
         self._award(1, "Скромный", 10)
         said = await self._say(1, ["all"])
