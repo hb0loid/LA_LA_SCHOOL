@@ -66,6 +66,9 @@ class DubConfig:
     max_translation_hops: int = 3
     # Share of foreign-channel mentions in artifacts rebranded to ours (0..1).
     channel_rebrand_share: float = 0.5
+    # How many times one short line may repeat across a whole video before the
+    # extras are dropped. 0 disables the limit.
+    max_line_repeats: int = 5
     translation_second_pass_ratio: float = 0.0
     collapse_repetitions: bool = True
     max_phrase_repeats: int = 2

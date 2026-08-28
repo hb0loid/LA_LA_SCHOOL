@@ -413,3 +413,48 @@ def _terminal_punctuation(text: str) -> str:
     if stripped and stripped[-1] in ".!?…。！？":
         return stripped[-1]
     return ""
+
+
+def limit_phrase_repeats_across_segments(
+    segments: list[Segment],
+    *,
+    max_repeats: int = 5,
+    max_phrase_words: int = 4,
+    min_segments: int = 40,
+) -> list[Segment]:
+    """Drop a short phrase once it has already been said max_repeats times.
+
+    suppress_pathological_segment_loops only sees a phrase that dominates a
+    dense local window. A translation that has collapsed spreads the same few
+    phrases evenly across the whole video instead: in one job "Интервью" landed
+    65 times and "Свяжитесь с нами" 29 across 308 lines, none of them dense
+    enough locally to trip that pass.
+
+    Only short phrases are counted - a long line repeating verbatim is far more
+    likely to be genuine - and the first max_repeats of each are always kept,
+    so a real catchphrase survives.
+    """
+    if max_repeats <= 0 or len(segments) < min_segments:
+        return segments
+
+    seen: dict[str, int] = {}
+    kept: list[Segment] = []
+    dropped = 0
+    for segment in segments:
+        key = _normalize_for_repeat_key(segment.spoken_text)
+        if not key or len(key.split()) > max_phrase_words:
+            kept.append(segment)
+            continue
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > max_repeats:
+            dropped += 1
+            continue
+        kept.append(segment)
+
+    if dropped:
+        worst = sorted(seen.items(), key=lambda item: item[1], reverse=True)[:3]
+        # Plain ASCII only: this log goes to a cp1251 console on Windows, and a
+        # UnicodeEncodeError here would take the whole pipeline down.
+        summary = ", ".join(f"{phrase!r} x{count}" for phrase, count in worst if count > max_repeats)
+        print(f"      Dropped {dropped} over-repeated line(s): {summary}", flush=True)
+    return kept

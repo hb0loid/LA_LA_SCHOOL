@@ -37,6 +37,7 @@ from .quality import (
     collapse_repetitions,
     collapse_repetitions_in_segments,
     limit_repeated_segment_phrases,
+    limit_phrase_repeats_across_segments,
     suppress_pathological_segment_loops,
     is_repetitive_loop,
 )
@@ -1113,10 +1114,13 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
             max_word_repeats=3,
         )
         segments = suppress_pathological_segment_loops(segments)
+        segments = limit_phrase_repeats_across_segments(
+            segments, max_repeats=config.max_line_repeats
+        )
         write_srt(translated_srt_path, segments, translated=True)
         _save_resume_state(config, translated=True, segment_count=len(segments))
         translation_changed = True
-    filled_segments = _fill_sparse_dub_segments(segments, config, source_audio, source_duration)
+    filled_segments = _fill_sparse_dub_segments_safely(segments, config, source_audio, source_duration)
     if filled_segments is not segments:
         segments = filled_segments
         if config.tts.lower() not in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
@@ -1126,6 +1130,9 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
             max_word_repeats=3,
         )
         segments = suppress_pathological_segment_loops(segments)
+        segments = limit_phrase_repeats_across_segments(
+            segments, max_repeats=config.max_line_repeats
+        )
         write_srt(translated_srt_path, segments, translated=True)
         _save_resume_state(config, translated=True, segment_count=len(segments), sparse_fill=True)
         translation_changed = True

@@ -133,6 +133,7 @@ class BotSettings:
     translation_pivots: str
     max_translation_hops: int
     channel_rebrand_share: float
+    max_line_repeats: int
     translation_second_pass_ratio: float
 
     def is_paid(self, user_id: int | None) -> bool:
@@ -322,6 +323,8 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         channel_rebrand_share=min(
             1.0, max(0.0, float(os.environ.get("LALADUB_CHANNEL_REBRAND_SHARE", "0.5")))
         ),
+        # How often one short line may repeat across a video. 0 disables it.
+        max_line_repeats=max(0, int(os.environ.get("LALADUB_MAX_LINE_REPEATS", "5"))),
         translation_second_pass_ratio=max(
             0.0,
             min(1.0, float(os.environ.get("LALADUB_TRANSLATION_SECOND_PASS_RATIO", "0.0"))),
