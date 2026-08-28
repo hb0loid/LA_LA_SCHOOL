@@ -479,7 +479,7 @@ def apply_translation_chaos(config: DubConfig, job: dict[str, Any], settings: Bo
         config.translation_pivots = (
             f"{settings.translation_pivots}|"
             "input,ja,ko,en|input,tr,ar,he,en|input,zh,ja,en|"
-            "en,de,fr,es,en|en,ja,ko,tr,en|en,th,he,ar,en|"
+            "en,de,fr,es,en|en,ja,ko,tr,en|en,th,he,ar,en|en,ms,he,ar,en|"
             "input,en,ja,ko,tr,ar,en"
         )
         config.translation_second_pass_ratio = max(settings.translation_second_pass_ratio, 0.70)

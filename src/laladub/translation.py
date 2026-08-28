@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import time
@@ -10,6 +11,16 @@ import urllib.request
 from pathlib import Path
 
 from .models import DubConfig, Segment
+
+# Argos splits text into sentences before translating, and its default splitter
+# wants a Stanza model per language. There is none for Malay or Azerbaijani, so
+# reading either raised "No processors to load for language ms" and killed the
+# job whenever the online translator was rate-limited - the single most common
+# failure people reported. MiniSBD needs no per-language model and, checked
+# side by side on Vietnamese, English and Japanese, returns exactly the same
+# translations. Set before argostranslate is imported anywhere: it reads this
+# once, at import.
+os.environ.setdefault("ARGOS_CHUNK_TYPE", "MINISBD")
 
 
 class TranslationError(RuntimeError):

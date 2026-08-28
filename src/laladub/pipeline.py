@@ -2759,7 +2759,11 @@ def _apply_deep_phonetic_chaos(segments: list[Segment], config: DubConfig) -> li
 # through one works right up until the online side hits its rate limit; then
 # the local fallback cannot run either and the whole chain collapses into
 # mechanical text mangling. That was 99% of every collapsed chain in the logs.
-UNPARSEABLE_PIVOT_LANGS = frozenset({"ms", "az"})
+# Empty now that MiniSBD chunking (see translation.py) reads every language
+# the packages cover. Kept as the place to list a language whose local
+# translation is broken, so a chain through one is dropped with a reason in
+# the log rather than silently degrading into mangled output.
+UNPARSEABLE_PIVOT_LANGS: frozenset[str] = frozenset()
 
 
 def _translation_distortion_chains(config: DubConfig) -> list[list[str]]:
