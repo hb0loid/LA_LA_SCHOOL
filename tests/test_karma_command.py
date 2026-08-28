@@ -6,7 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from laladub.bot import karma_command
+from laladub import karma_command as karma_module
+from laladub.karma_command import karma_command
 from laladub.proposal_store import ProposalStore
 
 
@@ -28,6 +29,8 @@ class KarmaCommandTests(unittest.IsolatedAsyncioTestCase):
         self._tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self._tempdir.cleanup)
         self.store = ProposalStore(Path(self._tempdir.name) / "proposals.sqlite3")
+        # The cooldown is process-wide; each test starts from a clean slate.
+        karma_module._last_karma_call.clear()
 
     def _context(self, args: list[str] | None = None) -> SimpleNamespace:
         return SimpleNamespace(
@@ -103,6 +106,24 @@ class KarmaCommandTests(unittest.IsolatedAsyncioTestCase):
         context = SimpleNamespace(application=SimpleNamespace(bot_data={}), args=[])
         await karma_command(update, context)
         self.assertIn("недоступна", update.effective_message.reply_text.call_args.args[0])
+
+
+    async def test_the_proposal_bots_store_key_is_understood_too(self) -> None:
+        # The two bots file the same store under different bot_data keys.
+        self._award(1, "Тест", 5000)
+        update = _update(1)
+        context = SimpleNamespace(
+            application=SimpleNamespace(bot_data={"store": self.store}), args=[]
+        )
+        await karma_command(update, context)
+        self.assertIn("Твоя карма", update.effective_message.reply_text.call_args.args[0])
+
+    async def test_a_second_call_straight_away_is_refused(self) -> None:
+        # The command works in groups now, so one person must not be able to
+        # make the bot post the leaderboard over and over.
+        self._award(1, "Тест", 5000)
+        await self._say(1)
+        self.assertIn("Слишком часто", await self._say(1))
 
 
 if __name__ == "__main__":

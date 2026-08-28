@@ -15,6 +15,7 @@ from datetime import datetime
 
 from .ffmpeg import probe_duration
 from .karma import format_karma_milli, karma_milli_for_duration, level_for_karma, visible_karma
+from .karma_command import karma_command
 from .library import LibraryStore, show_command
 from .update_dedupe import UpdateDeduplicator, build_replay_guard
 from .proposal_store import ProposalStore, ScheduledPost, Submission
@@ -109,6 +110,7 @@ def main() -> None:
     application.add_handler(CommandHandler("post", post_command, filters=private_chat))
     application.add_handler(CommandHandler("unpost", unpost_command, filters=private_chat))
     application.add_handler(CommandHandler("show", show_command))
+    application.add_handler(CommandHandler("karma", karma_command))
     application.add_handler(CommandHandler("clean", clean_command, filters=private_chat))
     application.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^mod:"))
     application.add_handler(ChatMemberHandler(karma_member_changed, ChatMemberHandler.CHAT_MEMBER))
@@ -130,6 +132,7 @@ async def _post_init(application: Any) -> None:
         ("post", "Отправить отложенный пост сейчас"),
         ("unpost", "Снять пост с отложенной публикации"),
         ("show", "Показать готовую работу из библиотеки"),
+        ("karma", "Своя карма, /karma all — таблица лидеров"),
         ("clean", "Очистить чат от лишних сообщений"),
     ]
     await application.bot.set_my_commands(commands)
