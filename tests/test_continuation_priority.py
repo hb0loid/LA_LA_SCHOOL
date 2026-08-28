@@ -3,7 +3,12 @@ from __future__ import annotations
 import heapq
 import unittest
 
-from laladub.bot import CONTINUATION_PRIORITY_BOOST, _QueuedJob
+from laladub.bot import (
+    CONTINUATION_PRIORITY_BOOST,
+    PREMIUM_PRIORITY,
+    _continuation_priority,
+    _QueuedJob,
+)
 
 
 def _item(key: str, priority: int, sequence: int) -> _QueuedJob:
@@ -24,7 +29,7 @@ def _item(key: str, priority: int, sequence: int) -> _QueuedJob:
 def _boost(item: _QueuedJob) -> None:
     """The requeue path applied to a job coming back from the worker."""
     if not item.job.get("continuation_boosted"):
-        item.priority -= CONTINUATION_PRIORITY_BOOST
+        item.priority = _continuation_priority(item.priority, item.premium)
         item.job["continuation_boosted"] = True
 
 
@@ -80,6 +85,26 @@ class ContinuationPriorityTests(unittest.TestCase):
         _boost(returning)
         _boost(returning)
         self.assertEqual(returning.priority, after_first)
+
+
+    def test_no_ordinary_priority_can_ever_reach_premium(self) -> None:
+        # Paying users always go first. This must hold structurally, not
+        # because the boost happens to be smaller than the tier gap - a bigger
+        # karma bonus or a bigger boost must not change it.
+        for priority in range(1, 400):
+            with self.subTest(priority=priority):
+                self.assertGreater(_continuation_priority(priority, premium=False), PREMIUM_PRIORITY)
+
+    def test_a_premium_continuation_is_not_floored(self) -> None:
+        self.assertEqual(
+            _continuation_priority(PREMIUM_PRIORITY, premium=True),
+            PREMIUM_PRIORITY - CONTINUATION_PRIORITY_BOOST,
+        )
+
+    def test_an_ordinary_continuation_still_beats_an_ordinary_arrival(self) -> None:
+        # The floor must not flatten the tier: continuations still go first
+        # among ordinary jobs.
+        self.assertLess(_continuation_priority(100, premium=False), 100)
 
 
 if __name__ == "__main__":

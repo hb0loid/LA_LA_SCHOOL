@@ -1074,6 +1074,7 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
             )
             translation_changed = True
     else:
+        segments = _prefill_sparse_source_segments(segments, config, source_audio, source_duration)
         segments = _translate_dub_segments(segments, config)
         write_srt(_debug_path(config, "translated_clean.srt"), segments, translated=True)
         segments = _maybe_distort_translations(
@@ -1446,6 +1447,50 @@ def _retry_sparse_source_asr(
     if detected_lang:
         config.source_lang = detected_lang
     return merged_segments
+
+
+def _prefill_sparse_source_segments(
+    segments: list[Segment],
+    config: DubConfig,
+    source_audio: Path,
+    source_duration: float,
+) -> list[Segment]:
+    """Top up a thin transcript *before* it is translated.
+
+    The sparse check needs only timings and text length, both of which the
+    untranslated segments already have. Running it afterwards meant the thin
+    set was translated and distorted first, then the fill ran and translated
+    its own set too: job 49447 paid for 30 lines and then 137 more, every one
+    of them through the distortion chains. Filling first means one pass.
+
+    Best-effort by design - the fallback ASR is an extra, so a failure here
+    leaves the original segments alone and the post-translation fill still
+    gets its turn.
+    """
+    if not _should_sparse_fill(config) or not _dub_is_too_sparse(segments, source_duration):
+        return segments
+    try:
+        fallback_source, detected_lang = _stable_fallback_source_asr(
+            source_audio, config, source_duration
+        )
+    except Exception as exc:
+        print(f"      Pre-translation fill skipped: {type(exc).__name__}: {exc}", flush=True)
+        return segments
+    if _asr_is_too_sparse(fallback_source, source_duration):
+        return segments
+
+    merged = _merge_sparse_fill_segments(segments, fallback_source)
+    if merged is segments:
+        return segments
+    if detected_lang and not config.source_lang:
+        config.source_lang = detected_lang
+    print(
+        f"      Pre-translation fill added {len(merged) - len(segments)} line(s); "
+        "translating once instead of twice",
+        flush=True,
+    )
+    _report_progress(config, "Добираю пустые места", 50, 100, f"реплик: {len(merged)}")
+    return merged
 
 
 def _fill_sparse_dub_segments_safely(

@@ -2859,10 +2859,22 @@ def _coerce_int(value: object) -> int | None:
         return None
 
 
-# How far ahead a job returning from the worker jumps. Large enough to clear
-# every arrival in its own tier, small enough that a premium arrival (0) still
-# goes before an ordinary continuation (50).
+# Priority is "lower goes first". Premium sits at 0, ordinary at 100 minus a
+# karma bonus, so the tiers are separated by a wide gap.
+PREMIUM_PRIORITY = 0
+# How far ahead a job returning from the worker jumps within its own tier.
 CONTINUATION_PRIORITY_BOOST = 50
+
+
+def _continuation_priority(priority: int, premium: bool) -> int:
+    """Priority for a job coming back from the worker: ahead of its own tier,
+    but never out of it. Paying users always go first, so an ordinary job -
+    however far along - is floored just below premium rather than allowed to
+    overtake it, whatever the boost and karma bonuses add up to."""
+    boosted = priority - CONTINUATION_PRIORITY_BOOST
+    if premium:
+        return boosted
+    return max(PREMIUM_PRIORITY + 1, boosted)
 
 
 class _QueuedJob:
@@ -3257,7 +3269,7 @@ class _JobScheduler:
             # 162 hours of a job sitting ready while the single local slot
             # worked through arrivals that were nowhere near done.
             if not item.job.get("continuation_boosted"):
-                item.priority -= CONTINUATION_PRIORITY_BOOST
+                item.priority = _continuation_priority(item.priority, item.premium)
                 item.job["continuation_boosted"] = True
             heapq.heappush(self._pending, (item.priority, item.sequence, item))
             detail = "ноут недоступен, продолжаю локально" if fallback else "подготовка с ноутбука получена"
