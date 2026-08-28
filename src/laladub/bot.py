@@ -2635,6 +2635,23 @@ async def _reserve_daily_allowance(
     return False
 
 
+async def _refund_failed_job(context: Any, item: "_QueuedJob") -> None:
+    """Give the minutes back when a job did not deliver anything.
+
+    The daily allowance pays for a finished dub, so a failure must not spend
+    it. Refunding was already attempted on the failure paths, but only after
+    the "Task failed" message had been sent - if that send raised (the user
+    blocked the bot, a network blip) the refund never ran, and 16 failed jobs
+    were still holding minutes. Called from finally now, so nothing earlier
+    can skip it, and release is a plain DELETE so calling it twice is safe.
+
+    Interrupted jobs are deliberately left alone: they stay resumable, and
+    reserve_daily_usage recognises the existing row rather than charging again.
+    """
+    with contextlib.suppress(Exception):
+        await _release_daily_allowance(context, item.user_id, item.job)
+
+
 async def _release_daily_allowance(context: Any, user_id: int | None, job: dict[str, Any]) -> None:
     if user_id is None:
         return
@@ -3298,8 +3315,8 @@ class _JobScheduler:
                 text=f"Task failed:\n{details}",
                 reply_markup=_resume_keyboard(job_dir),
             )
-            await _release_daily_allowance(context, item.user_id, item.job)
         finally:
+            await _refund_failed_job(context, item)
             async with self._lock:
                 self._leased.pop(item.job_id, None)
             await self.finish(context, item)
@@ -3372,6 +3389,7 @@ class _JobScheduler:
 
     async def _run_item(self, context: Any, item: _QueuedJob) -> None:
         interrupted = False
+        job_failed = False
         try:
             if item.progress is None:
                 title = "Сырой Whisper" if item.job.get("mode") == "raw_text" else "Полноценный дубляж"
@@ -3402,12 +3420,13 @@ class _JobScheduler:
                 )
                 item.job.update(snapshot)
                 _save_job_snapshot(Path(str(item.job["job_dir"])), snapshot, status="done")
-            if snapshot is not None and str(snapshot.get("status") or "") == "failed":
-                await _release_daily_allowance(context, item.user_id, item.job)
+            job_failed = snapshot is not None and str(snapshot.get("status") or "") == "failed"
         except asyncio.CancelledError:
             interrupted = True
             raise
         finally:
+            if job_failed:
+                await _refund_failed_job(context, item)
             if interrupted:
                 # This task is already unwinding a cancellation, so awaiting the
                 # cleanup here would be cut short - hand it to a fresh task.
