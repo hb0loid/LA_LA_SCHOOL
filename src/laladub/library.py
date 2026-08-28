@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+from .update_dedupe import RecentActions
+
 # Shared between the main dub bot and the proposal bot - both point at the
 # same files by default so /show works no matter which one receives it.
 
@@ -17,6 +19,23 @@ from typing import Any, Iterator
 # for no real benefit - this already stops the repeated-tap pattern it's for.
 _SHOW_COOLDOWN_SECONDS = 30.0
 _last_show_call: dict[int, float] = {}
+# The same work re-sent into the same chat is the expensive repeat: a restart
+# used to replay one /show and post the video again, once per restart. This
+# holds it back by what actually happened rather than by which update carried
+# it, so it survives a restart and costs nothing when the command is genuine.
+_SAME_WORK_WINDOW_SECONDS = 600.0
+_recent_sends: "RecentActions | None" = None
+
+
+def _recent_sends_for(context: Any) -> "RecentActions":
+    global _recent_sends
+    if _recent_sends is None:
+        library_store = context.application.bot_data.get("library_store")
+        base = Path(getattr(library_store, "path", "runs/library/library.sqlite3")).parent
+        _recent_sends = RecentActions(
+            base / "recent_shows.json", window_seconds=_SAME_WORK_WINDOW_SECONDS
+        )
+    return _recent_sends
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +179,17 @@ async def show_command(update: Any, context: Any) -> None:
     if not video_path.is_file():
         await update.effective_message.reply_text(f"Файл работы №{job_number} утерян.")
         return
+
+    chat_id = getattr(update.effective_chat, "id", None)
+    recent = _recent_sends_for(context)
+    send_key = f"{chat_id}:{entry.job_number}"
+    since = recent.seconds_since(send_key)
+    if since is not None:
+        await update.effective_message.reply_text(
+            f"Работа №{job_number} уже была здесь {round(since / 60)} мин назад."
+        )
+        return
+    recent.record(send_key)
 
     from .bot import _telegram_sendable_video_path, video_upload_metadata
 

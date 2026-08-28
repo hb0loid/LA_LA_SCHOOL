@@ -1789,7 +1789,23 @@ def _translate_dub_segments(segments: list[Segment], config: DubConfig) -> list[
         pivot_config.source_lang = source_lang
         pivot_config.target_lang = pivot_lang
         pivot_config.input_pivot_lang = None
-        translate_segments(pivot_segments, pivot_config)
+        try:
+            translate_segments(pivot_segments, pivot_config)
+        except Exception as exc:
+            # The pivot hop is extra flavour, not the translation itself. It is
+            # also the most fragile part: the source language is often a
+            # misdetection (is, nn) with no local route, so the hop dies the
+            # moment the online translator is rate-limited. Going direct still
+            # produces a real dub instead of losing the job.
+            print(
+                f"      Input-pivot hop {source_lang}->{pivot_lang} failed, going direct: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            direct_config = copy(config)
+            direct_config.source_lang = source_lang
+            direct_config.input_pivot_lang = None
+            return _translate_dub_segments(segments, direct_config)
 
     input_path = config.workdir / f"input_{_safe_label(pivot_lang)}.srt"
     write_srt(input_path, pivot_segments, translated=True)

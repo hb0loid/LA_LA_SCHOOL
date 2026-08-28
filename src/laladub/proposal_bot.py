@@ -17,7 +17,11 @@ from .ffmpeg import probe_duration
 from .karma import format_karma_milli, karma_milli_for_duration, level_for_karma, visible_karma
 from .karma_command import karma_command
 from .library import LibraryStore, show_command
-from .update_dedupe import UpdateDeduplicator, build_replay_guard
+from .update_dedupe import (
+    UpdateDeduplicator,
+    build_completion_marker,
+    build_replay_guard,
+)
 from .proposal_store import ProposalStore, ScheduledPost, Submission
 
 # How far apart consecutive posts to the same channel are spaced when /timer
@@ -93,13 +97,9 @@ def main() -> None:
     application.add_error_handler(_error_handler)
     # Before every other handler: an update Telegram redelivered after a hard
     # restart must not publish or post a second time.
+    update_dedupe = UpdateDeduplicator(settings.database.parent / "last_update.json")
     application.add_handler(
-        TypeHandler(
-            Update,
-            build_replay_guard(
-                UpdateDeduplicator(settings.database.parent / "last_update.json")
-            ),
-        ),
+        TypeHandler(Update, build_replay_guard(update_dedupe)),
         group=-100,
     )
     application.add_handler(CommandHandler("start", start, filters=private_chat))
@@ -116,6 +116,12 @@ def main() -> None:
     application.add_handler(ChatMemberHandler(karma_member_changed, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(MessageHandler(private_chat & filters.TEXT & ~filters.COMMAND, relay_message))
     application.add_handler(MessageHandler(~private_chat & filters.VIDEO, comment_on_channel_forward))
+    # Last group of all: reached only once every other handler has finished,
+    # which is what lets the update count as handled and its replay be refused.
+    application.add_handler(
+        TypeHandler(Update, build_completion_marker(update_dedupe)),
+        group=1000,
+    )
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 

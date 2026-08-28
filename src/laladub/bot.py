@@ -37,7 +37,11 @@ from .pipeline import run_dub, run_transcript
 from .premium_store import PremiumStore, Subscription, UserSettings
 from .preset_store import PRESET_FIELDS, PresetStore, UserPreset
 from .text_review import TextReviewStore
-from .update_dedupe import UpdateDeduplicator, build_replay_guard
+from .update_dedupe import (
+    UpdateDeduplicator,
+    build_completion_marker,
+    build_replay_guard,
+)
 from .proposal_store import ProposalStore
 from .tts import clear_tts_model_caches
 from .watermark import add_watermark
@@ -241,11 +245,9 @@ def main() -> None:
     application.add_error_handler(_telegram_error_handler)
     # Before every other handler: an update Telegram redelivered after a hard
     # restart must not run its side effects a second time.
+    update_dedupe = UpdateDeduplicator(settings.workdir / "last_update.json")
     application.add_handler(
-        TypeHandler(
-            Update,
-            build_replay_guard(UpdateDeduplicator(settings.workdir / "last_update.json")),
-        ),
+        TypeHandler(Update, build_replay_guard(update_dedupe)),
         group=-100,
     )
     application.add_handler(MessageHandler(private_chat, maintenance_message_gate), group=-1)
@@ -291,6 +293,12 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(preset_wizard_callback, pattern=r"^pset:"))
     application.add_handler(CallbackQueryHandler(resume_callback, pattern=r"^resume:"))
     application.add_handler(CallbackQueryHandler(proposal_callback, pattern=r"^proposal:"))
+    # Last group of all: reached only once every other handler has finished,
+    # which is what lets the update count as handled and its replay be refused.
+    application.add_handler(
+        TypeHandler(Update, build_completion_marker(update_dedupe)),
+        group=1000,
+    )
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
 
 
