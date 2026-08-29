@@ -107,6 +107,50 @@ class ReplayGuardTests(unittest.IsolatedAsyncioTestCase):
         await self.guard(SimpleNamespace(update_id=6), None)
 
 
+class EditedMessageTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.dedupe = UpdateDeduplicator(Path(self._tempdir.name) / "last_update.json")
+        self.guard = build_replay_guard(self.dedupe)
+
+    async def test_an_edit_is_refused(self) -> None:
+        # Regression: someone kept editing one nine-day-old "/show 42456"
+        # message. Telegram re-delivers an edit as a fresh update, so the
+        # command ran again every time - 25 copies of the video in a group
+        # from a command that was only ever typed once.
+        edit = SimpleNamespace(
+            update_id=7,
+            edited_message=SimpleNamespace(message_id=32507, chat=SimpleNamespace(id=-100)),
+        )
+        with self.assertRaises(ApplicationHandlerStop):
+            await self.guard(edit, None)
+
+    async def test_an_edited_channel_post_is_refused_too(self) -> None:
+        edit = SimpleNamespace(
+            update_id=7,
+            edited_message=None,
+            edited_channel_post=SimpleNamespace(message_id=1, chat=SimpleNamespace(id=-100)),
+        )
+        with self.assertRaises(ApplicationHandlerStop):
+            await self.guard(edit, None)
+
+    async def test_an_ordinary_message_still_passes(self) -> None:
+        fresh = SimpleNamespace(update_id=7, edited_message=None, edited_channel_post=None)
+        await self.guard(fresh, None)
+
+    async def test_a_refused_edit_does_not_burn_the_update_id(self) -> None:
+        # The edit never counted as handled, so a genuine later update with a
+        # higher id must still be accepted normally.
+        edit = SimpleNamespace(
+            update_id=7,
+            edited_message=SimpleNamespace(message_id=1, chat=SimpleNamespace(id=-100)),
+        )
+        with self.assertRaises(ApplicationHandlerStop):
+            await self.guard(edit, None)
+        await self.guard(SimpleNamespace(update_id=8, edited_message=None), None)
+
+
 class RecentActionsTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tempdir = tempfile.TemporaryDirectory()

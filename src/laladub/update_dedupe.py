@@ -60,10 +60,25 @@ class UpdateDeduplicator:
 
 
 def build_replay_guard(deduplicator: UpdateDeduplicator) -> Any:
-    """A handler for group=-100 that stops updates already handled to the end."""
+    """A handler for group=-100 that stops updates already handled to the end,
+    and edits of old messages, which are not new instructions."""
 
     async def guard(update: Any, context: Any) -> None:
         from telegram.ext import ApplicationHandlerStop
+
+        # Editing a message re-delivers it as a fresh update, and a command
+        # handler cannot tell the difference. Someone kept editing one nine-day
+        # old "/show 42456" message, and the bot posted that video every time -
+        # 25 copies in a group from a single command that was only ever typed
+        # once. Nothing here wants edits, so none of them get through.
+        edited = getattr(update, "edited_message", None) or getattr(update, "edited_channel_post", None)
+        if edited is not None:
+            print(
+                f"Ignoring edit of message {getattr(edited, 'message_id', None)} "
+                f"in chat {getattr(getattr(edited, 'chat', None), 'id', None)}",
+                flush=True,
+            )
+            raise ApplicationHandlerStop
 
         update_id = getattr(update, "update_id", None)
         if deduplicator.is_new(update_id):
