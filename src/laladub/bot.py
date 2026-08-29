@@ -4821,7 +4821,10 @@ async def _telegram_sendable_video_path(
     output_path = _telegram_video_output_path(video_path, suffix)
     source_mtime = video_path.stat().st_mtime
     if output_path.exists() and output_path.stat().st_size > 1024 and output_path.stat().st_mtime >= source_mtime:
-        if force or output_path.stat().st_size <= TELEGRAM_SAFE_VIDEO_BYTES:
+        # A forced retry follows Telegram's HTTP 413 response. Never reuse the
+        # previous cached file in that case: it may be exactly the oversized
+        # file that Telegram has just rejected.
+        if not force and output_path.stat().st_size <= TELEGRAM_SAFE_VIDEO_BYTES:
             return output_path
 
     await asyncio.to_thread(

@@ -504,7 +504,23 @@ def compress_video_for_telegram(
 ) -> None:
     duration = max(1.0, probe_duration(input_path))
     total_kbit_budget = target_size_mb * 8192 * 0.90
-    video_bitrate_k = max(320, int(total_kbit_budget / duration - audio_bitrate_k))
+    audio_tracks = _probe_audio_stream_count(input_path)
+    total_bitrate_k = max(64, int(total_kbit_budget / duration))
+    video_bitrate_k, effective_audio_bitrate_k = _telegram_bitrate_plan(
+        total_bitrate_k,
+        audio_tracks=audio_tracks,
+        requested_audio_bitrate_k=audio_bitrate_k,
+    )
+    # Very low bitrates spread over 720p turn into blocks. Reducing the frame
+    # size gives long Telegram videos a much cleaner picture for the same file
+    # budget. Short videos keep the caller's normal width limit.
+    effective_max_width = max_width
+    if video_bitrate_k < 140:
+        effective_max_width = min(effective_max_width, 480)
+    elif video_bitrate_k < 240:
+        effective_max_width = min(effective_max_width, 640)
+    elif video_bitrate_k < 400:
+        effective_max_width = min(effective_max_width, 854)
     maxrate_k = max(video_bitrate_k, int(video_bitrate_k * 1.35))
     bufsize_k = maxrate_k * 2
     ffmpeg = require_tool("ffmpeg")
@@ -523,7 +539,7 @@ def compress_video_for_telegram(
             "-map",
             "0:a?",
             "-vf",
-            f"scale=w='if(gt(iw,{max_width}),{max_width},iw)':h=-2",
+            f"scale=w='if(gt(iw,{effective_max_width}),{effective_max_width},iw)':h=-2",
             "-c:v",
             "libx264",
             "-preset",
@@ -539,7 +555,7 @@ def compress_video_for_telegram(
             "-c:a",
             "aac",
             "-b:a",
-            f"{audio_bitrate_k}k",
+            f"{effective_audio_bitrate_k}k",
             "-ac",
             "2",
             "-movflags",
@@ -547,6 +563,53 @@ def compress_video_for_telegram(
             str(output_path),
         ]
     )
+
+
+def _probe_audio_stream_count(path: Path) -> int:
+    ffprobe = require_tool("ffprobe")
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        streams = json.loads(result.stdout).get("streams") or []
+        return max(1, len(streams))
+    except Exception:
+        return 1
+
+
+def _telegram_bitrate_plan(
+    total_bitrate_k: int,
+    *,
+    audio_tracks: int,
+    requested_audio_bitrate_k: int,
+) -> tuple[int, int]:
+    """Fit every mapped audio track and the video inside one total budget."""
+    total_bitrate_k = max(64, int(total_bitrate_k))
+    audio_tracks = max(1, int(audio_tracks))
+    requested_audio_bitrate_k = max(16, int(requested_audio_bitrate_k))
+    min_video_bitrate_k = 40
+    audio_bitrate_k = min(
+        requested_audio_bitrate_k,
+        max(24, int(total_bitrate_k * 0.40 / audio_tracks)),
+    )
+    if audio_bitrate_k * audio_tracks + min_video_bitrate_k > total_bitrate_k:
+        audio_bitrate_k = max(16, (total_bitrate_k - min_video_bitrate_k) // audio_tracks)
+    video_bitrate_k = max(min_video_bitrate_k, total_bitrate_k - audio_bitrate_k * audio_tracks)
+    return video_bitrate_k, audio_bitrate_k
 
 
 def make_silence(wav_path: Path, duration: float, sample_rate: int = 44100) -> None:

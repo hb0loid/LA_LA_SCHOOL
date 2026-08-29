@@ -7,7 +7,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from laladub.ffmpeg import combine_video_audio_multitrack, compress_video_for_telegram, mp4_language_tag
+from laladub.ffmpeg import (
+    _telegram_bitrate_plan,
+    combine_video_audio_multitrack,
+    compress_video_for_telegram,
+    mp4_language_tag,
+)
 
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
@@ -105,6 +110,25 @@ class LanguageTagTests(unittest.TestCase):
         self.assertEqual(mp4_language_tag("xx"), "und")
         self.assertEqual(mp4_language_tag(None), "und")
         self.assertEqual(mp4_language_tag(""), "und")
+
+
+class TelegramBitratePlanTests(unittest.TestCase):
+    def test_long_video_budget_is_not_overridden_by_old_320k_floor(self) -> None:
+        video_k, audio_k = _telegram_bitrate_plan(
+            250,
+            audio_tracks=1,
+            requested_audio_bitrate_k=96,
+        )
+        self.assertLess(video_k, 320)
+        self.assertLessEqual(video_k + audio_k, 250)
+
+    def test_multiple_audio_tracks_share_the_same_total_budget(self) -> None:
+        video_k, audio_k = _telegram_bitrate_plan(
+            250,
+            audio_tracks=2,
+            requested_audio_bitrate_k=96,
+        )
+        self.assertLessEqual(video_k + audio_k * 2, 250)
 
 
 if __name__ == "__main__":
