@@ -116,20 +116,35 @@ def main() -> None:
             generation_seconds = target_seconds + completion_margin_seconds
             duration_tokens = max(5, round(generation_seconds * 12.5))
             language = str(item.get("language") or "Russian")
-            torch.manual_seed(seed + index)
+            item_seed = int(item.get("seed", seed + index))
+            torch.manual_seed(item_seed)
             if device.type == "cuda":
-                torch.cuda.manual_seed_all(seed + index)
+                torch.cuda.manual_seed_all(item_seed)
 
             print(f"MOSS_START\t{index}\t{total}", flush=True)
-            user_message = {
-                "text": generation_text,
-                "reference": [encoded_reference(reference)],
-                "language": language,
-            }
+            mode = str(item.get("mode") or "clone").strip().lower()
+            prompt_codes = encoded_reference(reference)
+            prompt_text = str(item.get("reference_text") or "").strip()
+            user_message = {"text": generation_text, "language": language}
+            if mode == "clone":
+                user_message["reference"] = [prompt_codes]
+            elif mode in {"continuation", "continuation_clone"}:
+                if not prompt_text:
+                    raise RuntimeError(f"MOSS item {index} continuation requires reference_text.")
+                user_message["text"] = prompt_text + generation_text
+                if mode == "continuation_clone":
+                    user_message["reference"] = [prompt_codes]
+            else:
+                raise RuntimeError(f"MOSS item {index} has unknown mode: {mode}")
             if duration_control:
                 user_message["tokens"] = duration_tokens
-            conversation = [[processor.build_user_message(**user_message)]]
-            batch = processor(conversation, mode="generation")
+            messages = [processor.build_user_message(**user_message)]
+            processor_mode = "generation"
+            if mode in {"continuation", "continuation_clone"}:
+                messages.append(processor.build_assistant_message(audio_codes_list=[prompt_codes]))
+                processor_mode = "continuation"
+            conversation = [messages]
+            batch = processor(conversation, mode=processor_mode)
             frame_budget = max(16, duration_tokens + 8) if duration_control else natural_max_new_tokens
             outputs = model.generate(
                 input_ids=batch["input_ids"].to(device),
@@ -140,10 +155,10 @@ def main() -> None:
                 # completion allowance without permitting that runaway tail.
                 max_new_tokens=frame_budget,
                 do_sample=True,
-                audio_temperature=1.2,
-                audio_top_p=0.85,
-                audio_top_k=25,
-                audio_repetition_penalty=1.05,
+                audio_temperature=float(item.get("audio_temperature", manifest.get("audio_temperature", 1.2))),
+                audio_top_p=float(item.get("audio_top_p", manifest.get("audio_top_p", 0.85))),
+                audio_top_k=int(item.get("audio_top_k", manifest.get("audio_top_k", 25))),
+                audio_repetition_penalty=float(item.get("audio_repetition_penalty", manifest.get("audio_repetition_penalty", 1.05))),
             )
             messages = [message for message in processor.decode(outputs) if message is not None]
             if not messages or not messages[0].audio_codes_list:
