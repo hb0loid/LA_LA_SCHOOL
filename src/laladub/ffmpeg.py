@@ -35,7 +35,7 @@ def probe_duration(path: Path) -> float:
             "-v",
             "error",
             "-show_entries",
-            "format=duration",
+            "format=duration:stream=codec_type,duration",
             "-of",
             "json",
             str(path),
@@ -45,13 +45,25 @@ def probe_duration(path: Path) -> float:
         text=True,
     )
     data = json.loads(result.stdout)
+
+    # Some Telegram MP4 files contain a valid short video stream alongside an
+    # AAC edit list whose declared duration is many hours. The container then
+    # reports the bogus audio duration as the duration of the whole file. For
+    # video jobs the visible video stream is the authoritative playback length.
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") != "video":
+            continue
+        duration = stream.get("duration")
+        if duration is not None and float(duration) > 0:
+            return float(duration)
+
     duration = data.get("format", {}).get("duration")
-    if duration is not None:
+    if duration is not None and float(duration) > 0:
         return float(duration)
 
     for stream in data.get("streams", []):
         duration = stream.get("duration")
-        if duration is not None:
+        if duration is not None and float(duration) > 0:
             return float(duration)
 
     if path.suffix.lower() == ".wav":
@@ -440,6 +452,8 @@ def extract_audio(video_path: Path, wav_path: Path) -> None:
             "-i",
             str(video_path),
             "-vn",
+            "-af",
+            "asetpts=N/SR/TB",
             "-ac",
             "1",
             "-ar",
@@ -461,6 +475,8 @@ def extract_audio_track(video_path: Path, wav_path: Path, sample_rate: int = 441
             "-i",
             str(video_path),
             "-vn",
+            "-af",
+            "asetpts=N/SR/TB",
             "-ac",
             str(channels),
             "-ar",
@@ -475,6 +491,7 @@ def extract_audio_track(video_path: Path, wav_path: Path, sample_rate: int = 441
 def trim_video(input_path: Path, output_path: Path, duration: float) -> None:
     ffmpeg = require_tool("ffmpeg")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    duration = max(0.1, duration)
     run(
         [
             ffmpeg,
@@ -482,13 +499,30 @@ def trim_video(input_path: Path, output_path: Path, duration: float) -> None:
             "-i",
             str(input_path),
             "-t",
-            f"{max(0.1, duration):.3f}",
+            f"{duration:.3f}",
             "-map",
-            "0",
-            "-c",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c:v",
             "copy",
+            # Re-encode the first audio stream instead of preserving malformed
+            # AAC edit lists/timestamps from Telegram uploads. Copying them was
+            # able to turn a normal 23-second clip into a 0.02-second WAV.
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-af",
+            # Reset timestamps before trimming. Some Telegram files number AAC
+            # packets in samples but declare a 1-second time base, making each
+            # normal 1024-sample frame appear 1024 seconds apart. Trimming first
+            # would therefore keep only the first one or two packets.
+            f"asetpts=N/SR/TB,atrim=0:{duration:.3f}",
             "-avoid_negative_ts",
             "make_zero",
+            "-movflags",
+            "+faststart",
             str(output_path),
         ]
     )
