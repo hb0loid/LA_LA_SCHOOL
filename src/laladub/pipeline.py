@@ -1374,8 +1374,25 @@ def _build_artifact_segments(
     else:
         try:
             artifact_audio = _whisper_chaos_audio(source_audio, artifact_config, purpose="artifact")
-            full_artifacts = transcribe(artifact_audio, artifact_config)
-            full_artifacts = _clamp_segments_to_duration(full_artifacts, source_duration)
+            # The chaos-backbone path has already run a full forced-language
+            # decode and saved it before the clean timing pass. Reuse that
+            # genuine current-video Whisper output instead of decoding the
+            # complete audio a second time with the same language. Short
+            # independent windows are still harvested below because those are
+            # what produce the useful extra hallucinations.
+            full_artifacts = (
+                _load_current_forced_artifact_seed(config, artifact_lang)
+                if config.content_chaos_backbone
+                else []
+            )
+            if full_artifacts:
+                print(
+                    "      Reusing main forced-ASR output for artifact layer: "
+                    f"segments={len(full_artifacts)}"
+                )
+            else:
+                full_artifacts = transcribe(artifact_audio, artifact_config)
+                full_artifacts = _clamp_segments_to_duration(full_artifacts, source_duration)
             chunk_artifacts = (
                 _harvest_chunked_forced_artifacts(artifact_audio, artifact_config, config, source_duration)
                 if config.artifact_chaos_mode
@@ -1737,6 +1754,24 @@ def _load_resumable_artifact_source(config: DubConfig, _artifact_lang: str) -> l
             print(f"      Resume: loaded artifact source {path} segments={len(segments)}")
             return segments
     return []
+
+
+def _load_current_forced_artifact_seed(config: DubConfig, artifact_lang: str) -> list[Segment]:
+    """Reuse the main forced decode without suppressing fresh chunk harvest.
+
+    This is deliberately separate from ``_load_resumable_artifact_source``:
+    the latter represents a complete, already-harvested artifact layer, while
+    this file contains only the full-video seed produced earlier in the same
+    run. Fresh five-second windows must still be decoded.
+    """
+    path = config.workdir / f"forced_{_safe_label(artifact_lang)}_transcript.srt"
+    if not _file_ready(path, min_size=16):
+        return []
+    try:
+        return read_srt(path, translated=False)
+    except Exception as exc:
+        print(f"      Could not reuse forced artifact seed {path}: {type(exc).__name__}: {exc}")
+        return []
 
 
 # Ghiền Mì Gõ is a real Vietnamese channel whose videos are the usual input,
@@ -2433,7 +2468,7 @@ def _harvest_chunked_forced_artifacts(
 
     chunk_dir = config.workdir / "artifact_chunks"
     chunk_dir.mkdir(parents=True, exist_ok=True)
-    windows = _artifact_harvest_windows(source_duration)
+    windows = _artifact_harvest_windows(source_duration, config.artifact_ratio)
     if not windows:
         return []
 
@@ -2468,9 +2503,12 @@ def _harvest_chunked_forced_artifacts(
     return result
 
 
-def _artifact_harvest_windows(source_duration: float) -> list[tuple[float, float]]:
+def _artifact_harvest_windows(
+    source_duration: float,
+    artifact_ratio: float = 0.20,
+) -> list[tuple[float, float]]:
     chunk_seconds = 5.0
-    max_windows = 24
+    max_windows = 12
     if source_duration < 0.5:
         return []
 
@@ -2480,16 +2518,23 @@ def _artifact_harvest_windows(source_duration: float) -> list[tuple[float, float
         for start in starts
         if source_duration - start >= 0.5
     ]
-    if len(windows) <= max_windows:
+    # We ultimately inject only ``artifact_ratio`` of the dialogue. Decode
+    # roughly twice that share of the timeline to leave enough candidates
+    # after filtering, with a small floor for short clips. The previous fixed
+    # cap decoded 24 independent windows even when only 20% could be used.
+    coverage = max(0.10, min(1.0, float(artifact_ratio) * 2.0))
+    target_windows = min(max_windows, max(3, math.ceil(len(windows) * coverage)))
+    target_windows = min(len(windows), target_windows)
+    if len(windows) <= target_windows:
         return windows
 
     # Do not make long videos spend minutes decoding hundreds of tiny files.
     # Sample the same 5-second windows evenly over the complete timeline.
     last_start = max(0.0, source_duration - chunk_seconds)
-    step = last_start / (max_windows - 1)
+    step = last_start / (target_windows - 1)
     return [
         (min(last_start, round(index * step, 3)), chunk_seconds)
-        for index in range(max_windows)
+        for index in range(target_windows)
     ]
 
 
