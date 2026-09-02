@@ -301,9 +301,16 @@ if (-not $env:LALADUB_MAX_PHRASE_REPEATS) { $env:LALADUB_MAX_PHRASE_REPEATS = "2
 if (-not $env:LALADUB_MAX_WORD_REPEATS) { $env:LALADUB_MAX_WORD_REPEATS = "3" }
 if (-not $env:LALADUB_INJECT_ARTIFACTS) { $env:LALADUB_INJECT_ARTIFACTS = "1" }
 if (-not $env:LALADUB_ARTIFACT_MAX_SEGMENTS) { $env:LALADUB_ARTIFACT_MAX_SEGMENTS = "14" }
-if (-not $env:LALADUB_ARTIFACT_RATIO) { $env:LALADUB_ARTIFACT_RATIO = "0.20" }
-if (-not $env:LALADUB_ARTIFACT_MIN_SOURCE_SEGMENTS) { $env:LALADUB_ARTIFACT_MIN_SOURCE_SEGMENTS = "5" }
+if (-not $env:LALADUB_ARTIFACT_RATIO) { $env:LALADUB_ARTIFACT_RATIO = "0.30" }
+if (-not $env:LALADUB_ARTIFACT_MIN_SOURCE_SEGMENTS) { $env:LALADUB_ARTIFACT_MIN_SOURCE_SEGMENTS = "3" }
 if (-not $env:LALADUB_ARTIFACT_MIN_GAP_SECONDS) { $env:LALADUB_ARTIFACT_MIN_GAP_SECONDS = "0.5" }
+# Artifacts come from assets/hallucinations, not a second Whisper pass.
+# Kept in step with tools/runtime/Start-Bot.ps1: the worker preprocesses,
+# so a job must not come out differently depending on which machine ran it.
+if (-not $env:LALADUB_ARTIFACT_SOURCE) { $env:LALADUB_ARTIFACT_SOURCE = "catalog" }
+if (-not $env:LALADUB_ARTIFACT_CROSS_LANGUAGE_SHARE) { $env:LALADUB_ARTIFACT_CROSS_LANGUAGE_SHARE = "0.15" }
+if (-not $env:LALADUB_MAX_LINE_REPEATS) { $env:LALADUB_MAX_LINE_REPEATS = "5" }
+if (-not $env:LALADUB_CHANNEL_REBRAND_SHARE) { $env:LALADUB_CHANNEL_REBRAND_SHARE = "0.5" }
 if (-not $env:LALADUB_DISTORT_TRANSLATION) { $env:LALADUB_DISTORT_TRANSLATION = "1" }
 if (-not $env:LALADUB_TRANSLATION_PIVOTS) { $env:LALADUB_TRANSLATION_PIVOTS = "input,en|input,ja,en|input,tr,de,en|en,de|en,fr|en,es|en,ja,ko|en,tr,ar|input,en,de|input,ja,ko,en|input,tr,ar,en|en,th,he,en|en,ms,he,en" }
 if (-not $env:LALADUB_TRANSLATION_SECOND_PASS_RATIO) { $env:LALADUB_TRANSLATION_SECOND_PASS_RATIO = "0.45" }
