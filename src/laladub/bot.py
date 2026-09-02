@@ -62,54 +62,7 @@ _force_current_python_for_child_processes()
 # Vietnamese alone is 48%, and the first eight cover 90%. Everything past that
 # is there so a rare video is not turned away - Argos has a round trip through
 # English for each, and Whisper can transcribe all of them.
-SOURCE_LANGS = [
-    ("auto", "Авто"),
-    ("vi", "Вьетнамский"),
-    ("ru", "Русский"),
-    ("en", "Английский"),
-    ("he", "Иврит"),
-    ("ko", "Корейский"),
-    ("zh", "Китайский"),
-    ("tr", "Турецкий"),
-    ("ms", "Малайзийский"),
-    ("hi", "Хинди"),
-    ("ja", "Японский"),
-    ("th", "Тайский"),
-    ("de", "Немецкий"),
-    ("ar", "Арабский"),
-    ("uk", "Украинский"),
-    ("id", "Индонезийский"),
-    ("pl", "Польский"),
-    ("fr", "Французский"),
-    ("az", "Азербайджанский"),
-    ("es", "Испанский"),
-    ("it", "Итальянский"),
-    ("pt", "Португальский"),
-    ("fa", "Персидский"),
-    ("nl", "Нидерландский"),
-    ("sv", "Шведский"),
-    ("cs", "Чешский"),
-    ("el", "Греческий"),
-    ("ro", "Румынский"),
-    ("hu", "Венгерский"),
-    ("fi", "Финский"),
-    ("da", "Датский"),
-    ("no", "Норвежский"),
-    ("bg", "Болгарский"),
-    ("sk", "Словацкий"),
-    ("sl", "Словенский"),
-    ("lt", "Литовский"),
-    ("lv", "Латышский"),
-    ("et", "Эстонский"),
-    ("sq", "Албанский"),
-    ("ca", "Каталанский"),
-    ("gl", "Галисийский"),
-    ("eu", "Баскский"),
-    ("bn", "Бенгальский"),
-    ("ur", "Урду"),
-    ("sw", "Суахили"),
-    ("tl", "Тагальский"),
-]
+from .languages import SOURCE_LANGS, TARGET_LANGS, transcript_header  # noqa: E402
 
 ASR_METHODS = [
     ("ow-large-v3-chaos-backbone", "Поломанный дубляж"),
@@ -142,11 +95,7 @@ VISUAL_MODE_OPTIONS = [
     ("original", "Оставить исходный видеоряд"),
     ("random", "Видеоряд скучный, сделай прикольно"),
 ]
-TARGET_LANGS = [
-    ("ru", "Русский"),
-    ("uk", "Украинский"),
-    ("en", "Английский"),
-]
+
 TTS_METHODS = [
     ("moss", "MOSS — лучше качество, дольше ждать"),
     ("cosyvoice", "CosyVoice — быстрее, но попроще"),
@@ -4547,6 +4496,7 @@ async def _process_job(
                 job_dir,
                 job.get("source_title") or Path(job["input_path"]).stem,
                 transcript_text,
+                job,
             )
             with transcript_path.open("rb") as file_obj:
                 await context.bot.send_document(
@@ -5051,10 +5001,19 @@ def _read_transcript_text(srt_path: Path, *, mark: bool = True) -> str:
     return re.sub(r"\s+", " ", " ".join(lines)).strip()
 
 
-def _write_transcript_text(job_dir: Path, source_title: str, transcript_text: str) -> Path:
+def _write_transcript_text(
+    job_dir: Path,
+    source_title: str,
+    transcript_text: str,
+    job: dict[str, Any] | None = None,
+) -> Path:
     filename = _lalaschool_filename(f"{source_title}_transcript", ".txt")
     path = job_dir / filename
-    path.write_text(transcript_text.strip() + "\n", encoding="utf-8")
+    header = transcript_header(job)
+    body = transcript_text.strip()
+    separator = "\n\n"
+    contents = header + separator + body if header else body
+    path.write_text(contents + "\n", encoding="utf-8")
     return path
 
 
