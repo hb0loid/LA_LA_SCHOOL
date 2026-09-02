@@ -52,6 +52,11 @@ class DubConfig:
     content_chaos_backbone: bool = False
     inject_artifacts: bool = True
     artifact_max_segments: int = 12
+    # "whisper" hunts artifacts with a second ASR pass; "catalog" looks them up.
+    artifact_source: str = "catalog"
+    # Share of catalogue phrases deliberately drawn from another language.
+    artifact_cross_language_share: float = 0.15
+    hallucination_catalog_path: str | None = None
     artifact_ratio: float = 0.2
     artifact_min_source_segments: int = 5
     artifact_min_gap_seconds: float = 0.5

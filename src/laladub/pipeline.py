@@ -1302,6 +1302,66 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     return config.output
 
 
+def _catalog_artifact_segments(
+    config: DubConfig,
+    base_segments: list[Segment],
+    source_duration: float,
+) -> list[Segment]:
+    """Artifacts taken from the catalogue instead of hunted with a second ASR pass.
+
+    The hunt re-ran Whisper over the whole audio just to collect what it
+    invented - a median of 10 seconds but up to 20 minutes on long input. The
+    catalogue holds the same kind of material for 100 languages, so the phrases
+    cost nothing and are no longer limited to what this one video provoked.
+
+    Timings are spread across the video only as a starting point: the injection
+    stage re-fits each interval to the length of its text, exactly as it does
+    for hunted artifacts.
+    """
+    from .hallucination_catalog import shared_catalog
+
+    artifact_lang = config.artifact_source_lang
+    wanted = max(1, int(config.artifact_max_segments or 12)) * 2
+    catalog = shared_catalog(getattr(config, "hallucination_catalog_path", None) or None)
+    phrases = catalog.phrases(
+        artifact_lang,
+        wanted,
+        seed=str(config.translation_seed or config.workdir),
+        cross_language_share=float(getattr(config, "artifact_cross_language_share", 0.15)),
+    )
+    if not phrases:
+        print("      Catalogue has no phrases for this language", flush=True)
+        return []
+
+    duration = max(1.0, source_duration)
+    step = duration / (len(phrases) + 1)
+    segments: list[Segment] = []
+    for index, phrase in enumerate(phrases, start=1):
+        start = min(duration - 0.5, max(0.0, step * index))
+        segments.append(
+            Segment(start=start, end=min(duration, start + _estimated_chaos_spoken_duration(phrase)), text=phrase)
+        )
+    print(
+        f"      Artifact catalogue: {len(segments)} phrase(s) for {artifact_lang}"
+        f" (of {catalog.size(artifact_lang)} listed)",
+        flush=True,
+    )
+    _report_progress(config, "Беру артефакты из каталога", 34, 100, f"фраз: {len(segments)}")
+    return _translate_and_clean_artifacts(
+        segments,
+        _artifact_translation_config(config, artifact_lang),
+        _debug_path(config, "artifact_catalog_translated.srt"),
+    )
+
+
+def _artifact_translation_config(config: DubConfig, artifact_lang: str) -> DubConfig:
+    artifact_config = copy(config)
+    artifact_config.source_lang = artifact_lang
+    artifact_config.input_pivot_lang = None
+    artifact_config.inject_artifacts = False
+    return artifact_config
+
+
 def _build_artifact_segments(
     source_audio: Path,
     config: DubConfig,
@@ -1310,6 +1370,14 @@ def _build_artifact_segments(
     artifact_lang = config.artifact_source_lang
     if not config.inject_artifacts or not artifact_lang or artifact_lang == "auto":
         return []
+    if str(getattr(config, "artifact_source", "whisper")).lower() == "catalog":
+        # Catalogue mode skips the hunt entirely, including the same-language
+        # rule below: that rule exists because hunting in the language already
+        # transcribed finds nothing new, which does not apply to a lookup.
+        source_duration = max(
+            (segment.end for segment in base_segments), default=0.0
+        )
+        return _catalog_artifact_segments(config, base_segments, source_duration)
     same_language_hunt = bool(config.source_lang and artifact_lang == config.source_lang)
     ru_same_language_hunt = same_language_hunt and artifact_lang == "ru"
     if same_language_hunt and not ru_same_language_hunt:

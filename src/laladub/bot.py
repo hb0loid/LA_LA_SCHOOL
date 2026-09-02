@@ -4343,6 +4343,8 @@ async def _process_job(
         max_translation_hops=settings.max_translation_hops,
         channel_rebrand_share=settings.channel_rebrand_share,
         max_line_repeats=settings.max_line_repeats,
+        artifact_source=settings.artifact_source,
+        artifact_cross_language_share=settings.artifact_cross_language_share,
         translation_second_pass_ratio=settings.translation_second_pass_ratio,
         collapse_repetitions=settings.collapse_repetitions,
         max_phrase_repeats=settings.max_phrase_repeats,

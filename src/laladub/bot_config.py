@@ -134,6 +134,8 @@ class BotSettings:
     max_translation_hops: int
     channel_rebrand_share: float
     max_line_repeats: int
+    artifact_source: str
+    artifact_cross_language_share: float
     translation_second_pass_ratio: float
 
     def is_paid(self, user_id: int | None) -> bool:
@@ -325,6 +327,12 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         ),
         # How often one short line may repeat across a video. 0 disables it.
         max_line_repeats=max(0, int(os.environ.get("LALADUB_MAX_LINE_REPEATS", "5"))),
+        # "catalog" looks artifacts up instead of hunting them with a second
+        # ASR pass; "whisper" restores the old hunt.
+        artifact_source=os.environ.get("LALADUB_ARTIFACT_SOURCE", "catalog").strip().lower(),
+        artifact_cross_language_share=min(
+            1.0, max(0.0, float(os.environ.get("LALADUB_ARTIFACT_CROSS_LANGUAGE_SHARE", "0.15")))
+        ),
         translation_second_pass_ratio=max(
             0.0,
             min(1.0, float(os.environ.get("LALADUB_TRANSLATION_SECOND_PASS_RATIO", "0.0"))),

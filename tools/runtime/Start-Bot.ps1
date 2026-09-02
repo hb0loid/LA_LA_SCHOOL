@@ -289,6 +289,13 @@ $env:LALADUB_COLLAPSE_REPETITIONS = "1"
 $env:LALADUB_MAX_PHRASE_REPEATS = "2"
 $env:LALADUB_MAX_WORD_REPEATS = "3"
 $env:LALADUB_INJECT_ARTIFACTS = "1"
+# Artifacts now come from assets/hallucinations instead of a second Whisper
+# pass over the whole audio. That pass cost a median of 10s, 141s at the
+# 90th percentile and up to 20 minutes on long input. Set to "whisper" to
+# bring the hunt back.
+$env:LALADUB_ARTIFACT_SOURCE = "catalog"
+# How often a phrase is pulled from a language other than the decoy one.
+$env:LALADUB_ARTIFACT_CROSS_LANGUAGE_SHARE = "0.15"
 $env:LALADUB_ARTIFACT_MAX_SEGMENTS = "14"
 $env:LALADUB_ARTIFACT_RATIO = "0.20"
 $env:LALADUB_ARTIFACT_MIN_SOURCE_SEGMENTS = "5"
