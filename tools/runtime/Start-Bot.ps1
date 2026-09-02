@@ -213,6 +213,11 @@ $env:LALADUB_JOB_RETENTION_SECONDS = "2592000"
 $env:LALADUB_CLEANUP_INTERVAL_SECONDS = "3600"
 $env:LALADUB_TTS = "moss"
 $env:LALADUB_TRANSLATOR = "hybrid"
+# Argos language models live on F: they are several gigabytes and C: is the
+# small SSD that gets cleaned out regularly. Only the first read of a model
+# after a reboot touches the disk at all - after that Windows keeps it cached -
+# so the slower drive costs a fraction of a second per language, once.
+$env:ARGOS_PACKAGES_DIR = "F:\LaLaSchoolData\argos-translate\packages"
 $env:LALADUB_MAX_ACTIVE_JOBS = "2"
 $env:LALADUB_MAX_ACTIVE_JOBS_PER_USER = "1"
 $env:LALADUB_WATERMARK_IMAGE = (Join-Path $Root "assets")

@@ -463,9 +463,28 @@ def _install_argos_package(source_lang: str, target_lang: str) -> bool:
     return True
 
 
+# Whisper and Argos spell a few languages differently. Norwegian is the one
+# that matters: Whisper reports "no" (and "nn" for Nynorsk, a frequent false
+# positive on music), while the package is filed under "nb" - so without this
+# the language was detected fine and then had no translator at all.
+ARGOS_LANG_ALIASES = {
+    "no": "nb",
+    "nn": "nb",
+    "iw": "he",
+    "in": "id",
+    "jw": "jv",
+}
+
+
+def _argos_lang(code: str) -> str:
+    return ARGOS_LANG_ALIASES.get((code or "").strip().casefold(), code)
+
+
 def _get_argos_translation(translate_module: object, source_lang: str, target_lang: str) -> object | None:
     try:
-        return translate_module.get_translation_from_codes(source_lang, target_lang)
+        return translate_module.get_translation_from_codes(
+            _argos_lang(source_lang), _argos_lang(target_lang)
+        )
     except Exception:
         return None
 
