@@ -1325,7 +1325,13 @@ def _catalog_artifact_segments(
     from .hallucination_catalog import shared_catalog
 
     artifact_lang = config.artifact_source_lang
-    wanted = max(1, int(config.artifact_max_segments or 12)) * 2
+    # Ask only for what can actually be injected, plus a margin for candidates
+    # that get rejected on timing. Sizing this off artifact_max_segments meant
+    # 128 phrases on a normal job - the chaos mode raises that cap to 64 - and
+    # every one of them then went through the distortion chains. That traded
+    # the ASR pass we saved for a translation bill several times larger.
+    injectable = len(base_segments) * max(0.05, float(config.artifact_ratio or 0.2))
+    wanted = int(max(8, min(32, round(injectable * 3))))
     catalog = shared_catalog(getattr(config, "hallucination_catalog_path", None) or None)
     phrases = catalog.phrases(
         artifact_lang,
