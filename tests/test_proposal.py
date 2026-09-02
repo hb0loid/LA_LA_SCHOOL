@@ -19,6 +19,7 @@ from laladub.proposal_bot import (
     _author_caption,
     _find_submission_original_video,
     _find_submission_subtitles,
+    _delete_moderator_cards,
     _karma_tag,
     _level_up_message,
     _moderation_caption,
@@ -1197,6 +1198,32 @@ class CleanCommandTests(unittest.IsolatedAsyncioTestCase):
         await clean_command(update, self._context(delete_message))
         self.assertIn("Очищено сообщений: 1", message.reply_text.call_args.args[0])
         self.assertIn("Не удалось удалить: 1", message.reply_text.call_args.args[0])
+        # The failed note remains tracked so a later /clean can retry it.
+        self.assertIn((-100, 30), self.store.bot_notes(631551040))
+
+    async def test_failed_video_delete_remains_tracked_for_retry(self) -> None:
+        submission = self._submission("4")
+        self.store.try_claim(submission.id, 631551040)
+        self.store.finish_decision(
+            submission_id=submission.id, moderator_id=631551040, destination="rejected", award_milli=0,
+            publication_chat_id=None, publication_message_id=None,
+        )
+        self.store.record_moderator_message(submission.id, 631551040, -100, 50)
+        delete_message = AsyncMock(side_effect=Exception("message can't be deleted"))
+        update, _message = self._update()
+        await clean_command(update, self._context(delete_message))
+        self.assertEqual(self.store.moderator_messages(submission.id), [(-100, 50)])
+
+    async def test_decision_cleanup_deletes_all_moderator_cards(self) -> None:
+        submission = self._submission("5")
+        self.store.record_moderator_message(submission.id, 631551040, 631551040, 60)
+        self.store.record_moderator_message(submission.id, 7123813884, 7123813884, 61)
+        delete_message = AsyncMock()
+        deleted, failed = await _delete_moderator_cards(
+            SimpleNamespace(delete_message=delete_message), self.store, submission.id
+        )
+        self.assertEqual((deleted, failed), (2, 0))
+        self.assertEqual(self.store.moderator_messages(submission.id), [])
 
     async def test_non_moderator_does_nothing(self) -> None:
         self.store.record_bot_note(1, -100, 30)

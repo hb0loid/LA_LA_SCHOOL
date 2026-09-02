@@ -322,6 +322,27 @@ class ProposalStore:
             ).fetchall()
         return [(int(row["chat_id"]), int(row["message_id"])) for row in rows]
 
+    def tracked_moderator_messages(self, submission_id: int) -> list[tuple[int, int, int]]:
+        """(moderator_id, chat_id, message_id) for every moderator copy.
+
+        Decisions can be made by any moderator, so the successful decision must
+        remove every copy, not just the card belonging to the moderator who
+        pressed the button.
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT moderator_id, chat_id, message_id
+                FROM moderator_messages
+                WHERE submission_id = ?
+                """,
+                (submission_id,),
+            ).fetchall()
+        return [
+            (int(row["moderator_id"]), int(row["chat_id"]), int(row["message_id"]))
+            for row in rows
+        ]
+
     def forget_moderator_message(self, submission_id: int, moderator_id: int) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -361,6 +382,29 @@ class ProposalStore:
             connection.execute(
                 "INSERT INTO bot_notes (moderator_id, chat_id, message_id, created_at) VALUES (?, ?, ?, ?)",
                 (moderator_id, chat_id, message_id, time.time()),
+            )
+
+    def bot_notes(self, moderator_id: int) -> list[tuple[int, int]]:
+        """Returns tracked notes without forgetting them.
+
+        Telegram may temporarily reject deletion. Keeping the row allows the
+        next /clean to retry instead of permanently orphaning the message.
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT chat_id, message_id FROM bot_notes WHERE moderator_id = ?",
+                (moderator_id,),
+            ).fetchall()
+        return [(int(row["chat_id"]), int(row["message_id"])) for row in rows]
+
+    def forget_bot_note(self, moderator_id: int, chat_id: int, message_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM bot_notes
+                WHERE moderator_id = ? AND chat_id = ? AND message_id = ?
+                """,
+                (moderator_id, chat_id, message_id),
             )
 
     def take_bot_notes(self, moderator_id: int) -> list[tuple[int, int]]:

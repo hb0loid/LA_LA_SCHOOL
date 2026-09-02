@@ -339,21 +339,32 @@ async def clean_command(update: Any, context: Any) -> None:
     deleted = 0
     failed = 0
 
-    notes = await asyncio.to_thread(store.take_bot_notes, moderator_id)
+    notes = await asyncio.to_thread(store.bot_notes, moderator_id)
     for chat_id, message_id in notes:
         try:
             await context.bot.delete_message(chat_id, message_id)
             deleted += 1
-        except Exception:
+        except Exception as exc:
+            if _message_is_already_gone(exc):
+                deleted += 1
+                await asyncio.to_thread(store.forget_bot_note, moderator_id, chat_id, message_id)
+                continue
             failed += 1
+            continue
+        await asyncio.to_thread(store.forget_bot_note, moderator_id, chat_id, message_id)
 
     resolved = await asyncio.to_thread(store.resolved_moderator_video_messages, moderator_id)
     for submission_id, chat_id, message_id in resolved:
         try:
             await context.bot.delete_message(chat_id, message_id)
             deleted += 1
-        except Exception:
+        except Exception as exc:
+            if _message_is_already_gone(exc):
+                deleted += 1
+                await asyncio.to_thread(store.forget_moderator_message, submission_id, moderator_id)
+                continue
             failed += 1
+            continue
         await asyncio.to_thread(store.forget_moderator_message, submission_id, moderator_id)
 
     summary = f"Очищено сообщений: {deleted}."
@@ -668,10 +679,45 @@ async def _after_decision_effects(
             )
 
     tag_updated = await _sync_karma_tag(context.bot, settings, store, updated.user_id)
-    await _refresh_moderator_messages(context.bot, store, updated)
+    deleted_cards, failed_cards = await _delete_moderator_cards(context.bot, store, updated.id)
     delta_text = f"Карма: {format_karma_milli(delta, signed=True)}" if delta else "Карма без изменений"
     tag_text = " Тег в группе обновлён." if tag_updated else ""
-    return f"{delta_text}.{tag_text}"
+    cleanup_text = f" Карточек удалено: {deleted_cards}."
+    if failed_cards:
+        cleanup_text += f" Не удалось удалить: {failed_cards}; /clean повторит попытку."
+    return f"{delta_text}.{tag_text}{cleanup_text}"
+
+
+def _message_is_already_gone(exc: Exception) -> bool:
+    text = str(exc).casefold()
+    return "message to delete not found" in text or "message_id_invalid" in text
+
+
+async def _delete_moderator_cards(bot: Any, store: ProposalStore, submission_id: int) -> tuple[int, int]:
+    """Delete resolved moderation cards immediately while Telegram still allows it.
+
+    Telegram normally stops bots deleting messages after 48 hours. Failed
+    deletions deliberately remain tracked so /clean can retry them instead of
+    losing their message IDs forever.
+    """
+    deleted = 0
+    failed = 0
+    messages = await asyncio.to_thread(store.tracked_moderator_messages, submission_id)
+    for moderator_id, chat_id, message_id in messages:
+        try:
+            await bot.delete_message(chat_id, message_id)
+        except Exception as exc:
+            if not _message_is_already_gone(exc):
+                failed += 1
+                print(
+                    f"Moderator card cleanup failed submission={submission_id} "
+                    f"chat={chat_id} message={message_id}: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                continue
+        await asyncio.to_thread(store.forget_moderator_message, submission_id, moderator_id)
+        deleted += 1
+    return deleted, failed
 
 
 async def karma_member_changed(update: Any, context: Any) -> None:

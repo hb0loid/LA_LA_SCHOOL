@@ -6,6 +6,7 @@ import hashlib
 import heapq
 import html
 import json
+import math
 import multiprocessing
 import re
 import shutil
@@ -34,6 +35,7 @@ from .asr import clear_openai_whisper_cache
 from .library import LibraryStore, show_command
 from .models import DubConfig
 from .pipeline import run_dub, run_transcript
+from .performance import PerformanceHistory, job_duration_seconds, merge_stage_seconds, record_terminal_job
 from .premium_store import PremiumStore, Subscription, UserSettings
 from .preset_store import PRESET_FIELDS, PresetStore, UserPreset
 from .text_review import TextReviewStore
@@ -56,29 +58,57 @@ def _force_current_python_for_child_processes() -> None:
 _force_current_python_for_child_processes()
 
 
+# Ordered by how often people actually pick each one, measured over 3505 jobs:
+# Vietnamese alone is 48%, and the first eight cover 90%. Everything past that
+# is there so a rare video is not turned away - Argos has a round trip through
+# English for each, and Whisper can transcribe all of them.
 SOURCE_LANGS = [
     ("auto", "Авто"),
     ("vi", "Вьетнамский"),
-    ("ko", "Корейский"),
-    ("tr", "Турецкий"),
-    ("en", "Английский"),
     ("ru", "Русский"),
-    ("ja", "Японский"),
+    ("en", "Английский"),
+    ("he", "Иврит"),
+    ("ko", "Корейский"),
     ("zh", "Китайский"),
+    ("tr", "Турецкий"),
+    ("ms", "Малайзийский"),
+    ("hi", "Хинди"),
+    ("ja", "Японский"),
     ("th", "Тайский"),
     ("de", "Немецкий"),
-    ("es", "Испанский"),
+    ("ar", "Арабский"),
+    ("uk", "Украинский"),
+    ("id", "Индонезийский"),
+    ("pl", "Польский"),
     ("fr", "Французский"),
+    ("az", "Азербайджанский"),
+    ("es", "Испанский"),
     ("it", "Итальянский"),
     ("pt", "Португальский"),
-    ("ar", "Арабский"),
-    ("he", "Иврит"),
-    ("hi", "Хинди"),
-    ("id", "Индонезийский"),
-    ("ms", "Малайзийский"),
-    ("az", "Азербайджанский"),
-    ("pl", "Польский"),
-    ("uk", "Украинский"),
+    ("fa", "Персидский"),
+    ("nl", "Нидерландский"),
+    ("sv", "Шведский"),
+    ("cs", "Чешский"),
+    ("el", "Греческий"),
+    ("ro", "Румынский"),
+    ("hu", "Венгерский"),
+    ("fi", "Финский"),
+    ("da", "Датский"),
+    ("no", "Норвежский"),
+    ("bg", "Болгарский"),
+    ("sk", "Словацкий"),
+    ("sl", "Словенский"),
+    ("lt", "Литовский"),
+    ("lv", "Латышский"),
+    ("et", "Эстонский"),
+    ("sq", "Албанский"),
+    ("ca", "Каталанский"),
+    ("gl", "Галисийский"),
+    ("eu", "Баскский"),
+    ("bn", "Бенгальский"),
+    ("ur", "Урду"),
+    ("sw", "Суахили"),
+    ("tl", "Тагальский"),
 ]
 
 ASR_METHODS = [
@@ -2934,6 +2964,7 @@ class _QueuedJob:
 class _JobScheduler:
     def __init__(self, settings: BotSettings) -> None:
         self._settings = settings
+        self._performance = PerformanceHistory(settings.workdir)
         self._lock = asyncio.Lock()
         self._pending: list[tuple[int, int, _QueuedJob]] = []
         self._active_total = 0
@@ -2992,6 +3023,19 @@ class _JobScheduler:
         job: dict[str, Any],
         status_message: Any,
     ) -> bool:
+        if job_duration_seconds(job) is None:
+            input_path = Path(str(job.get("input_path") or ""))
+            if input_path.is_file():
+                try:
+                    duration = await asyncio.to_thread(probe_duration, input_path)
+                except Exception as exc:
+                    print(
+                        f"ETA duration probe failed for {input_path.name}: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                else:
+                    if duration > 0:
+                        job["input_duration_seconds"] = round(duration, 3)
         key = _job_queue_key(job)
         async with self._lock:
             if key in self._known_jobs:
@@ -3021,6 +3065,10 @@ class _JobScheduler:
                         "Дождись завершения одной из своих задач и попробуй снова.",
                     )
                     return False
+            enqueue_attempt_at = time.time()
+            first_queued_at = _coerce_float(job.get("first_queued_at")) or _coerce_float(job.get("queued_at"))
+            if first_queued_at is None:
+                first_queued_at = enqueue_attempt_at
             item = _QueuedJob(
                 key=key,
                 priority=0 if premium else 100 - priority_bonus,
@@ -3029,15 +3077,23 @@ class _JobScheduler:
                 user_id=user_id,
                 job=job,
                 status_message=status_message,
-                enqueued_at=time.time(),
+                enqueued_at=enqueue_attempt_at,
                 premium=premium,
                 queue_limit=queue_limit,
             )
-            job["queued_at"] = item.enqueued_at
+            job["first_queued_at"] = first_queued_at
+            job["queue_attempt_at"] = item.enqueued_at
+            job["queued_at"] = first_queued_at
             job["queue_priority"] = "premium" if premium else f"karma_{priority_bonus}"
             job["queue_priority_label"] = (
                 "премиум" if premium else "обычный" if priority_bonus == 0 else f"+{priority_bonus} ({level_name})"
             )
+            estimate = self._performance.estimate(job)
+            if estimate is not None:
+                job["initial_eta_seconds"] = round(estimate.seconds, 3)
+                job["initial_eta_low_seconds"] = round(estimate.low_seconds, 3)
+                job["initial_eta_high_seconds"] = round(estimate.high_seconds, 3)
+                job["initial_eta_samples"] = estimate.sample_count
             self._known_jobs.add(key)
             self._items_by_key[key] = item
             heapq.heappush(self._pending, (item.priority, item.sequence, item))
@@ -3048,6 +3104,14 @@ class _JobScheduler:
 
     async def finish(self, context: Any, item: _QueuedJob) -> None:
         async with self._lock:
+            snapshot = _load_job_snapshot(Path(str(item.job.get("job_dir") or "")))
+            if snapshot is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        record_terminal_job,
+                        Path(str(snapshot["job_dir"])),
+                        snapshot,
+                    )
             self._active_total = max(0, self._active_total - 1)
             if item.execution_kind == "local":
                 self._active_local = max(0, self._active_local - 1)
@@ -3129,6 +3193,7 @@ class _JobScheduler:
             item.progress = _ProgressState(
                 "Raw Whisper" if item.job.get("mode") == "raw_text" else "Full dubbing",
                 _job_number(item.job),
+                estimated_total_seconds=_coerce_float(item.job.get("initial_eta_seconds")),
             )
             item.progress.update("Remote worker leased", 1, 100, worker_id)
             item.progress_task = context.application.create_task(_progress_updater(item.status_message, item.progress))
@@ -3276,6 +3341,10 @@ class _JobScheduler:
                     self._active_by_user.pop(item.user_id, None)
             if item.progress_task is not None:
                 item.progress_task.cancel()
+            if item.progress is not None:
+                item.job["stage_seconds"] = merge_stage_seconds(
+                    item.job.get("stage_seconds"), item.progress.stage_seconds()
+                )
             item.progress_task = None
             item.progress = None
             item.execution_kind = None
@@ -3338,7 +3407,11 @@ class _JobScheduler:
                 item.job["local_continuation_started_at"] = time.time()
             _save_job_snapshot(Path(item.job["job_dir"]), item.job, status="starting")
             title = "Сырой Whisper" if item.job.get("mode") == "raw_text" else "Полноценный дубляж"
-            item.progress = _ProgressState(title, _job_number(item.job))
+            item.progress = _ProgressState(
+                title,
+                _job_number(item.job),
+                estimated_total_seconds=_coerce_float(item.job.get("initial_eta_seconds")),
+            )
             item.runner_task = context.application.create_task(self._run_item(context, item))
 
     def _can_start_local_worker(self) -> bool:
@@ -3484,6 +3557,9 @@ class _JobScheduler:
             f"Сейчас выполняется: {self._active_total}/{self._settings.max_active_jobs}",
             f"У тебя выполняется: {active_for_user}/{self._settings.max_active_jobs_per_user}",
         ]
+        wait_range = self._queue_wait_range(item)
+        if wait_range is not None:
+            lines.append(f"До начала примерно: {_format_eta_range(*wait_range)}")
         if item.queue_limit is not None and item.user_id is not None:
             jobs_for_user = sum(
                 1 for existing in self._items_by_key.values() if existing.user_id == item.user_id
@@ -3503,6 +3579,39 @@ class _JobScheduler:
             ]
         )
         return "\n".join(lines)
+
+    def _queue_wait_range(self, target: _QueuedJob) -> tuple[float, float] | None:
+        pending = sorted((priority, sequence, item) for priority, sequence, item in self._pending)
+        ahead: list[_QueuedJob] = []
+        for _priority, _sequence, item in pending:
+            if item is target:
+                break
+            ahead.append(item)
+
+        work_seconds = 0.0
+        usable_samples = 0
+        pending_ids = {id(item) for _priority, _sequence, item in pending}
+        for item in self._items_by_key.values():
+            if id(item) in pending_ids or item is target or item.execution_kind is None:
+                continue
+            if item.progress is not None:
+                remaining = item.progress.remaining_seconds()
+            else:
+                estimate = self._performance.estimate(item.job)
+                remaining = estimate.seconds * 0.5 if estimate is not None else None
+            if remaining is not None:
+                work_seconds += remaining
+                usable_samples += 1
+        for item in ahead:
+            estimate = self._performance.estimate(item.job)
+            if estimate is not None:
+                work_seconds += estimate.seconds
+                usable_samples += 1
+        if usable_samples == 0 or work_seconds < 20:
+            return None
+        slots = max(1, self._settings.max_active_jobs)
+        wait = work_seconds / slots
+        return (max(15.0, wait * 0.65), max(30.0, wait * 1.45))
 
     def _mark_remote_worker_locked(self, worker_id: str, *, active_job_id: str | None) -> None:
         worker_id = str(worker_id or "worker").strip() or "worker"
@@ -3623,12 +3732,25 @@ def _job_status_counts(workdir: Path) -> dict[str, int]:
 
 
 class _ProgressState:
-    def __init__(self, title: str, job_number: str = "") -> None:
+    def __init__(
+        self,
+        title: str,
+        job_number: str = "",
+        *,
+        estimated_total_seconds: float | None = None,
+    ) -> None:
         self._lock = threading.Lock()
         self._started_at = time.monotonic()
+        self._stage_started_at = self._started_at
         self._title = title
         self._job_number = job_number
         self._stage = "В очереди"
+        self._stage_seconds: dict[str, float] = {}
+        self._estimated_total_seconds = (
+            max(0.0, float(estimated_total_seconds))
+            if estimated_total_seconds is not None
+            else None
+        )
         self._detail = ""
         self._current = 0
         self._total = 100
@@ -3643,8 +3765,10 @@ class _ProgressState:
         detail: str | None = None,
     ) -> None:
         with self._lock:
-            if stage:
+            if stage and stage != self._stage:
+                self._close_current_stage_locked()
                 self._stage = stage
+                self._stage_started_at = time.monotonic()
             if total is not None and total > 0:
                 self._total = total
             if current is not None:
@@ -3654,7 +3778,9 @@ class _ProgressState:
 
     def finish(self, stage: str, *, failed: bool = False, detail: str | None = None) -> None:
         with self._lock:
+            self._close_current_stage_locked()
             self._stage = stage
+            self._stage_started_at = time.monotonic()
             self._current = self._total
             self._done = True
             self._failed = failed
@@ -3664,6 +3790,43 @@ class _ProgressState:
     def is_done(self) -> bool:
         with self._lock:
             return self._done
+
+    def elapsed_seconds(self) -> float:
+        with self._lock:
+            return max(0.0, time.monotonic() - self._started_at)
+
+    def remaining_seconds(self) -> float | None:
+        with self._lock:
+            if self._done:
+                return None
+            elapsed = max(0.0, time.monotonic() - self._started_at)
+            percent = round(self._current * 100 / max(1, self._total))
+            if self._estimated_total_seconds is None:
+                if 5 <= percent < 98 and elapsed >= 30:
+                    return min(8 * 60 * 60.0, elapsed * (100 - percent) / max(1, percent))
+                return None
+            remaining = max(0.0, self._estimated_total_seconds - elapsed)
+            if 10 <= percent < 98 and elapsed >= 30:
+                pace_remaining = elapsed * (100 - percent) / max(1, percent)
+                remaining = max(
+                    remaining,
+                    min(pace_remaining, self._estimated_total_seconds * 3.0),
+                )
+            return remaining if remaining >= 15 else None
+
+    def stage_seconds(self) -> dict[str, float]:
+        with self._lock:
+            result = dict(self._stage_seconds)
+            if not self._done and self._stage:
+                elapsed = max(0.0, time.monotonic() - self._stage_started_at)
+                result[self._stage] = result.get(self._stage, 0.0) + elapsed
+            return {key: round(value, 3) for key, value in result.items()}
+
+    def _close_current_stage_locked(self) -> None:
+        if not self._stage:
+            return
+        elapsed = max(0.0, time.monotonic() - self._stage_started_at)
+        self._stage_seconds[self._stage] = self._stage_seconds.get(self._stage, 0.0) + elapsed
 
     def render(self) -> str:
         with self._lock:
@@ -3687,6 +3850,9 @@ class _ProgressState:
         ]
         if detail:
             lines.append(f"Детали: {_short_status_detail(detail)}")
+        remaining = self.remaining_seconds()
+        if remaining is not None and not done:
+            lines.append(f"Осталось примерно: {_format_eta_range(remaining * 0.7, remaining * 1.4)}")
         return "\n".join(lines)
 
 
@@ -3703,6 +3869,28 @@ def _format_elapsed(seconds: float) -> str:
     if hours:
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
     return f"{minutes:02d}:{seconds:02d}"
+
+
+def _format_eta_range(low_seconds: float, high_seconds: float) -> str:
+    low_seconds = max(0.0, float(low_seconds))
+    high_seconds = max(low_seconds, float(high_seconds))
+    if high_seconds < 60:
+        return "меньше минуты"
+    low_minutes = max(1, int(low_seconds // 60))
+    high_minutes = max(low_minutes + 1, int(math.ceil(high_seconds / 60)))
+    if high_minutes < 60:
+        return f"{low_minutes}–{high_minutes} мин"
+    low_hours = low_minutes / 60
+    high_hours = high_minutes / 60
+    if low_hours >= 1:
+        return f"{low_hours:.1f}–{high_hours:.1f} ч".replace(".0", "")
+    return f"{low_minutes} мин – {high_hours:.1f} ч".replace(".0", "")
+
+
+def _capture_progress_metrics(job: dict[str, Any], progress: _ProgressState | None) -> None:
+    if progress is None:
+        return
+    job["stage_seconds"] = merge_stage_seconds(job.get("stage_seconds"), progress.stage_seconds())
 
 
 def _short_status_detail(detail: str, limit: int = 180) -> str:
@@ -4245,6 +4433,7 @@ async def _process_job(
                         connect_timeout=60,
                         pool_timeout=60,
                     )
+            _capture_progress_metrics(job, progress)
             _save_job_snapshot(job_dir, job, status="done")
             await _finish_progress(progress, progress_task, status_message, "Готово", detail="SRT, TXT и meta JSON отправлены")
             return
@@ -4281,6 +4470,7 @@ async def _process_job(
             config.resume = True
             await _run_pipeline_isolated("dub", Path(job["input_path"]), config, progress)
             job.setdefault("review_attempt", 1)
+            _capture_progress_metrics(job, progress)
             _save_job_snapshot(job_dir, job, status="awaiting_review")
             await _finish_progress(
                 progress, progress_task, status_message, "Текст готов", detail="жду решения"
@@ -4367,6 +4557,7 @@ async def _process_job(
         if transcript_text:
             sent_items.append("транскрипт")
         final_detail = "Отправлены: " + ", ".join(sent_items)
+        _capture_progress_metrics(job, progress)
         _save_job_snapshot(job_dir, job, status="done")
         await _archive_finished_dub(context, job)
         await _finish_progress(progress, progress_task, status_message, "Готово", detail=final_detail)
@@ -4376,6 +4567,7 @@ async def _process_job(
         details = "".join(traceback.format_exception_only(type(exc), exc)).strip()
         error_log = job_dir / "error.log"
         error_log.write_text(traceback_text, encoding="utf-8")
+        _capture_progress_metrics(job, progress)
         _save_job_snapshot(job_dir, job, status="failed", error=details)
         await _finish_progress(progress, progress_task, status_message, "Ошибка", failed=True, detail=details)
         await context.bot.send_message(
@@ -4454,6 +4646,7 @@ async def _send_remote_worker_result(context: Any, item: _QueuedJob, manifest: d
                         connect_timeout=60,
                         pool_timeout=60,
                     )
+            _capture_progress_metrics(job, progress)
             _save_job_snapshot(job_dir, job, status="done")
             await _finish_progress(progress, progress_task, status_message, "Done", detail="Worker documents sent")
             return
@@ -4515,6 +4708,7 @@ async def _send_remote_worker_result(context: Any, item: _QueuedJob, manifest: d
                 connect_timeout=60,
                 pool_timeout=60,
             )
+        _capture_progress_metrics(job, progress)
         _save_job_snapshot(job_dir, job, status="done")
         await _archive_finished_dub(context, job)
         sent_items = ["дубляж"]
@@ -4529,6 +4723,7 @@ async def _send_remote_worker_result(context: Any, item: _QueuedJob, manifest: d
         print(traceback_text, flush=True)
         details = "".join(traceback.format_exception_only(type(exc), exc)).strip()
         (job_dir / "error.log").write_text(traceback_text, encoding="utf-8")
+        _capture_progress_metrics(job, progress)
         _save_job_snapshot(job_dir, job, status="failed", error=details)
         await _finish_progress(progress, progress_task, status_message, "Error", failed=True, detail=details)
         await context.bot.send_message(

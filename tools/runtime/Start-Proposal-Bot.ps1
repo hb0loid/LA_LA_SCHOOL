@@ -23,7 +23,12 @@ Remove-Item -LiteralPath $HoldFile -Force -ErrorAction SilentlyContinue
 foreach ($logPath in @($OutLog, $ErrLog)) {
   if (-not (Test-Path -LiteralPath $logPath)) { New-Item -ItemType File -Path $logPath | Out-Null }
   $item = Get-Item -LiteralPath $logPath -ErrorAction SilentlyContinue
-  if ($item -and $item.Length -gt 10MB) { Clear-Content -LiteralPath $logPath }
+  # The watchdog keeps both logs open for redirection. A health check must not
+  # report the already-running bot as failed merely because Windows has the log
+  # file locked at this instant.
+  if ($item -and $item.Length -gt 10MB) {
+    Clear-Content -LiteralPath $logPath -ErrorAction SilentlyContinue
+  }
 }
 
 $mutex = [Threading.Mutex]::new($false, "Local\LaLaDubProposalStart")
@@ -42,7 +47,7 @@ try {
     Select-Object -First 1
   if ($existing) {
     Set-Content -LiteralPath $PidFile -Value $existing.ProcessId
-    Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Proposal watchdog already running, pid=$($existing.ProcessId)"
+    Add-Content -LiteralPath $OutLog -Value "$(Get-Date -Format s) Proposal watchdog already running, pid=$($existing.ProcessId)" -ErrorAction SilentlyContinue
     exit 0
   }
   Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue

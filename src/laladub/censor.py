@@ -33,6 +33,7 @@ _BANNED_TERMS = [
     "пиздец", "пизду", "пизды", "ебать", "ебал", "ебаный", "ёбаный", "ебанутый",
     "ёбнутый", "еблан", "уебок", "уёбок", "мудак", "мразь", "гандон", "долбоеб",
     "долбоёб", "пидор", "пидорас", "шлюха", "сучка", "жопа", "дерьмо",
+    "педик", "педераст", "гомик", "проститутка", "шалава", "потаскуха", "давалка",
     # Russian hateful slurs
     "ниггер", "нига", "чурка", "чурки", "хач", "хачи", "жид", "жиды", "москаль",
     "кацап", "хохол", "укроп", "пендос", "пиндос", "пиндосы", "черножопый",
@@ -40,6 +41,7 @@ _BANNED_TERMS = [
     # Common translit / obfuscated forms
     "blyat", "blyad", "suka", "cyka", "nahui", "nahuy", "huy", "hui", "pizda",
     "pizdec", "pidor", "pidoras", "mudak", "uebok", "ebat", "yebat", "yobany",
+    "pedik", "pederast", "shluha", "shlyuha", "shlyukha", "shalava",
 ]
 
 _BANNED_PHRASES = [
@@ -68,6 +70,14 @@ _BANNED_REGEXES = [
     r"\bkike\w*\b",
     r"\bfagg?ot\w*\b",
     r"\btrann(?:y|ies)\b",
+    r"\bшлюх\w*\b",
+    r"\bпроститут\w*\b",
+    r"\bшалав\w*\b",
+    r"\bпотаскух\w*\b",
+    r"\bпедик\w*\b",
+    r"\bпедераст\w*\b",
+    r"\bпид(?:ор|ар|ерас|орас)\w*\b",
+    r"\bгомик\w*\b",
     # Hate/violence constructions.
     r"\b(?:i\s+hate|hate)\s+(?:those\s+|all\s+)?(?:nigg\w+|black\s+people|jews|gays|fags|trann\w+)\b",
     r"\bя\s+ненавижу\s+(?:этих\s+|всех\s+)?[^\s,.!?;:]{2,24}\b",
@@ -105,6 +115,12 @@ _REPLACEMENTS = [
     "[слишком остро для перевода]",
     "[автоматическая замена]",
     "[нейросеть отказалась продолжать]",
+    "[не прошло]",
+    "[не скажу]",
+    "[слово удалено]",
+    "[слово скрыто]",
+    "[фраза скрыта]",
+    "[цензурный соус]",
 ]
 
 
@@ -194,16 +210,34 @@ def censor_text(text: str, *, percent: int, seed: str | None = None) -> tuple[st
     def repl(match: re.Match[str]) -> str:
         nonlocal replacements
         token = match.group(0)
-        replacement_index = _stable_int(f"{seed}|replacement|{match.start()}|{token}") % len(_ACTIVE_REPLACEMENTS)
         if _stable_int(f"{seed}|chance|{match.start()}|{token}") % 100 >= percent:
             return token
+        replacement_key = f"{seed}|replacement|{match.start()}|{token}"
+        replacement_pool = _replacement_pool(token, replacement_key)
+        replacement_index = _stable_int(replacement_key) % len(replacement_pool)
         replacements += 1
-        return _ACTIVE_REPLACEMENTS[replacement_index]
+        return replacement_pool[replacement_index]
 
     current = _REGEX_PATTERN.sub(repl, text)
     current = _PHRASE_PATTERN.sub(repl, current)
     current = _TERM_PATTERN.sub(repl, current)
     return current, replacements
+
+
+def _replacement_pool(token: str, key: str) -> list[str]:
+    """Usually keep a one/two-word match compact, while preserving occasional
+    long comedy warnings from the original bank."""
+    token_words = re.findall(r"[\wёЁ]+", token, flags=re.UNICODE)
+    if len(token_words) > 2:
+        return _ACTIVE_REPLACEMENTS
+    short = [
+        replacement
+        for replacement in _ACTIVE_REPLACEMENTS
+        if 1 <= len(re.findall(r"[\wёЁ]+", replacement, flags=re.UNICODE)) <= 2
+    ]
+    if short and _stable_int(f"{key}|prefer-short") % 100 < 85:
+        return short
+    return _ACTIVE_REPLACEMENTS
 
 
 def _stable_int(value: str) -> int:
