@@ -297,7 +297,10 @@ $env:LALADUB_ARTIFACT_SOURCE = "catalog"
 # How often a phrase is pulled from a language other than the decoy one.
 $env:LALADUB_ARTIFACT_CROSS_LANGUAGE_SHARE = "0.15"
 $env:LALADUB_ARTIFACT_MAX_SEGMENTS = "14"
-$env:LALADUB_ARTIFACT_RATIO = "0.20"
+# Denser than before: artifacts no longer delete the lines they merely
+# clip, so more of them fit without costing dialogue. 0.20 was the old
+# effective value, when this setting was ignored outright.
+$env:LALADUB_ARTIFACT_RATIO = "0.30"
 $env:LALADUB_ARTIFACT_MIN_SOURCE_SEGMENTS = "5"
 $env:LALADUB_ARTIFACT_MIN_GAP_SECONDS = "0.5"
 $env:LALADUB_DISTORT_TRANSLATION = "1"

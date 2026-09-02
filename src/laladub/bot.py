@@ -4011,7 +4011,10 @@ def _apply_translation_chaos(config: DubConfig, job: dict[str, Any], settings: B
             "en,ja,ko,tr,en|en,th,he,en"
         )
         config.translation_second_pass_ratio = max(settings.translation_second_pass_ratio, 0.72)
-        config.artifact_ratio = 0.20
+        # Was pinned at 0.20, which silently ignored LALADUB_ARTIFACT_RATIO in
+        # the mode nearly every job uses (3416 of 3552). The floor keeps the
+        # old density as the minimum; raising the setting now actually works.
+        config.artifact_ratio = max(settings.artifact_ratio, 0.20)
         config.artifact_max_segments = max(config.artifact_max_segments, 64)
         return
 

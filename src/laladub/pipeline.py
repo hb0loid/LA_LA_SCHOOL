@@ -987,7 +987,11 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
                         config.source_lang = timing_lang
                         config.force_source_language = False
                         config.inject_artifacts = bool(artifact_lang)
-                        config.artifact_ratio = 0.20
+                        # Third copy of this constant - the other two are in
+                        # bot.py and job_runner.py - and the one that actually
+                        # won, so raising LALADUB_ARTIFACT_RATIO did nothing at
+                        # all. Keep 0.20 as the floor, let a higher setting through.
+                        config.artifact_ratio = max(config.artifact_ratio, 0.20)
                         segments = [
                             Segment(start=item.start, end=item.end, text=item.text)
                             for item in timing_segments
@@ -3212,12 +3216,24 @@ def _chaos_ranges_conflict(left_start: float, left_end: float, right_start: floa
     return overlap / shortest >= 0.35
 
 
+# A base line is dropped only when an artifact genuinely takes its place. The
+# old thresholds - 0.6s of overlap, or 35% of the line - meant two artifacts
+# displaced four real lines (median, over 617 jobs), because an artifact is
+# longer than the short lines it lands among and clipped each of them.
+#
+# Overlapping speech was the reason for that caution, from the days when TTS
+# could not fit a target duration. The mix handles overlap now: it ducks and
+# separates conflicting spans. Two dubbed lines briefly over each other is a
+# far smaller loss than deleting one of them outright.
+CHAOS_ARTIFACT_DISPLACEMENT_SHARE = 0.7
+
+
 def _base_segment_replaced_by_chaos_artifact(segment: Segment, ranges: list[tuple[float, float]]) -> bool:
     if segment.duration <= 0.0:
         return False
     for start, end in ranges:
         overlap = _overlap_seconds(segment.start, segment.end, start, end)
-        if overlap >= 0.6 or overlap / segment.duration >= 0.35:
+        if overlap / segment.duration >= CHAOS_ARTIFACT_DISPLACEMENT_SHARE:
             return True
     return False
 
