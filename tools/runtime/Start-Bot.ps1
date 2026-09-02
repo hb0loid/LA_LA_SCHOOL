@@ -301,7 +301,9 @@ $env:LALADUB_ARTIFACT_MAX_SEGMENTS = "14"
 # clip, so more of them fit without costing dialogue. 0.20 was the old
 # effective value, when this setting was ignored outright.
 $env:LALADUB_ARTIFACT_RATIO = "0.30"
-$env:LALADUB_ARTIFACT_MIN_SOURCE_SEGMENTS = "5"
+# At 5 a third of all jobs (1011 of 3085) got no artifacts at all - the
+# median job has only 8 lines. At 3 that falls to 17%.
+$env:LALADUB_ARTIFACT_MIN_SOURCE_SEGMENTS = "3"
 $env:LALADUB_ARTIFACT_MIN_GAP_SECONDS = "0.5"
 $env:LALADUB_DISTORT_TRANSLATION = "1"
 $env:LALADUB_TRANSLATION_PIVOTS = "input,en|input,ja,en|input,tr,de,en|en,de|en,fr|en,es|en,ja,ko|en,tr,ar|input,en,de|input,ja,ko,en|input,tr,ar,en|en,th,he,en|en,ms,he,en"
