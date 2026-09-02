@@ -1057,6 +1057,8 @@ def _max_file_mb_for(
     return settings.max_file_mb
 
 
+_CENSOR_MARK_PATTERN: object = None
+
 _PREMIUM_ONLY_TEXT = "Это премиум-функция. Оформить: /premium"
 
 
@@ -4983,15 +4985,69 @@ def _lalaschool_filename(source_title: str, suffix: str) -> str:
     return f"{base}{suffix}"
 
 
-def _read_transcript_text(srt_path: Path) -> str:
+def _censor_replacement_pattern() -> "re.Pattern[str] | None":
+    """Matches any phrase the censor swaps words for.
+
+    The censor leaves no marker of its own - it just substitutes - but every
+    substitution comes from a known bank, so the bank is the marker.
+    """
+    global _CENSOR_MARK_PATTERN
+    if _CENSOR_MARK_PATTERN is not None:
+        return _CENSOR_MARK_PATTERN or None
+    try:
+        from .censor import _ACTIVE_REPLACEMENTS
+    except Exception:
+        _CENSOR_MARK_PATTERN = False
+        return None
+    phrases = sorted({p.strip() for p in _ACTIVE_REPLACEMENTS if p and p.strip()}, key=len, reverse=True)
+    if not phrases:
+        _CENSOR_MARK_PATTERN = False
+        return None
+    _CENSOR_MARK_PATTERN = re.compile("|".join(re.escape(p) for p in phrases), re.IGNORECASE)
+    return _CENSOR_MARK_PATTERN
+
+
+def _artifact_texts(job_dir: Path) -> set[str]:
+    """Normalised text of every artifact that was actually injected."""
+    path = job_dir / "work" / "debug" / "artifact_injected.srt"
+    if not path.is_file():
+        return set()
+    texts: set[str] = set()
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.isdigit() or "-->" in stripped:
+            continue
+        texts.add(_transcript_key(stripped))
+    return texts
+
+
+def _transcript_key(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+def _mark_transcript_line(line: str, artifacts: set[str]) -> str:
+    """Upper-cases whole lines that are artifacts, and censored phrases inside
+    the rest, so it is visible at a glance which words are the bot's own and
+    which came from the video."""
+    if _transcript_key(line) in artifacts:
+        return line.upper()
+    pattern = _censor_replacement_pattern()
+    if pattern is None:
+        return line
+    return pattern.sub(lambda match: match.group(0).upper(), line)
+
+
+def _read_transcript_text(srt_path: Path, *, mark: bool = True) -> str:
     if not srt_path.exists():
         return ""
+    # work/translated.srt -> the job folder two levels up.
+    artifacts = _artifact_texts(srt_path.parent.parent) if mark else set()
     lines: list[str] = []
     for line in srt_path.read_text(encoding="utf-8", errors="replace").splitlines():
         stripped = line.strip()
         if not stripped or stripped.isdigit() or "-->" in stripped:
             continue
-        lines.append(stripped)
+        lines.append(_mark_transcript_line(stripped, artifacts) if mark else stripped)
     return re.sub(r"\s+", " ", " ".join(lines)).strip()
 
 
