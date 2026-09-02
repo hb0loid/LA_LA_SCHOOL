@@ -11,6 +11,14 @@ from typing import Any, Iterable
 
 
 _WRITE_LOCK = threading.Lock()
+# The pipeline keeps getting faster, and old jobs do not expire on their own.
+# Measured the day artifacts moved to the catalogue: jobs older than a day
+# averaged 613 seconds of work per minute of video, jobs from that day 311 -
+# but 539 old samples against 109 fresh ones dragged every estimate towards
+# the old figure. Only the newest samples are used, so a speed-up shows up in
+# the estimate within a few hundred jobs instead of never.
+RECENT_SAMPLE_LIMIT = 150
+
 _MIN_SAMPLE_SECONDS = 10.0
 _MAX_SAMPLE_SECONDS = 8 * 60 * 60.0
 
@@ -21,6 +29,13 @@ class RuntimeEstimate:
     low_seconds: float
     high_seconds: float
     sample_count: int
+
+
+def _most_recent(samples: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if limit <= 0 or len(samples) <= limit:
+        return samples
+    ordered = sorted(samples, key=lambda item: _number(item.get("recorded_at")) or 0.0)
+    return ordered[-limit:]
 
 
 def _number(value: object) -> float | None:
@@ -210,6 +225,7 @@ class PerformanceHistory:
             candidates = [sample for sample in self._samples if str(sample.get("mode") or "dub") == mode]
         if len(candidates) < 5:
             candidates = list(self._samples)
+        candidates = _most_recent(candidates, RECENT_SAMPLE_LIMIT)
         predictions = self._scaled_predictions(candidates, duration)
         if len(predictions) < 3:
             return None

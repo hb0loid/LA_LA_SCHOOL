@@ -3911,6 +3911,21 @@ def _target_lang_value(value: Any) -> str:
     return text if text in {"ru", "uk", "en"} else "ru"
 
 
+def _source_lang_label(value: Any) -> str:
+    code = str(value or "auto").strip()
+    return next((label for item, label in SOURCE_LANGS if item == code), code)
+
+
+def _queued_detail(job: dict[str, Any], target_lang: Any) -> str:
+    # An arrow rather than "с вьетнамского на русский": the language names are
+    # stored in the nominative, and declining them correctly is a bigger
+    # problem than it is worth solving for a status line.
+    source = str(job.get("source_lang") or "auto")
+    where_from = "Любой язык" if source == "auto" else _source_lang_label(source)
+    voices = _speaker_count_label(job.get("speaker_count")).lower()
+    return f"{where_from} → {_target_lang_label(target_lang)}, голоса: {voices}"
+
+
 def _target_lang_label(value: Any) -> str:
     target_lang = _target_lang_value(value)
     return next((label for code, label in TARGET_LANGS if code == target_lang), target_lang)
@@ -4448,15 +4463,10 @@ async def _process_job(
             "В очереди",
             1,
             100,
-            (
-                f"вход={job.get('source_lang') or 'auto'}, "
-                f"цель={target_lang}, "
-                f"метод={_asr_method_label(job.get('asr_method') or settings.default_asr_method)}, "
-                f"голоса={_speaker_count_label(job.get('speaker_count'))}, "
-                f"TTS={_tts_method_label(tts_provider)}, "
-                f"ASR={config.asr_backend} {config.whisper_model}, "
-                f"pivot={config.input_pivot_lang or '-'}"
-            ),
+            # What the person chose, in words. The engine, the ASR backend and
+            # the pivot were in here too, but they are not choices any more -
+            # there is one engine - and reading them told nobody anything.
+            _queued_detail(job, target_lang),
         )
         if status_message is not None:
             await _safe_edit_status(status_message, progress.render())
