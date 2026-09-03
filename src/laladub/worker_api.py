@@ -108,6 +108,10 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
                 self._send_error(401, "unauthorized")
                 return
             self._note_seen(parsed)
+            if parsed.path == "/api/v1/worker/report":
+                self._print_worker_report(self._read_json())
+                self._send_json({"ok": True})
+                return
             job_id, suffix = self._match_job_path(parsed.path)
             if not job_id:
                 self._send_error(404, "not found")
@@ -154,6 +158,25 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:
         print(f"Worker API: {self.address_string()} - {format % args}", flush=True)
+
+    def _print_worker_report(self, payload: dict[str, Any]) -> None:
+        """Puts the worker's own log tail into the coordinator's log.
+
+        Nothing on the laptop answers from outside, so a worker that dies takes
+        the explanation with it. This is that explanation, arriving by the only
+        route there is: the worker itself, on the way back up.
+        """
+        worker_id = str(payload.get("worker_id") or "worker").strip() or "worker"
+        sections = payload.get("sections")
+        if not isinstance(sections, dict):
+            return
+        for name, body in sections.items():
+            text = str(body or "").strip()
+            if not text:
+                continue
+            print(f"--- worker report [{worker_id}] {name} ---", flush=True)
+            print(text, flush=True)
+            print(f"--- end worker report [{worker_id}] {name} ---", flush=True)
 
     def _note_seen(self, parsed: Any) -> None:
         """Marks the worker alive straight from this thread.

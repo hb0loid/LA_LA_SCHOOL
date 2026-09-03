@@ -61,6 +61,10 @@ def main(argv: list[str] | None = None) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     _ensure_windows_autostart()
     print(f"LaLaDub worker started: id={worker_id} server={server} workdir={workdir}", flush=True)
+    try:
+        _report_startup_logs(client, workdir)
+    except Exception as exc:
+        print(f"Startup log report failed: {type(exc).__name__}: {exc}", flush=True)
 
     if args.auto_update and _remote_update_available(client):
         print("Worker update is available. Restarting through launcher.", flush=True)
@@ -114,6 +118,21 @@ class CoordinatorClient:
         if not isinstance(response, dict):
             raise RuntimeError(f"Bad lease response: {response!r}")
         return response
+
+    def send_startup_report(self, sections: dict[str, str]) -> None:
+        """Hands the coordinator the tail of this worker's own logs.
+
+        The link only ever runs one way - the laptop dials the main PC, and
+        nothing on the laptop answers from outside. So when a worker vanishes,
+        the reason is written down on a machine nobody can read from the other
+        side. Sending it on the way back up closes that gap.
+        """
+        self._request_json(
+            "POST",
+            "/api/v1/worker/report",
+            {"worker_id": self.worker_id, "sections": sections},
+            timeout=30,
+        )
 
     def worker_manifest(self) -> dict[str, Any] | None:
         response = self._request_json("GET", "/api/v1/worker/manifest")
@@ -327,6 +346,53 @@ def _settings_for_worker_job(settings: BotSettings, job: dict[str, Any]) -> BotS
     if str(job.get("remote_stage") or "").strip().lower() != "preprocess" or not _cuda_available():
         return settings
     return replace(settings, artifact_whisper_device="cuda")
+
+
+# Enough to cover a crash and the minutes before it, small enough to sit in a
+# log line without drowning everything else in it.
+REPORT_TAIL_BYTES = 6000
+
+
+def _log_tail(path: Path, limit: int = REPORT_TAIL_BYTES) -> str:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > limit:
+                handle.seek(size - limit)
+            data = handle.read()
+    except Exception:
+        return ""
+    text = data.decode("utf-8", errors="replace").strip()
+    if size > limit:
+        # The first line is half a line; drop it rather than report a fragment.
+        text = text.split("\n", 1)[-1]
+    return text
+
+
+def _worker_log_dir(workdir: Path) -> Path:
+    """Where the launcher keeps worker.log and worker-supervisor.log.
+
+    The supervisor runs the worker from the package root and passes
+    runs/worker as the workdir, so the logs sit two levels up from it. Falling
+    back to the current directory covers a worker started by hand.
+    """
+    candidates = [workdir.parent.parent / "logs", Path.cwd() / "logs"]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return candidates[-1]
+
+
+def _report_startup_logs(client: CoordinatorClient, workdir: Path) -> None:
+    log_dir = _worker_log_dir(workdir)
+    sections = {}
+    for name in ("worker-supervisor.log", "worker.log"):
+        tail = _log_tail(log_dir / name)
+        if tail:
+            sections[name] = tail
+    if not sections:
+        return
+    client.send_startup_report(sections)
 
 
 def _lease_heartbeat_loop(client: CoordinatorClient, job_id: str, stop: threading.Event) -> None:
