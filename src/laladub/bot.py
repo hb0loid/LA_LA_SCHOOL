@@ -1359,7 +1359,8 @@ async def queue_status(update: Any, context: Any) -> None:
         lines.append(waiting)
     else:
         lines.append("⏳ Очередь пуста")
-    lines.append(f"👤 Пользователей с задачами: {live['active_users']}")
+    busy_users = live.get("busy_users", live["active_users"])
+    lines.append(f"👤 Пользователей с задачами: {busy_users}")
 
     # Anything on disk that the live scheduler does not know about is a job left
     # behind by a restart - that is the only part of the file scan worth showing.
@@ -3681,7 +3682,13 @@ class _JobScheduler:
                 item.remote_last_seen_at = now
                 if not worker_id:
                     worker_id = item.worker_id
-        name = str(worker_id or address or "").strip()
+        # Only a worker that named itself gets an entry here. Keying one by the
+        # address it came from listed the same laptop twice - and since only the
+        # named half was ever marked busy, the other half read as a worker
+        # standing idle forever. The main PC defers to an idle worker, so it
+        # deferred to a machine that did not exist and the queue stopped moving.
+        # Liveness does not need the name: remote_traffic_at above has it.
+        name = str(worker_id or "").strip()
         if not name:
             return
         state = dict(self._remote_workers.get(name) or {})
@@ -3744,6 +3751,12 @@ class _JobScheduler:
                 "online_machines": local_machine_total + remote_counts["online"],
                 "busy_machines": local_machine_busy + remote_counts["busy"],
                 "active_users": len(self._active_by_user),
+                # Counting only running jobs read as nonsense next to a queue of
+                # nine: "waiting: 9, users with jobs: 0".
+                "busy_users": len(
+                    {item.user_id for _p, _s, item in self._pending if item.user_id is not None}
+                    | {user_id for user_id, count in self._active_by_user.items() if count}
+                ),
                 "pending_total": pending_total,
                 "pending_premium": pending_premium,
                 "pending_normal": pending_total - pending_premium,

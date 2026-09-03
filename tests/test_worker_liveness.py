@@ -116,7 +116,11 @@ class ReclaimTests(unittest.TestCase):
                 scheduler = _scheduler(Path(tempdir))
                 scheduler.note_worker_seen(None, "no-such-job", "192.168.1.67")
                 self.assertGreater(scheduler.remote_traffic_at, 0.0)
-                self.assertIn("192.168.1.67", scheduler._remote_workers)
+                # And it must NOT invent a worker out of the address: listing
+                # the same laptop twice left a phantom that read as permanently
+                # idle, and the main PC defers to an idle worker - so nine jobs
+                # sat still while both machines showed as free.
+                self.assertEqual(scheduler._remote_workers, {})
 
         asyncio.run(run())
 
