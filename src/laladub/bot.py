@@ -2738,6 +2738,11 @@ def _find_recoverable_jobs(settings: BotSettings) -> list[dict[str, Any]]:
     return [job for _updated_at, job in candidates]
 
 
+# Downloading the package, unpacking it and starting Python again takes well
+# under this on the laptop; anything longer is a real absence worth hearing.
+WORKER_UPDATE_QUIET_SECONDS = 300.0
+
+
 async def _worker_presence_loop(application: object) -> None:
     """Says out loud when the worker goes missing, and when it returns.
 
@@ -2755,6 +2760,12 @@ async def _worker_presence_loop(application: object) -> None:
     while True:
         try:
             live = await scheduler.snapshot()
+            # A worker that just took an update is restarting into it, which is
+            # a minute or two of silence we caused ourselves. Not news.
+            served_at = float(application.bot_data.get("worker_update_served_at") or 0.0)
+            if time.time() - served_at < WORKER_UPDATE_QUIET_SECONDS:
+                await asyncio.sleep(60)
+                continue
             message = presence.observe(int(live.get("remote_workers_online") or 0))
             if message:
                 print(f"Worker presence: {message.splitlines()[0]}", flush=True)

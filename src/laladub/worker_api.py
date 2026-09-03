@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import time
 import json
 import os
 import re
@@ -72,6 +73,10 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
                 if package_path is None:
                     self._send_error(404, "worker package not found")
                     return
+                # Downloading this means the worker is about to restart into
+                # it. Remember when, so the presence watcher does not report a
+                # deploy of our own making as a worker that went missing.
+                self.server.context.application.bot_data["worker_update_served_at"] = time.time()
                 self._send_file(package_path)
                 return
             if parsed.path == "/api/v1/jobs/lease":
