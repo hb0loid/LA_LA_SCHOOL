@@ -27,6 +27,7 @@ from .proposal_store import ProposalStore, ScheduledPost, Submission
 # How far apart consecutive posts to the same channel are spaced when /timer
 # delayed posting is on.
 DELAYED_POST_INTERVAL_SECONDS = 30 * 60
+TELEGRAM_TEXT_LIMIT = 4000
 
 
 @dataclass(frozen=True, slots=True)
@@ -1067,17 +1068,17 @@ async def comment_on_channel_forward(update: Any, context: Any) -> None:
                 flush=True,
             )
     if text:
-        if len(text) > 4000:
-            text = text[:4000] + "…"
-
-        async def send_text() -> None:
-            await context.bot.send_message(
-                chat_id=message.chat_id, text=text, reply_to_message_id=message.message_id
-            )
-
         try:
-            await _send_respecting_flood_limit(send_text)
-            delivered = True
+            for text_part in _split_telegram_text(text):
+                async def send_text(part: str = text_part) -> None:
+                    await context.bot.send_message(
+                        chat_id=message.chat_id,
+                        text=part,
+                        reply_to_message_id=message.message_id,
+                    )
+
+                await _send_respecting_flood_limit(send_text)
+                delivered = True
         except Exception as exc:
             print(f"Comment post failed for submission {submission.id}: {type(exc).__name__}: {exc}", flush=True)
 
@@ -1087,6 +1088,27 @@ async def comment_on_channel_forward(update: Any, context: Any) -> None:
         # post permanently marked as commented.
         await asyncio.to_thread(store.clear_comment_posted, submission.id)
         print(f"Comment claim released for submission {submission.id}: nothing was sent", flush=True)
+
+
+def _split_telegram_text(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+    """Split a transcript without truncating it or breaking ordinary words."""
+    remaining = text.strip()
+    if not remaining:
+        return []
+    if limit < 1:
+        raise ValueError("Telegram text limit must be positive")
+
+    parts: list[str] = []
+    while len(remaining) > limit:
+        newline_cut = remaining.rfind("\n", 0, limit + 1)
+        space_cut = remaining.rfind(" ", 0, limit + 1)
+        boundary = max(newline_cut, space_cut)
+        cut = boundary + 1 if boundary >= limit // 2 else limit
+        parts.append(remaining[:cut])
+        remaining = remaining[cut:]
+    if remaining:
+        parts.append(remaining)
+    return parts
 
 
 def _parse_ids(raw: str) -> set[int]:

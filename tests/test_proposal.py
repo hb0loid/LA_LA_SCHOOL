@@ -26,6 +26,7 @@ from laladub.proposal_bot import (
     _moderation_keyboard,
     _process_scheduled_post,
     _transcript_text_for_submission,
+    _split_telegram_text,
     clean_command,
     comment_on_channel_forward,
     moderation_callback,
@@ -547,6 +548,27 @@ class CommentOnChannelForwardTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(call["chat_id"], -2002)
             self.assertEqual(call["reply_to_message_id"], 7)
             self.assertEqual(call["text"], "Привет мир")
+
+    async def test_long_transcript_is_posted_in_multiple_replies_without_truncation(self) -> None:
+        with tempfile.TemporaryDirectory() as job_tempdir:
+            job_dir = Path(job_tempdir)
+            transcript = ("длинная строка " * 700).strip()
+            (job_dir / "video_transcript_lalaschool.txt").write_text(transcript, encoding="utf-8")
+            self._publish(job_dir=job_dir)
+
+            send_spy = _SendMessageSpy()
+            await comment_on_channel_forward(self._forward_update(), self._context(send_spy))
+
+            self.assertGreater(len(send_spy.calls), 1)
+            self.assertTrue(all(len(call["text"]) <= 4000 for call in send_spy.calls))
+            self.assertEqual("".join(call["text"] for call in send_spy.calls), transcript)
+            self.assertTrue(all(call["reply_to_message_id"] == 7 for call in send_spy.calls))
+
+    def test_split_telegram_text_hard_splits_a_single_oversized_word(self) -> None:
+        text = "я" * 9001
+        parts = _split_telegram_text(text)
+        self.assertEqual([len(part) for part in parts], [4000, 4000, 1001])
+        self.assertEqual("".join(parts), text)
 
     async def test_does_not_post_twice_for_the_same_submission(self) -> None:
         with tempfile.TemporaryDirectory() as job_tempdir:

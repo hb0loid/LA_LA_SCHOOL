@@ -1317,7 +1317,14 @@ async def queue_status(update: Any, context: Any) -> None:
     settings: BotSettings = context.application.bot_data["settings"]
     scheduler: _JobScheduler = context.application.bot_data["job_scheduler"]
     live = await scheduler.snapshot()
-    disk_counts = await asyncio.to_thread(_job_status_counts, settings.workdir)
+    # This is only a diagnostic cross-check for recently stranded work.  The
+    # live scheduler already owns the real queue, so walking the whole 30-day
+    # archive here just makes /queue appear dead on a large F: drive.
+    disk_counts = await asyncio.to_thread(
+        _job_status_counts,
+        settings.workdir,
+        newer_than=time.time() - 2 * 86400,
+    )
 
     live_total = live["active_total"] + live["pending_total"]
 
@@ -3137,7 +3144,12 @@ class _JobScheduler:
                     for item in self._leased.values()
                     if item.execution_kind == "remote_preprocess"
                     and now - float(item.remote_last_seen_at or 0.0)
-                    > (90.0 if item.remote_heartbeat_seen else 1200.0)
+                    # Heartbeats come every 10 seconds, so 90 was nine misses -
+                    # except one slow post could block the worker's heartbeat
+                    # thread for longer than that on its own, and the job was
+                    # taken away from a worker still running it. Nine jobs were
+                    # lost that way and redone on the main PC.
+                    > (240.0 if item.remote_heartbeat_seen else 1200.0)
                 ]
                 await self._dispatch_locked(context)
             for item in stale:
@@ -3217,6 +3229,13 @@ class _JobScheduler:
         async with self._lock:
             item = self._leased.get(job_id)
             if item is None:
+                # The job is gone - reclaimed after a heartbeat timeout, or
+                # already finished elsewhere - but the worker plainly is not.
+                # Dropping the whole post used to make a busy worker look
+                # offline until it finished and asked for its next lease.
+                reported = str(payload.get("worker_id") or "").strip()
+                if reported:
+                    self._mark_remote_worker_locked(reported, active_job_id=None)
                 return
             item.remote_last_seen_at = time.time()
             if item.worker_id:
@@ -3691,7 +3710,7 @@ def _safe_upload_name(value: str) -> str:
     return value[:180]
 
 
-def _job_status_counts(workdir: Path) -> dict[str, int]:
+def _job_status_counts(workdir: Path, *, newer_than: float | None = None) -> dict[str, int]:
     """Counts job.json files by status, skipping terminal ones (done/failed/
     rejected) - this feeds the "stuck job" cross-check against the live
     scheduler, and the retention window means those already number in the
@@ -3699,7 +3718,30 @@ def _job_status_counts(workdir: Path) -> dict[str, int]:
     counts: dict[str, int] = {}
     if not workdir.exists():
         return counts
-    for path in workdir.rglob("job.json"):
+    # Jobs always live at <workdir>/<user id>/<job number>/job.json.  A
+    # recursive walk also descends into every job's large ``work`` tree on F:,
+    # which made /queue take minutes once the archive grew to thousands of
+    # jobs.  Inspect the fixed layout and, for the interactive status command,
+    # do not even open inactive user trees from the old archive.
+    paths: list[Path] = []
+    for user_dir in workdir.iterdir():
+        try:
+            if not user_dir.is_dir():
+                continue
+            if newer_than is not None and user_dir.stat().st_mtime < newer_than:
+                continue
+            for job_dir in user_dir.iterdir():
+                if not job_dir.is_dir():
+                    continue
+                if newer_than is not None and job_dir.stat().st_mtime < newer_than:
+                    continue
+                path = job_dir / "job.json"
+                if path.is_file():
+                    paths.append(path)
+        except OSError:
+            continue
+
+    for path in paths:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:

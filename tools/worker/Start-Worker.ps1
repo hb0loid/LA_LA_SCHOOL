@@ -7,9 +7,18 @@ $StatePath = Join-Path $Root ".worker_state.json"
 $UpdatesDir = Join-Path $Root "updates"
 $WorkDir = Join-Path $Root "runs\worker"
 $LockPath = Join-Path $Root ".worker.lock"
+$LogDir = Join-Path $Root "logs"
+$WorkerLog = Join-Path $LogDir "worker.log"
+$SupervisorLog = Join-Path $LogDir "worker-supervisor.log"
 
 Set-Location -LiteralPath $Root
-New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+New-Item -ItemType Directory -Force -Path $WorkDir,$LogDir | Out-Null
+
+function Write-SupervisorLog([string]$Message) {
+  $line = "$(Get-Date -Format s) $Message"
+  Add-Content -LiteralPath $SupervisorLog -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
+  Write-Host $line
+}
 
 try {
   $WorkerLock = [IO.File]::Open($LockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
@@ -29,10 +38,12 @@ function Install-WorkerAutostart {
     $healthTrigger = New-ScheduledTaskTrigger `
       -Once `
       -At ((Get-Date).AddMinutes(1)) `
-      -RepetitionInterval (New-TimeSpan -Minutes 5) `
+      -RepetitionInterval (New-TimeSpan -Minutes 1) `
       -RepetitionDuration (New-TimeSpan -Days 3650)
     $settings = New-ScheduledTaskSettingsSet `
       -MultipleInstances IgnoreNew `
+      -RestartCount 999 `
+      -RestartInterval (New-TimeSpan -Minutes 1) `
       -StartWhenAvailable `
       -DontStopIfGoingOnBatteries `
       -AllowStartIfOnBatteries `
@@ -40,7 +51,7 @@ function Install-WorkerAutostart {
     $settings.Hidden = $true
     Register-ScheduledTask `
       -TaskName $taskName `
-      -Description "Starts the LaLaDub laptop worker and checks it every five minutes." `
+      -Description "Keeps the LaLaDub laptop worker running and recovers it within one minute." `
       -Action $action `
       -Trigger @($logonTrigger, $healthTrigger) `
       -Settings $settings `
@@ -301,7 +312,7 @@ if (-not $env:LALADUB_MAX_PHRASE_REPEATS) { $env:LALADUB_MAX_PHRASE_REPEATS = "2
 if (-not $env:LALADUB_MAX_WORD_REPEATS) { $env:LALADUB_MAX_WORD_REPEATS = "3" }
 if (-not $env:LALADUB_INJECT_ARTIFACTS) { $env:LALADUB_INJECT_ARTIFACTS = "1" }
 if (-not $env:LALADUB_ARTIFACT_MAX_SEGMENTS) { $env:LALADUB_ARTIFACT_MAX_SEGMENTS = "14" }
-if (-not $env:LALADUB_ARTIFACT_RATIO) { $env:LALADUB_ARTIFACT_RATIO = "0.30" }
+if (-not $env:LALADUB_ARTIFACT_RATIO) { $env:LALADUB_ARTIFACT_RATIO = "0.20" }
 if (-not $env:LALADUB_ARTIFACT_MIN_SOURCE_SEGMENTS) { $env:LALADUB_ARTIFACT_MIN_SOURCE_SEGMENTS = "3" }
 if (-not $env:LALADUB_ARTIFACT_MIN_GAP_SECONDS) { $env:LALADUB_ARTIFACT_MIN_GAP_SECONDS = "0.5" }
 # Artifacts come from assets/hallucinations, not a second Whisper pass.
@@ -334,15 +345,52 @@ if (-not (Test-Path -LiteralPath $python)) {
   $python = "python"
 }
 
-Write-Host "Starting worker $workerId -> $server"
+Write-SupervisorLog "Supervisor started: worker=$workerId server=$server"
 while ($true) {
-  Invoke-WorkerUpdate -ServerUrl $server -WorkerToken $token
-  & $python -m laladub.worker --server $server --token $token --worker-id $workerId --workdir $WorkDir
-  $exitCode = $LASTEXITCODE
+  $updateFailed = $false
+  try {
+    Invoke-WorkerUpdate -ServerUrl $server -WorkerToken $token
+  } catch {
+    $updateFailed = $true
+    Write-SupervisorLog "Update failed; starting the installed worker: $($_.Exception.Message)"
+  }
+
+  $workerArguments = @(
+    "-m", "laladub.worker",
+    "--server", $server,
+    "--token", $token,
+    "--worker-id", $workerId,
+    "--workdir", $WorkDir
+  )
+  # If installing an update failed, do not let the worker immediately request
+  # that same update and enter a restart loop.  The supervisor will try again
+  # after the worker's next genuine restart.
+  if ($updateFailed) {
+    $workerArguments += "--no-auto-update"
+  }
+
+  Write-SupervisorLog "Launching worker process."
+  $previousErrorActionPreference = $ErrorActionPreference
+  try {
+    # Windows PowerShell can turn harmless native stderr (for example the
+    # portable Python <exec_prefix> notice) into a terminating NativeCommandError
+    # while the worker itself is still healthy.  Keep both streams in the log
+    # and decide success solely from the real process exit code.
+    $ErrorActionPreference = "Continue"
+    & $python @workerArguments *>> $WorkerLog
+    $exitCode = $LASTEXITCODE
+  } catch {
+    $exitCode = 1
+    Write-SupervisorLog "Worker launch failed: $($_.Exception.Message)"
+  } finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
+
   if ($exitCode -eq 42) {
-    Write-Host "Worker requested update restart."
+    Write-SupervisorLog "Worker requested an update restart."
     Start-Sleep -Seconds 2
     continue
   }
-  exit $exitCode
+  Write-SupervisorLog "Worker exited with code $exitCode; restarting in 10 seconds."
+  Start-Sleep -Seconds 10
 }

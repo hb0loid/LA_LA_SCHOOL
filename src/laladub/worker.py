@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> None:
     if not config_path.exists() and not args.no_save_config:
         _save_worker_config(config_path, {"server": server, "token": token, "worker_id": worker_id})
 
-    client = CoordinatorClient(server, token)
+    client = CoordinatorClient(server, token, worker_id)
     token = _rotate_worker_token(
         client,
         config_path=config_path,
@@ -90,9 +90,13 @@ def main(argv: list[str] | None = None) -> None:
 
 
 class CoordinatorClient:
-    def __init__(self, server: str, token: str) -> None:
+    def __init__(self, server: str, token: str, worker_id: str = "worker") -> None:
         self.server = server.rstrip("/")
         self.token = token
+        # Sent with every progress and heartbeat post. The coordinator needs it
+        # to tell a worker is alive even when the job it reports on is one the
+        # coordinator has already taken back.
+        self.worker_id = str(worker_id or "worker")
         self._parsed = urllib.parse.urlparse(self.server)
         if self._parsed.scheme not in {"http", "https"}:
             raise ValueError("Worker server must be http:// or https:// URL.")
@@ -129,14 +133,19 @@ class CoordinatorClient:
                 "current": current,
                 "total": total,
                 "detail": detail,
+                "worker_id": self.worker_id,
             },
         )
 
     def heartbeat(self, job_id: str) -> None:
+        # A short timeout on purpose. The coordinator drops the lease after a
+        # fixed silence; a single call blocking on the default timeout outlasts
+        # that window, so the job is taken away from a worker still running it.
         self._request_json(
             "POST",
             f"/api/v1/jobs/{urllib.parse.quote(job_id)}/progress",
-            {"heartbeat_only": True},
+            {"heartbeat_only": True, "worker_id": self.worker_id},
+            timeout=20,
         )
 
     def upload_file(self, job_id: str, kind: str, path: Path) -> None:
@@ -161,6 +170,7 @@ class CoordinatorClient:
         payload: dict[str, Any] | None = None,
         *,
         none_on_204: bool = False,
+        timeout: float = 120,
     ) -> Any:
         data = None
         headers = self._auth_headers()
@@ -169,7 +179,7 @@ class CoordinatorClient:
             headers["Content-Type"] = "application/json; charset=utf-8"
         request = urllib.request.Request(self._url(path), data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 if response.status == 204 and none_on_204:
                     return None
                 body = response.read()

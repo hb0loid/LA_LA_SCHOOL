@@ -12,10 +12,12 @@ $logonTrigger.Delay = "PT30S"
 $healthTrigger = New-ScheduledTaskTrigger `
   -Once `
   -At ((Get-Date).AddMinutes(1)) `
-  -RepetitionInterval (New-TimeSpan -Minutes 5) `
+  -RepetitionInterval (New-TimeSpan -Minutes 1) `
   -RepetitionDuration (New-TimeSpan -Days 3650)
 $settings = New-ScheduledTaskSettingsSet `
   -MultipleInstances IgnoreNew `
+  -RestartCount 999 `
+  -RestartInterval (New-TimeSpan -Minutes 1) `
   -StartWhenAvailable `
   -DontStopIfGoingOnBatteries `
   -AllowStartIfOnBatteries `
@@ -24,7 +26,7 @@ $settings.Hidden = $true
 
 Register-ScheduledTask `
   -TaskName $TaskName `
-  -Description "Starts the LaLaDub laptop worker and checks it every five minutes." `
+  -Description "Keeps the LaLaDub laptop worker running and recovers it within one minute." `
   -Action $action `
   -Trigger @($logonTrigger, $healthTrigger) `
   -Settings $settings `

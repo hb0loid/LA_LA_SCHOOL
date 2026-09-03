@@ -10,6 +10,9 @@ class SourceLanguageTests(unittest.TestCase):
     def test_auto_is_offered_first(self) -> None:
         self.assertEqual(SOURCE_LANGS[0][0], "auto")
 
+    def test_familiar_artifact_languages_are_pinned_after_auto(self) -> None:
+        self.assertEqual([code for code, _label in SOURCE_LANGS[:3]], ["auto", "vi", "ru"])
+
     def test_codes_are_unique(self) -> None:
         codes = [code for code, _label in SOURCE_LANGS]
         self.assertEqual(len(codes), len(set(codes)))
