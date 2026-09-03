@@ -1340,7 +1340,13 @@ async def queue_status(update: Any, context: Any) -> None:
             f"({live['remote_workers_busy']}/{live['remote_workers_online']})"
         )
     else:
-        lines.append("📡 Воркер — не на связи")
+        # "Not on the air" is true but says nothing, and most of the time today
+        # it meant the laptop was installing an update we had just published.
+        served_at = float(context.application.bot_data.get("worker_update_served_at") or 0.0)
+        if time.time() - served_at < WORKER_UPDATE_QUIET_SECONDS:
+            lines.append("📡 Воркер — ставит обновление")
+        else:
+            lines.append("📡 Воркер — не на связи")
     if live["remote_workers_stale"]:
         lines.append(f"   ⚠️ без свежего пинга: {live['remote_workers_stale']}")
 
