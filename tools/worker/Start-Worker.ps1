@@ -9,6 +9,10 @@ $WorkDir = Join-Path $Root "runs\worker"
 $LockPath = Join-Path $Root ".worker.lock"
 $LogDir = Join-Path $Root "logs"
 $WorkerLog = Join-Path $LogDir "worker.log"
+$HeartbeatPath = Join-Path $WorkDir "worker_heartbeat.txt"
+# Well above the longest silence a healthy worker has ever shown (four minutes),
+# and far below the two hours the freeze it is meant to catch actually lasted.
+$StallLimitSeconds = 600
 $SupervisorLog = Join-Path $LogDir "worker-supervisor.log"
 
 Set-Location -LiteralPath $Root
@@ -370,20 +374,55 @@ while ($true) {
   }
 
   Write-SupervisorLog "Launching worker process."
-  $previousErrorActionPreference = $ErrorActionPreference
+  # The worker used to run in the foreground here, which recovered a worker that
+  # crashed but not one that froze: the process stayed in Windows, so both the
+  # scheduler and this loop counted it as healthy.  One such freeze lasted two
+  # hours.  Running it as a child leaves this script free to watch it, and this
+  # script keeps running when the interpreter over there stops.
+  Remove-Item -LiteralPath $HeartbeatPath -Force -ErrorAction SilentlyContinue
+  $runOut = Join-Path $LogDir "worker.run.log"
+  $runErr = Join-Path $LogDir "worker.run.err.log"
+  $exitCode = 1
+  $process = $null
   try {
-    # Windows PowerShell can turn harmless native stderr (for example the
-    # portable Python <exec_prefix> notice) into a terminating NativeCommandError
-    # while the worker itself is still healthy.  Keep both streams in the log
-    # and decide success solely from the real process exit code.
-    $ErrorActionPreference = "Continue"
-    & $python @workerArguments *>> $WorkerLog
-    $exitCode = $LASTEXITCODE
+    $process = Start-Process -FilePath $python -ArgumentList $workerArguments `
+      -NoNewWindow -PassThru -RedirectStandardOutput $runOut -RedirectStandardError $runErr
   } catch {
-    $exitCode = 1
     Write-SupervisorLog "Worker launch failed: $($_.Exception.Message)"
-  } finally {
-    $ErrorActionPreference = $previousErrorActionPreference
+  }
+
+  if ($process) {
+    $startedAt = Get-Date
+    $killed = $false
+    while (-not $process.HasExited) {
+      Start-Sleep -Seconds 20
+      $lastSign = $startedAt
+      if (Test-Path -LiteralPath $HeartbeatPath) {
+        $lastSign = (Get-Item -LiteralPath $HeartbeatPath).LastWriteTime
+      }
+      $quiet = [int]((Get-Date) - $lastSign).TotalSeconds
+      if ($quiet -gt $StallLimitSeconds) {
+        # Not "the job is slow" - the worker touches that file from a thread of
+        # its own, so silence here means Python stopped running at all.
+        Write-SupervisorLog "Worker frozen: nothing for ${quiet}s. Killing PID $($process.Id)."
+        & taskkill.exe /PID $process.Id /T /F | Out-Null
+        $killed = $true
+        break
+      }
+    }
+    $process.WaitForExit()
+    $exitCode = if ($killed) { 1 } else { $process.ExitCode }
+  }
+
+  # Start-Process truncates what it redirects, so fold each run into the log the
+  # startup report reads - otherwise a restart erases the evidence of the crash
+  # that caused it.
+  foreach ($runLog in @($runOut, $runErr)) {
+    if (Test-Path -LiteralPath $runLog) {
+      Get-Content -LiteralPath $runLog -ErrorAction SilentlyContinue |
+        Add-Content -LiteralPath $WorkerLog -Encoding UTF8 -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath $runLog -Force -ErrorAction SilentlyContinue
+    }
   }
 
   if ($exitCode -eq 42) {

@@ -59,6 +59,7 @@ def main(argv: list[str] | None = None) -> None:
         save_config=not args.no_save_config,
     )
     workdir.mkdir(parents=True, exist_ok=True)
+    _start_stall_heartbeat(workdir)
     _ensure_windows_autostart()
     print(f"LaLaDub worker started: id={worker_id} server={server} workdir={workdir}", flush=True)
     try:
@@ -386,13 +387,49 @@ def _worker_log_dir(workdir: Path) -> Path:
 def _report_startup_logs(client: CoordinatorClient, workdir: Path) -> None:
     log_dir = _worker_log_dir(workdir)
     sections = {}
-    for name in ("worker-supervisor.log", "worker.log"):
+    for name in ("worker-supervisor.log", "worker.log", "worker.run.err.log"):
         tail = _log_tail(log_dir / name)
         if tail:
             sections[name] = tail
     if not sections:
         return
     client.send_startup_report(sections)
+
+
+# The supervisor watches this file. Touching it is the cheapest thing a healthy
+# process can do, so failing to touch it says something real: not that the work
+# is slow, but that the interpreter itself has stopped running Python.
+STALL_HEARTBEAT_SECONDS = 15.0
+
+
+def _stall_heartbeat_loop(path: Path, stop: threading.Event) -> None:
+    while True:
+        try:
+            path.write_text(str(time.time()), encoding="utf-8")
+        except Exception:
+            pass
+        if stop.wait(STALL_HEARTBEAT_SECONDS):
+            return
+
+
+def _start_stall_heartbeat(workdir: Path) -> Path:
+    """Starts the thread the supervisor uses to tell a hang from a long job.
+
+    A worker that dies is restarted already. A worker that *hangs* was not: the
+    process stayed in Windows, so the scheduler saw it as alive, and one such
+    hang lasted two hours. The watchdog has to live outside this process,
+    because whatever freezes it freezes every thread in here as well - this
+    thread included, which is exactly what makes the silence detectable.
+    """
+    path = workdir / "worker_heartbeat.txt"
+    thread = threading.Thread(
+        target=_stall_heartbeat_loop,
+        args=(path, threading.Event()),
+        name="laladub-stall-heartbeat",
+        daemon=True,
+    )
+    thread.start()
+    return path
 
 
 def _lease_heartbeat_loop(client: CoordinatorClient, job_id: str, stop: threading.Event) -> None:

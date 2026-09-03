@@ -39,5 +39,48 @@ class WorkerReportTests(unittest.TestCase):
             self.assertEqual(_worker_log_dir(root / "runs" / "worker"), root / "logs")
 
 
+
+class StallHeartbeatTests(unittest.TestCase):
+    """A worker that crashes was always restarted. A worker that froze was not:
+    the process stayed in Windows, so everything counted it as healthy, and one
+    freeze lasted two hours. The supervisor watches this file to tell the two
+    apart."""
+
+    def test_the_heartbeat_file_is_written_and_kept_fresh(self) -> None:
+        import threading
+        import time
+
+        from laladub.worker import _stall_heartbeat_loop
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "worker_heartbeat.txt"
+            stop = threading.Event()
+            thread = threading.Thread(target=_stall_heartbeat_loop, args=(path, stop), daemon=True)
+            thread.start()
+            for _ in range(100):
+                if path.exists():
+                    break
+                time.sleep(0.01)
+            stop.set()
+            thread.join(timeout=2)
+            self.assertTrue(path.exists())
+            self.assertGreater(float(path.read_text(encoding="utf-8")), 0.0)
+
+    def test_a_failing_write_does_not_kill_the_thread(self) -> None:
+        import threading
+
+        from laladub.worker import _stall_heartbeat_loop
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            # A directory where the file should be: every write raises.
+            path = Path(tempdir) / "worker_heartbeat.txt"
+            path.mkdir()
+            stop = threading.Event()
+            thread = threading.Thread(target=_stall_heartbeat_loop, args=(path, stop), daemon=True)
+            thread.start()
+            stop.set()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+
 if __name__ == "__main__":
     unittest.main()
