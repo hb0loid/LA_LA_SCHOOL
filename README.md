@@ -2,41 +2,204 @@
 
 Увага! Этот бот на 100 процентов сгенерирован нейросетью, автор не то что за кодинг не шарит, а в принципе за гитхаб и всё из него вытекающее не судите строга :3
 
-Локальный конвейер для перевода и дубляжа видео с Telegram-ботом. Бот оставляет два рабочих режима: сырой текст Whisper и полноценный дубляж с переводом, вырезанием оригинального вокала и XTTS voice cloning.
+Локальный конвейер перевода и дубляжа видео с Telegram-ботом. Всё считается на своих машинах: распознавание, перевод, разделение вокала, синтез речи, сборка видео. Наружу уходит только сам Telegram.
 
-## Возможности
+Главное, что стоит понимать про этот проект: **дубляж здесь ломается намеренно.** Это не баг и не недоделка. Перевод специально гоняется по цепочке промежуточных языков, в текст подсаживаются галлюцинации Whisper из собранного каталога, повторы схлопываются, названия каналов подменяются. Получается тот самый корявый ранний AI-дубляж — ради него всё и затевалось.
 
-- Локальный ASR через `faster-whisper`.
-- Локальный перевод через `argos-translate` или локальный LibreTranslate.
-- Локальная озвучка через Windows SAPI, Piper или XTTS voice cloning.
-- Вырезание оригинального голоса через Demucs: финальный микс может быть "инструментал + новый голос".
-- Сборка финального видео через `ffmpeg`.
-- Telegram-бот: пользователь кидает видео или ссылку на видео, выбирает входной язык и один из двух режимов.
-- Очередь Telegram-задач: бот ограничивает число одновременных дубляжей и ставит paid-пользователей выше в очереди.
-- Режим `Сырой текст`: только оригинальный OpenAI Whisper, без перевода/дубляжа, для ловли ASR-артефактов.
-- Режим `Полноценный дубляж`: перевод, сжатие повторов, Demucs, мультиспикерные XTTS-референсы по сегментам и финальный MP4.
-- Watermark для free-пользователей; paid-пользователи задаются allowlist по Telegram ID.
+---
+
+## Что он умеет
+
+- **46 входных языков**, определение языка автоматом, три языка озвучки: русский, украинский, английский.
+- **Распознавание** — OpenAI Whisper / `faster-whisper` локально.
+- **Перевод** — `argos-translate` локально, с гибридным фоллбэком. Языковые пакеты живут отдельно от кода — путь к ним задаёт `ARGOS_PACKAGES_DIR`.
+- **Порча перевода** — цепочки промежуточных языков (`en → th → he → en` и ещё десяток), второй проход на части строк.
+- **Артефакты** — каталог реальных галлюцинаций Whisper (`assets/hallucinations`), у каждой фразы свой язык, с небольшой вероятностью протекают фразы из чужих языков.
+- **Цензура** — найденный мат и slurs с заданной вероятностью заменяются на предупреждения.
+- **Разделение вокала** — BS-RoFormer или Demucs, финальный микс «инструментал + новый голос».
+- **Голоса** — MOSS TTS с клонированием тембра из оригинала, диаризация через pyannote, до 9 разных голосов на видео.
+- **Видеоряд** — можно оставить исходный, а можно попросить нарезку из своей библиотеки.
+- **Субтитры** — текстовая расшифровка с языками в шапке; артефакты и цензурированные слова помечены КАПСОМ.
+- **Две машины** — основной ПК считает всё, ноутбук-воркер забирает тяжёлую часть себе и сам обновляется по сети.
+- **Предложка** — отдельный бот-модератор публикует одобренное в каналы и начисляет авторам карму.
+
+---
+
+## Как пользоваться ботом
+
+Пользователь кидает видеофайл или ссылку, бот проводит через мастер настроек:
+
+| Шаг | Что спрашивает |
+|---|---|
+| 1 | Видеоряд: оставить исходный или сделать нарезку |
+| 2 | Входной язык (46 вариантов, есть «определить сам») |
+| 3 | Количество голосов: авто или 1–9 |
+| 4 | Язык озвучки: русский / украинский / английский |
+
+Шаги, у которых остался один вариант ответа, бот не показывает — выбирает сам. Постоянные ответы можно один раз задать через `/preset`, тогда мастер их больше не спрашивает.
+
+### Команды
+
+**Для всех:**
+
+- `/start` — короткая инструкция.
+- `/me` — Telegram ID и статус.
+- `/karma` — уровень, дневной лимит минут, прогресс до следующего уровня.
+- `/queue` — что сейчас в работе, кто считает, сколько ждут.
+- `/preset` — постоянные ответы мастера; `/preset reset` сбрасывает.
+- `/show НОМЕР` — прислать готовую работу ещё раз.
+- `/send НОМЕР` — отправить работу в предложку.
+- `/resume` — вернуть свою застрявшую работу в очередь; с номером — конкретную.
+- `/cancel` — сбросить текущую задачу.
+- `/premium`, `/paysupport` — подписка за Telegram Stars и поддержка по оплате.
+
+**Премиум:**
+
+- `/watermark` — управление вотермаркой.
+- `/mycensor` — своя настройка цензуры.
+
+**Админские:**
+
+- `/maintenance` — режим обслуживания.
+- `/censored` — статистика цензуры.
+- `/reviews`, `/starbalance`, `/prem_owners` — отчёты.
+- `/grant_premium`, `/revoke_premium`, `/refund_premium` — выдать, отозвать, вернуть.
+
+### Карма и лимиты
+
+Дневной лимит минут растёт с кармой, которая начисляется за опубликованные в каналах видео:
+
+| Уровень | Карма от | Минут в день | Работ в очереди |
+|---|---|---|---|
+| Участник | 0 | 1 | 1 |
+| Автор | 6 | 5 | 1 |
+| Проверенный автор | 60 | 10 | 2 |
+| Любимчик редакции | 360 | 15 | 2 |
+| Ветеран | 720 | 20 | 3 |
+| Алмазный подписчик | 1440 | 25 | 3 |
+| Легенда La La School | 2880 | 30 | 3 |
+| **Премиум подписка** | — | **60** | **5** |
+
+Премиум — 250 Stars на 30 дней. Даёт высший приоритет в очереди, снятие лимита на размер файла и свои настройки вотермарки и цензуры. **Оплатившие всегда идут впереди остальных**, включая продолжения уже начатых работ.
+
+---
+
+## Две машины
+
+Основной ПК — координатор: держит очередь, отдаёт работу, собирает результат. Ноутбук — воркер: забирает распознавание, перевод и разделение вокала, отдаёт готовый пакет обратно, а озвучка MOSS делается на основном ПК.
+
+- Координатор поднимает HTTP-API на `0.0.0.0:8765`, воркер стучится туда сам — на ноутбуке ничего открывать наружу не нужно.
+- Воркер сам скачивает новую сборку, когда она появляется, и перезапускается.
+- Если воркер молчит дольше двух минут — бот пишет админам. Пока воркер ставит обновление, бот об этом молчит: это не пропажа.
+- Работа, брошенная воркером, возвращается на основной ПК автоматически.
+
+Собрать пакет для ноутбука: `tools/admin/Build-Worker-Package.ps1`. Развернуть: распаковать и запустить `Start-Worker.cmd` — дальше он поставит себе автозапуск и будет подниматься сам.
+
+---
 
 ## Установка
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -e .[asr,translate,bot,clone,separation]
+python -m pip install -e ".[asr,translate,bot,separation,diarization]"
 ```
 
 Проверить окружение:
 
 ```powershell
 laladub doctor
-laladub voices
 ```
 
-`argostranslate` ставит библиотеку, но языковые пакеты Argos нужно установить отдельно. Для первых тестов можно временно поставить `LALADUB_TRANSLATOR=identity`, чтобы проверить бот, ASR, TTS и сборку без реального перевода.
+Тяжёлые движки живут в отдельных окружениях, чтобы не конфликтовать зависимостями: `.venv-f5tts`, `.venv-cosyvoice`, `.venv-diarization`, `.venv-separator`, `.venv-bsroformer`. Путь к каждому задаётся своей переменной (`LALADUB_MOSS_PYTHON`, `LALADUB_DIARIZATION_PYTHON` и так далее).
+
+Языковые пакеты argos ставятся отдельно:
+
+```powershell
+python tools\install_argos_languages.py
+```
+
+---
+
+## Запуск
+
+- `БОТ - ЗАПУСТИТЬ.cmd` / `БОТ - ОСТАНОВИТЬ.cmd` — единственные ручные кнопки. Всё остальное они вызывают сами.
+- `tools/runtime/` — рабочие сценарии: `Start-Bot.ps1`, `Stop-Bot.ps1`, `Start-Proposal-Bot.ps1`, `Watchdog.ps1`, `Install-Autostart.ps1`.
+- `tools/admin/` — сборка пакета воркера, режим обслуживания, ротация токена, логи.
+- Логи — `logs/`, задачи — `runs/bot-release/`, секреты — `.secrets/` (в `.gitignore`).
+
+Токен релизного бота лежит в `.secrets/Release-Bot-Token.ps1`, токен API воркера — в `.secrets/Worker-Api-Token.txt`.
+
+Бэкап всего состояния (базы снимаются на живую, через backup API SQLite):
+
+```powershell
+python tools\backup_bot.py
+```
+
+---
+
+## Настройки
+
+Настроек больше сотни. **Источник правды — `tools/runtime/Start-Bot.ps1`**: там прописано ровно то, с чем бот работает сейчас. `tools/worker/Start-Worker.ps1` держит те же значения для ноутбука — иначе работа получилась бы разной в зависимости от того, какая машина её считала.
+
+Ниже — те, которые меняют чаще всего. В колонке «по умолчанию» стоит значение из кода;
+в рабочей сборке часть из них переопределена — например, `LALADUB_EXECUTOR_MODE=hybrid`,
+`LALADUB_ARTIFACT_RATIO=0.30` и `LALADUB_MAX_SPEAKER_CLUSTERS=9`.
+
+**Обязательное**
+
+| Переменная | Смысл |
+|---|---|
+| `LALADUB_BOT_TOKEN` | токен Telegram-бота |
+| `LALADUB_ADMIN_USERS_FILE` | файл со списком админов |
+| `LALADUB_PAID_USERS_FILE` | файл со списком оплативших |
+
+**Очередь и машины**
+
+| Переменная | По умолчанию | Смысл |
+|---|---|---|
+| `LALADUB_EXECUTOR_MODE` | `local` | `local`, `remote` или `hybrid` |
+| `LALADUB_MAX_ACTIVE_JOBS` | `2` | сколько работ считается одновременно |
+| `LALADUB_MAX_LOCAL_JOBS` | `1` | из них на основном ПК |
+| `LALADUB_WORKER_API_PORT` | `8765` | порт для воркеров |
+| `LALADUB_JOB_RETENTION_SECONDS` | `2592000` | сколько хранить готовые работы (30 дней) |
+
+**Порча перевода и артефакты**
+
+| Переменная | По умолчанию | Смысл |
+|---|---|---|
+| `LALADUB_DISTORT_TRANSLATION` | `1` | гонять перевод по промежуточным языкам |
+| `LALADUB_TRANSLATION_PIVOTS` | длинный список | сами цепочки, через `\|` |
+| `LALADUB_INJECT_ARTIFACTS` | `1` | подсаживать галлюцинации |
+| `LALADUB_ARTIFACT_SOURCE` | `catalog` | `catalog` — из готового банка, `whisper` — искать вторым проходом (медленно) |
+| `LALADUB_ARTIFACT_RATIO` | `0.20` | какая доля строк заменяется |
+| `LALADUB_ARTIFACT_CROSS_LANGUAGE_SHARE` | `0.15` | вероятность утечки фразы из чужого языка |
+| `LALADUB_COLLAPSE_REPETITIONS` | `1` | схлопывать повторы перед озвучкой |
+
+**Голос и звук**
+
+| Переменная | По умолчанию | Смысл |
+|---|---|---|
+| `LALADUB_TTS` | `moss` | движок озвучки |
+| `LALADUB_SEPARATION` | `bsroformer` | разделение вокала: `bsroformer`, `demucs`, `none` |
+| `LALADUB_AUDIO_BED` | `instrumental` | подложка: `instrumental`, `original`, `dub-only`, `multitrack` |
+| `LALADUB_MULTI_SPEAKER` | `1` | свой референс голоса на каждый сегмент |
+| `LALADUB_MAX_SPEAKER_CLUSTERS` | `6` | максимум разных голосов на видео |
+
+**Деньги и лимиты**
+
+| Переменная | По умолчанию | Смысл |
+|---|---|---|
+| `LALADUB_PREMIUM_PRICE_STARS` | `250` | цена подписки |
+| `LALADUB_PREMIUM_DAYS` | `30` | срок подписки |
+| `LALADUB_MAX_FILE_MB` | `200` | лимит размера видео |
+| `LALADUB_MAX_FILE_MB_PREMIUM` | `0` | то же для премиума, `0` — без лимита |
+
+---
 
 ## CLI
 
-Нормальный дубляж без клонирования:
+Бот — не единственный вход. Тот же конвейер доступен напрямую:
 
 ```powershell
 laladub dub ".\input\episode.mp4" `
@@ -44,150 +207,45 @@ laladub dub ".\input\episode.mp4" `
   --source-lang vi `
   --target-lang ru `
   --translator argos `
-  --tts sapi `
-  --voice "Microsoft Irina Desktop" `
-  --glitch-profile clean
-```
-
-Дубляж с клонированием голоса и вырезанием оригинального вокала:
-
-```powershell
-laladub dub ".\input\episode.mp4" `
-  --output ".\runs\episode_ru_clone.mp4" `
-  --source-lang vi `
-  --target-lang ru `
-  --translator argos `
-  --tts xtts `
-  --separation demucs `
-  --audio-bed instrumental `
-  --original-volume 1.0 `
-  --dub-volume 1.0 `
-  --glitch-profile clean
-```
-
-Если есть отдельный чистый референс голоса, лучше использовать его:
-
-```powershell
-laladub dub ".\input\episode.mp4" `
-  --output ".\runs\episode_ru_clone.mp4" `
-  --source-lang vi `
-  --target-lang ru `
-  --tts xtts `
-  --speaker-wav ".\voices\speaker.wav" `
-  --separation demucs `
+  --tts moss `
+  --separation bsroformer `
   --audio-bed instrumental
 ```
 
-Если указать `--source-lang auto` в боте или не указывать `--source-lang` в CLI, Whisper попробует определить язык сам, а переводчик получит найденный язык автоматически.
+Если `--source-lang` не указать, язык определится сам.
 
-Сырой/сломанный вариант:
+- `laladub dub` — перевести и озвучить.
+- `laladub doctor` — проверить, что стоит на машине.
+- `laladub voices` — список голосов Windows SAPI.
 
-```powershell
-laladub dub ".\input\episode.mp4" `
-  --output ".\runs\episode_ru_ghost.mp4" `
-  --source-lang ru `
-  --target-lang ru `
-  --translator argos `
-  --tts sapi `
-  --voice "Microsoft Irina Desktop" `
-  --glitch-profile ghost `
-  --original-volume 0.18
+Движки: `moss`, `cosyvoice`, `f5`, `xtts`, `sapi`, `piper`, `none`. Разделение: `bsroformer`, `demucs`, `none`.
+
+---
+
+## Что где лежит
+
+```
+src/laladub/      конвейер и оба бота
+  pipeline.py       порядок стадий, артефакты, порча текста
+  bot.py            Telegram-бот, очередь, планировщик
+  proposal_bot.py   бот-модератор предложки
+  worker.py         клиент воркера
+  worker_api.py     HTTP-API координатора
+  languages.py      списки языков
+  karma.py          лестница уровней
+tools/runtime/    запуск и остановка
+tools/worker/     запускатор ноутбука
+tools/admin/      сборка пакета, обслуживание
+assets/           вотермарки и каталог галлюцинаций
+tests/            480+ тестов
 ```
 
-Здесь `--source-lang ru` для вьетнамского видео как раз намеренно ломает распознавание. В Telegram-боте это делается выбором любого входного языка, даже неправильного.
-
-## Режимы Бота
-
-- `Сырой текст` - возвращает SRT/TXT и meta JSON из OpenAI Whisper. Неправильный входной язык намеренно усиливает ASR-артефакты.
-- `Полноценный дубляж` - переводит и озвучивает видео. Входной язык тоже можно выбрать неверно, чтобы получить ранний AI-dub эффект.
-
-## Telegram-Бот
-
-Создай бота через BotFather и задай токен:
+## Тесты
 
 ```powershell
-$env:LALADUB_BOT_TOKEN="123456:telegram-token"
-$env:LALADUB_TRANSLATOR="hybrid"
-$env:LALADUB_TTS="xtts"
-$env:LALADUB_VOICE="Microsoft Irina Desktop"
-$env:LALADUB_SEPARATION="demucs"
-$env:LALADUB_AUDIO_BED="instrumental"
-$env:LALADUB_ORIGINAL_VOLUME="1.0"
-$env:LALADUB_XTTS_DEVICE="cpu"
-# Only if you accept Coqui XTTS CPML terms:
-# $env:COQUI_TOS_AGREED="1"
-$env:LALADUB_WHISPER_DEVICE="cpu"
-$env:LALADUB_WHISPER_COMPUTE_TYPE="int8"
-$env:LALADUB_PAID_USERS="123456789,987654321"
-$env:LALADUB_FREE_MAX_DURATION_SECONDS="180"
-$env:LALADUB_PAID_MAX_DURATION_SECONDS="0"
-$env:LALADUB_WATERMARK_TEXT="La La Local Dub"
-$env:LALADUB_WATERMARK_IMAGE=".\assets\watermark.png"
-laladub-bot
+python -m pytest tests -q
 ```
 
-Пользовательский сценарий:
+## Лицензия и оговорки
 
-1. Пользователь отправляет видеофайл или ссылку на видео, например YouTube.
-2. Бот просит выбрать входной язык. Для `Сырого текста` можно выбрать неправильный язык, чтобы ломать Whisper; для дубляжа ASR дополнительно автоопределяет язык ради качества.
-3. Бот просит выбрать режим: `Сырой текст` или `Полноценный дубляж`.
-4. Бот присылает SRT/TXT или готовый MP4. Язык озвучки всегда русский. Если Telegram ID пользователя нет в `LALADUB_PAID_USERS`, на видео добавляется watermark и действует лимит длительности free-версии.
-
-Полезные команды бота:
-
-- `/start` - короткая инструкция.
-- `/me` - показать Telegram ID и статус `free`/`paid`.
-- `/cancel` - сбросить текущую задачу.
-
-## Настройки Бота
-
-## Запуск: Тест И Релиз
-
-- `Start-Test-Bot.cmd` / `Stop-Test-Bot.cmd` - текущий тестовый бот. Логи: `bot.out.log`, `bot.err.log`; pid: `bot.pid`; задачи: `runs/bot`.
-- `БОТ - ЗАПУСТИТЬ.cmd` / `БОТ - ОСТАНОВИТЬ.cmd` - единственные ручные кнопки управления релизным ботом. Технические сценарии лежат в `tools/runtime`, журналы — в `logs`, задачи — в `runs/bot-release`.
-- Токен релизного бота лежит в `.secrets/Release-Bot-Token.ps1`; папка `.secrets` добавлена в `.gitignore`.
-
-- `LALADUB_BOT_TOKEN` - токен Telegram-бота, обязательный.
-- `LALADUB_PAID_USERS` - список paid Telegram ID через запятую.
-- `LALADUB_MAX_ACTIVE_JOBS` - общий лимит одновременно выполняемых задач, по умолчанию `2`.
-- `LALADUB_MAX_ACTIVE_JOBS_PER_USER` - лимит одновременно выполняемых задач на одного пользователя, по умолчанию `1`.
-- `LALADUB_WATERMARK_IMAGE` - PNG watermark для free-пользователей. Если файла нет, используется текстовый fallback.
-- `LALADUB_WATERMARK_TEXT` - текстовый fallback watermark для free-пользователей.
-- `LALADUB_MAX_FILE_MB` - лимит входного видео, по умолчанию `200`.
-- `LALADUB_FREE_MAX_DURATION_SECONDS` - лимит длительности для free-пользователей, по умолчанию `180` секунд.
-- `LALADUB_PAID_MAX_DURATION_SECONDS` - лимит длительности для paid-пользователей, по умолчанию `0` без ограничения.
-- `LALADUB_BOT_WORKDIR` - папка задач, по умолчанию `runs/bot`.
-- `LALADUB_JOB_RETENTION_SECONDS` - сколько хранить завершённые задачи (`done`, `failed`, `rejected`) перед автоочисткой, по умолчанию `2592000` секунд (30 дней). `0` отключает очистку.
-- `LALADUB_CLEANUP_INTERVAL_SECONDS` - как часто запускать автоочистку, по умолчанию `3600` секунд.
-- `LALADUB_TRANSLATOR` - `hybrid`, `googleweb`, `mymemory`, `argos`, `libretranslate` или `identity`.
-- `LALADUB_TTS` - `xtts`, `f5`, `sapi`, `piper` или `none`; `Start-Bot.ps1` по умолчанию ставит `f5`.
-- `LALADUB_VOICE` - имя SAPI-голоса.
-- `LALADUB_SPEAKER_WAV` - чистый WAV-референс голоса для XTTS. Если не задан, берётся вокальная дорожка после Demucs.
-- `LALADUB_MULTI_SPEAKER` - `1` по умолчанию: для каждого сегмента нарезается свой speaker reference из оригинального вокала.
-- `LALADUB_SPEAKER_REFERENCE_SECONDS` - длина сегментного speaker reference, по умолчанию `3.5`.
-- `LALADUB_SPEAKER_CLUSTERING` - `1` по умолчанию: группирует похожие сегментные speaker references в speaker bank, чтобы разные персонажи чаще сохраняли разные голоса.
-- `LALADUB_MAX_SPEAKER_CLUSTERS` - максимум кластеров голосов, по умолчанию `6`.
-- `LALADUB_SPEAKER_CLUSTER_THRESHOLD` - порог объединения голосов, по умолчанию `0.08`; ниже = больше разных голосов, выше = агрессивнее склеивает.
-- `LALADUB_XTTS_MODEL` - модель XTTS, по умолчанию `tts_models/multilingual/multi-dataset/xtts_v2`.
-- `LALADUB_XTTS_DEVICE` - `cpu` по умолчанию. `cuda` только если CUDA/cuBLAS настроены.
-- `LALADUB_F5_PYTHON` - Python из отдельного окружения F5-TTS, по умолчанию `.venv-f5tts\Scripts\python.exe`.
-- `LALADUB_F5_HF_REPO` - Hugging Face repo F5-модели, по умолчанию `Misha24-10/F5-TTS_RUSSIAN`.
-- `LALADUB_F5_HF_CKPT_PATH` - checkpoint внутри repo, по умолчанию `F5TTS_v1_Base_v2/model_last_inference.safetensors`.
-- `LALADUB_F5_HF_VOCAB_PATH` - vocab внутри repo, по умолчанию `F5TTS_v1_Base/vocab.txt`.
-- `LALADUB_F5_DEVICE` - `auto`, `cpu` или `cuda`; по умолчанию `auto`.
-- `LALADUB_F5_SPEED` - скорость F5-TTS, по умолчанию `1.0`.
-- `LALADUB_SEPARATION` - `demucs` или `none`.
-- `LALADUB_AUDIO_BED` - `instrumental`, `original`, `dub-only` или `multitrack`. `multitrack` не смешивает оригинал и дубляж в одну дорожку: в итоговом видео оригинал сохраняется отдельной дорожкой рядом с дублированной (с языковыми метаданными), и плеер может переключаться между ними. Дубляж идёт **первой** дорожкой и помечен `default` - плеер, который просто берёт первую дорожку (в том числе встроенный в Telegram), всё равно проигрывает дубляж, а не оригинал. Сама дублированная дорожка собирается точно так же, как в `instrumental`, включая громкость фона, поэтому по умолчанию видео звучит ровно как раньше - оригинал просто добавляется рядом.
-- `LALADUB_WHISPER_MODEL` - модель faster-whisper, по умолчанию `small`.
-- `LALADUB_ASR_BACKEND` - backend обычного дубляжа, по умолчанию `faster-whisper`.
-- `LALADUB_WHISPER_ONLY_MODEL` - модель для режима bug hunt и artifact-hunt, по умолчанию `turbo`.
-- `LALADUB_WHISPER_ONLY_DEVICE` - устройство для bug hunt, по умолчанию `cpu`.
-- `LALADUB_WHISPER_DEVICE` - `cpu` по умолчанию. Можно поставить `cuda`, если установлены CUDA/cuBLAS DLL.
-- `LALADUB_WHISPER_COMPUTE_TYPE` - `int8` по умолчанию для CPU.
-- `LALADUB_ORIGINAL_VOLUME` - громкость оригинала в финальном миксе.
-- `LALADUB_DUB_VOLUME` - громкость дубляжа.
-- `LALADUB_COLLAPSE_REPETITIONS` - `1` по умолчанию: сжимает повторяющиеся слова/фразы перед XTTS.
-- `LALADUB_MAX_PHRASE_REPEATS` - сколько раз подряд можно оставить одинаковую фразу, по умолчанию `2`.
-- `LALADUB_MAX_WORD_REPEATS` - сколько раз подряд можно оставить одно слово, по умолчанию `3`.
-
-For another PC on the same LAN, unzip `LaLaDubWorker.zip`, run `Start-Worker.cmd`, and leave it open. When the release bot package changes, idle workers download the update from the main PC and restart themselves.
+MOSS, CosyVoice, F5-TTS, XTTS, pyannote и Demucs — каждый со своей лицензией и своими условиями. XTTS требует согласия с CPML (`COQUI_TOS_AGREED=1`), pyannote — токена Hugging Face. Проверяйте условия сами, прежде чем использовать что-то из этого не для себя.
