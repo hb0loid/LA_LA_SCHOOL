@@ -51,3 +51,37 @@ class WorkerLivenessTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkerTtlTests(unittest.TestCase):
+    def test_a_worker_that_spoke_a_minute_ago_is_still_online(self) -> None:
+        """The old thirty-second window was the whole bug.
+
+        A worker inside one long step says nothing but its heartbeat, and the
+        coordinator only had to be busy for half a minute to declare it gone.
+        """
+
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                scheduler = _scheduler(Path(tempdir))
+                scheduler.note_worker_seen("worker-pc")
+                scheduler._remote_workers["worker-pc"]["last_seen"] -= 60.0
+                async with scheduler._lock:
+                    self.assertEqual(scheduler._remote_worker_counts_locked()["online"], 1)
+                scheduler._remote_workers["worker-pc"]["last_seen"] -= 120.0
+                async with scheduler._lock:
+                    self.assertEqual(scheduler._remote_worker_counts_locked()["online"], 0)
+
+        asyncio.run(run())
+
+    def test_note_worker_seen_needs_no_lock(self) -> None:
+        """It is called from the HTTP thread, so it must not wait on anything."""
+
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                scheduler = _scheduler(Path(tempdir))
+                async with scheduler._lock:
+                    scheduler.note_worker_seen("worker-pc")
+                    self.assertIn("worker-pc", scheduler._remote_workers)
+
+        asyncio.run(run())

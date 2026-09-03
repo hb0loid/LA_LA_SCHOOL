@@ -63,6 +63,7 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
             if not self._authorized():
                 self._send_error(401, "unauthorized")
                 return
+            self._note_seen(parsed)
             if parsed.path == "/api/v1/worker/manifest":
                 self._send_json(self._worker_manifest())
                 return
@@ -101,6 +102,7 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
             if not self._authorized():
                 self._send_error(401, "unauthorized")
                 return
+            self._note_seen(parsed)
             job_id, suffix = self._match_job_path(parsed.path)
             if not job_id:
                 self._send_error(404, "not found")
@@ -128,6 +130,7 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
             if not self._authorized():
                 self._send_error(401, "unauthorized")
                 return
+            self._note_seen(parsed)
             job_id, suffix = self._match_job_path(parsed.path)
             if not job_id or not suffix.startswith("result/"):
                 self._send_error(404, "not found")
@@ -146,6 +149,21 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:
         print(f"Worker API: {self.address_string()} - {format % args}", flush=True)
+
+    def _note_seen(self, parsed: Any) -> None:
+        """Marks the worker alive straight from this thread.
+
+        Every other route to that fact goes through the event loop, so a busy
+        coordinator could report a perfectly healthy worker as missing. Whoever
+        is talking to us right now is, by definition, not missing.
+        """
+        try:
+            worker_id = (urllib.parse.parse_qs(parsed.query).get("worker_id") or [None])[0]
+            job_id, _ = self._match_job_path(parsed.path)
+            if worker_id or job_id:
+                self._scheduler().note_worker_seen(worker_id, job_id)
+        except Exception:
+            pass
 
     def _scheduler(self) -> Any:
         return self.server.application.bot_data["job_scheduler"]

@@ -2962,7 +2962,11 @@ class _JobScheduler:
         self._items_by_key: dict[str, _QueuedJob] = {}
         self._leased: dict[str, _QueuedJob] = {}
         self._remote_workers: dict[str, dict[str, Any]] = {}
-        self._remote_worker_ttl = 30.0
+        # Thirty seconds was the whole reason the worker kept "disappearing".
+        # A worker deep in one long step says nothing but its heartbeat, and the
+        # coordinator only has to be busy for half a minute to miss it. Two
+        # minutes of real silence is still plenty to notice a worker that died.
+        self._remote_worker_ttl = 120.0
         self._sequence = 0
 
     async def reattach_if_known(self, context: Any, job: dict[str, Any], status_message: Any) -> bool:
@@ -3153,8 +3157,10 @@ class _JobScheduler:
                 ]
                 await self._dispatch_locked(context)
             for item in stale:
+                silence = now - float(item.remote_last_seen_at or 0.0)
                 print(
-                    f"Remote preprocessing heartbeat timed out job={item.job_id} worker={item.worker_id}",
+                    f"Remote preprocessing heartbeat timed out job={item.job_id} "
+                    f"worker={item.worker_id} silence={silence:.0f}s",
                     flush=True,
                 )
                 await self._fallback_remote_preprocess(context, item, "worker heartbeat timed out")
@@ -3612,6 +3618,28 @@ class _JobScheduler:
         slots = max(1, self._settings.max_active_jobs)
         wait = work_seconds / slots
         return (max(15.0, wait * 0.65), max(30.0, wait * 1.45))
+
+    def note_worker_seen(self, worker_id: str | None, job_id: str | None = None) -> None:
+        """Records that a worker just spoke to us. Called from the HTTP thread.
+
+        Deliberately takes no lock and touches no event loop: the point is that
+        a busy coordinator must never be able to make a live worker look dead.
+        Dict and attribute writes are atomic enough for a timestamp.
+        """
+        now = time.time()
+        if job_id:
+            item = self._leased.get(job_id)
+            if item is not None:
+                item.remote_last_seen_at = now
+                if not worker_id:
+                    worker_id = item.worker_id
+        name = str(worker_id or "").strip()
+        if not name:
+            return
+        state = dict(self._remote_workers.get(name) or {})
+        state["last_seen"] = now
+        state.setdefault("active_job_id", None)
+        self._remote_workers[name] = state
 
     def _mark_remote_worker_locked(self, worker_id: str, *, active_job_id: str | None) -> None:
         worker_id = str(worker_id or "worker").strip() or "worker"
