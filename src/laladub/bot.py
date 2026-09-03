@@ -39,6 +39,7 @@ from .performance import PerformanceHistory, job_duration_seconds, merge_stage_s
 from .premium_store import PremiumStore, Subscription, UserSettings
 from .preset_store import PRESET_FIELDS, PresetStore, UserPreset
 from .text_review import TextReviewStore
+from .worker_watch import WorkerPresence
 from .update_dedupe import (
     UpdateDeduplicator,
     build_completion_marker,
@@ -522,6 +523,7 @@ async def _setup_bot_commands(application: Any) -> None:
         await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     asyncio.create_task(_recover_interrupted_jobs(application))
     asyncio.create_task(_cleanup_finished_jobs_loop(application))
+    asyncio.create_task(_worker_presence_loop(application))
     asyncio.create_task(_maintenance_watch_loop(application))
     asyncio.create_task(_daily_quota_reminder_loop(application))
     asyncio.create_task(application.bot_data["job_scheduler"].watch_remote_leases(_ApplicationContext(application)))
@@ -2727,6 +2729,34 @@ def _find_recoverable_jobs(settings: BotSettings) -> list[dict[str, Any]]:
         candidates.append((updated_at, job))
     candidates.sort(key=lambda item: item[0])
     return [job for _updated_at, job in candidates]
+
+
+async def _worker_presence_loop(application: object) -> None:
+    """Says out loud when the worker goes missing, and when it returns.
+
+    The bot always knew - workers check in and the TTL decides - but the fact
+    only showed up in /queue, so an absence was found by accident hours later.
+    The worker takes 43% of the jobs; those hours are paid for in queue time.
+    """
+    settings: BotSettings = application.bot_data["settings"]
+    scheduler: _JobScheduler = application.bot_data["job_scheduler"]
+    presence = WorkerPresence(settings.workdir / "worker_presence.json")
+    admins = sorted(settings.admin_users)
+    if not admins:
+        return
+    await asyncio.sleep(60)
+    while True:
+        try:
+            live = await scheduler.snapshot()
+            message = presence.observe(int(live.get("remote_workers_online") or 0))
+            if message:
+                print(f"Worker presence: {message.splitlines()[0]}", flush=True)
+                for admin_id in admins:
+                    with contextlib.suppress(Exception):
+                        await application.bot.send_message(chat_id=admin_id, text=message)
+        except Exception as exc:
+            print(f"Worker presence check failed: {type(exc).__name__}: {exc}", flush=True)
+        await asyncio.sleep(60)
 
 
 async def _cleanup_finished_jobs_loop(application: Any) -> None:
