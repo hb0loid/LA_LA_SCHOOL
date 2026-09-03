@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
+import time
 import json
+import os
+import re
 import shutil
+import socket
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,6 +49,7 @@ class _WorkerHTTPServer(ThreadingHTTPServer):
         self.context = context
         self.loop = loop
         self.token = token
+        self.trusted_worker_networks = _trusted_worker_networks()
 
 
 class _WorkerRequestHandler(BaseHTTPRequestHandler):
@@ -58,6 +64,7 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
             if not self._authorized():
                 self._send_error(401, "unauthorized")
                 return
+            self._note_seen(parsed)
             if parsed.path == "/api/v1/worker/manifest":
                 self._send_json(self._worker_manifest())
                 return
@@ -66,6 +73,10 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
                 if package_path is None:
                     self._send_error(404, "worker package not found")
                     return
+                # Downloading this means the worker is about to restart into
+                # it. Remember when, so the presence watcher does not report a
+                # deploy of our own making as a worker that went missing.
+                self.server.context.application.bot_data["worker_update_served_at"] = time.time()
                 self._send_file(package_path)
                 return
             if parsed.path == "/api/v1/jobs/lease":
@@ -96,6 +107,7 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
             if not self._authorized():
                 self._send_error(401, "unauthorized")
                 return
+            self._note_seen(parsed)
             job_id, suffix = self._match_job_path(parsed.path)
             if not job_id:
                 self._send_error(404, "not found")
@@ -123,6 +135,7 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
             if not self._authorized():
                 self._send_error(401, "unauthorized")
                 return
+            self._note_seen(parsed)
             job_id, suffix = self._match_job_path(parsed.path)
             if not job_id or not suffix.startswith("result/"):
                 self._send_error(404, "not found")
@@ -141,6 +154,21 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:
         print(f"Worker API: {self.address_string()} - {format % args}", flush=True)
+
+    def _note_seen(self, parsed: Any) -> None:
+        """Marks the worker alive straight from this thread.
+
+        Every other route to that fact goes through the event loop, so a busy
+        coordinator could report a perfectly healthy worker as missing. Whoever
+        is talking to us right now is, by definition, not missing.
+        """
+        try:
+            worker_id = (urllib.parse.parse_qs(parsed.query).get("worker_id") or [None])[0]
+            job_id, _ = self._match_job_path(parsed.path)
+            if worker_id or job_id:
+                self._scheduler().note_worker_seen(worker_id, job_id)
+        except Exception:
+            pass
 
     def _scheduler(self) -> Any:
         return self.server.application.bot_data["job_scheduler"]
@@ -164,6 +192,8 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
             "version": str(manifest.get("version") or settings.worker_version),
             "build_id": str(manifest.get("build_id") or ""),
             "package": "/api/v1/worker/package",
+            "worker_token": self.server.token,
+            "worker_server": f"http://{socket.gethostname()}:{settings.worker_api_port}",
         }
         if package_path is None:
             return data
@@ -185,7 +215,15 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
 
     def _authorized(self) -> bool:
         header = self.headers.get("Authorization", "")
-        return header == f"Bearer {self.server.token}"
+        if header == f"Bearer {self.server.token}":
+            return True
+        if not header.startswith("Bearer ") or not header[7:].strip():
+            return False
+        try:
+            client_ip = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            return False
+        return any(client_ip in network for network in self.server.trusted_worker_networks)
 
     def _match_job_path(self, path: str) -> tuple[str | None, str]:
         prefix = "/api/v1/jobs/"
@@ -254,6 +292,22 @@ def _read_json_file(path: Path) -> dict[str, Any]:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _trusted_worker_networks() -> list[Any]:
+    value = os.environ.get("LALADUB_WORKER_API_TRUSTED_IPS", "").strip()
+    if not value:
+        return []
+    networks: list[Any] = []
+    for item in re.split(r"[,;\s]+", value):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            print(f"Worker API trusted IP ignored: {item}", flush=True)
+    return networks
 
 
 def _sha256_file(path: Path) -> str:

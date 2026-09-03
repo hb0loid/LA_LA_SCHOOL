@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from pathlib import Path
 
-from .ffmpeg import require_tool, run
+from .ffmpeg import probe_duration, require_tool, run
 
 
 def add_watermark(
@@ -15,8 +15,10 @@ def add_watermark(
 ) -> None:
     selected_image = _select_watermark_image(image_path)
     if selected_image is not None:
+        print(f"      Watermark image: {selected_image}", flush=True)
         add_image_watermark(input_path, output_path, selected_image)
         return
+    print("      Watermark image: none, using text fallback", flush=True)
     add_text_watermark(input_path, output_path, text)
 
 
@@ -27,7 +29,8 @@ def _select_watermark_image(image_path: Path | None) -> Path | None:
         return image_path if image_path.suffix.casefold() == ".png" else None
 
     candidates = sorted(
-        path for path in image_path.iterdir()
+        path
+        for path in image_path.iterdir()
         if path.is_file() and path.suffix.casefold() == ".png"
     )
     if not candidates:
@@ -48,18 +51,36 @@ def add_image_watermark(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     alpha = max(0.0, min(1.0, opacity))
     filter_value = (
-        f"[1:v]format=rgba,scale={width}:-1,colorchannelmixer=aa={alpha:.2f}[wm];"
-        f"[0:v][wm]overlay="
-        f"x=W-w-{margin}:y=H-h-{margin}:"
-        "eval=init:format=auto,"
+        "[0:v]setpts=PTS-STARTPTS,"
         "scale=trunc(iw/2)*2:trunc(ih/2)*2,"
-        "format=yuv420p[v]"
+        "fps=30,"
+        "format=yuv420p,"
+        "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709[base];"
+        f"[1:v]setpts=PTS-STARTPTS,format=rgba,scale={width}:-1,"
+        f"colorchannelmixer=aa={alpha:.2f}[wm];"
+        f"[base][wm]overlay="
+        f"x=W-w-{margin}:y=H-h-{margin}:"
+        "eval=init:shortest=1:repeatlast=1:eof_action=repeat:"
+        "format=auto,format=yuv420p[v]"
     )
+    duration_args: list[str] = []
+    with_duration = True
+    try:
+        duration = probe_duration(input_path)
+    except Exception:
+        with_duration = False
+    if with_duration:
+        duration_args = ["-t", f"{max(0.1, duration):.3f}"]
+
     command = [
         ffmpeg,
         "-y",
         "-i",
         str(input_path),
+        "-loop",
+        "1",
+        "-framerate",
+        "30",
         "-i",
         str(image_path),
         "-filter_complex",
@@ -81,6 +102,7 @@ def add_image_watermark(
         "-movflags",
         "+faststart",
     ]
+    command.extend(duration_args)
     command.append(str(output_path))
     run(command)
 

@@ -10,12 +10,15 @@ from pathlib import Path
 import random
 import re
 import shutil
+import subprocess
 from typing import Any
 import wave
 
 from .asr import clear_openai_whisper_cache, transcribe
+from .censor import apply_censor_to_segments
 from .ffmpeg import (
     combine_video_audio,
+    combine_video_audio_multitrack,
     concat_wavs,
     delayed_mix,
     extract_audio,
@@ -29,11 +32,19 @@ from .ffmpeg import (
 )
 from .glitch import apply_glitch_profile, clean_segments
 from .models import DubConfig, Segment
-from .quality import collapse_repetitions, collapse_repetitions_in_segments, is_repetitive_loop
+from .quality import (
+    clamp_obvious_word_repeats_in_segments,
+    collapse_repetitions,
+    collapse_repetitions_in_segments,
+    limit_repeated_segment_phrases,
+    limit_phrase_repeats_across_segments,
+    suppress_pathological_segment_loops,
+    is_repetitive_loop,
+)
 from .separation import SeparationResult, separate_audio
 from .srt import read_srt, write_srt, write_txt
 from .translation import translate_segments, translate_text_chain
-from .tts import synthesize_segment
+from .tts import synthesize_cosyvoice_batch, synthesize_moss_batch, synthesize_qwen3_batch, synthesize_segment
 
 
 _DEFAULT_META_HALLUCINATION_TERMS = [
@@ -45,6 +56,12 @@ _DEFAULT_META_HALLUCINATION_TERMS = [
     "solanya",
     "dimatorzok",
     "dima torzok",
+    "игорь негода",
+    "с вами был игорь негода",
+    "девушки отдыхают",
+    "девушка отдыхает",
+    "девочки отдыхают",
+    "các cô gái thư giãn",
     "subscribe",
     "subscribed",
     "thanks for watching",
@@ -96,6 +113,11 @@ _DEFAULT_RU_ARTIFACT_PROMPT_SEEDS = [
     "Субтитры сделал DimaTorzok.",
     "Субтитры создавал DimaTorzok.",
     "Перевод и субтитры DimaTorzok.",
+    "С вами был Игорь Негода.",
+    "Субтитры подогнал Игорь Негода.",
+    "Девушки отдыхают.",
+    "Девушка отдыхает.",
+    "Девочки отдыхают.",
     "Спасибо за субтитры Алексею Дубровскому!",
     "Субтитры подогнал Симон.",
     "Продолжение следует...",
@@ -185,6 +207,14 @@ def _ru_artifact_prompt_seeds() -> list[str]:
     )
 
 
+def _legacy_artifact_inserts_ru() -> list[str]:
+    return _read_artifact_text_file(
+        "artifact_legacy_inserts_ru.txt",
+        "LALADUB_ARTIFACT_LEGACY_INSERTS_RU_FILE",
+        _DEFAULT_RU_ARTIFACT_PROMPT_SEEDS,
+    )
+
+
 _ROOT_DEBUG_SRT_FILES = [
     "artifact_injected.srt",
     "artifact_source.srt",
@@ -230,6 +260,19 @@ def _report_progress(
         print(f"      Progress callback skipped: {type(exc).__name__}: {exc}")
 
 
+def _format_video_position(position: float, duration: float) -> str:
+    def stamp(seconds: float) -> str:
+        total = max(0, round(seconds))
+        minutes, secs = divmod(total, 60)
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+    ratio = max(0.0, min(1.0, position / max(0.001, duration)))
+    filled = round(12 * ratio)
+    bar = "[" + "#" * filled + "-" * (12 - filled) + "]"
+    return f"видео {bar} {stamp(position)} / {stamp(duration)}"
+
+
 def _prepare_workdir_outputs(config: DubConfig) -> None:
     for filename in _ROOT_DEBUG_SRT_FILES:
         (config.workdir / filename).unlink(missing_ok=True)
@@ -262,6 +305,20 @@ def _asr_is_too_sparse(segments: list[Segment], source_duration: float) -> bool:
         return True
     if source_duration >= 20.0 and text_chars / max(1.0, source_duration) < 0.8:
         return True
+    # A long hole between otherwise valid phrases is easy to miss when one
+    # verbose segment makes the character count look healthy. This was the
+    # failure mode in job 26929 (roughly 23 seconds missing in the middle).
+    spoken = sorted(
+        (segment for segment in segments if segment.text.strip() and segment.end > segment.start),
+        key=lambda item: (item.start, item.end),
+    )
+    if source_duration >= 20.0 and len(spoken) >= 2:
+        largest_inner_gap = max(
+            (right.start - left.end for left, right in zip(spoken, spoken[1:])),
+            default=0.0,
+        )
+        if largest_inner_gap >= max(10.0, source_duration * 0.25):
+            return True
     return False
 
 
@@ -281,7 +338,90 @@ def _dub_is_too_sparse(segments: list[Segment], source_duration: float) -> bool:
         return True
     if source_duration >= 90.0 and len(spoken) < 6 and text_chars / duration < 1.6:
         return True
+    # Plenty of phrases overall can still leave a long stretch saying nothing -
+    # in job 40814 the opening 27 seconds were silent while every count above
+    # looked healthy, because one segment claimed the whole 30-second window.
+    if source_duration >= 30.0 and _largest_unspoken_stretch(spoken, source_duration) >= 12.0:
+        return True
     return False
+
+
+def _plausible_speech_seconds(text: str) -> float:
+    """How long a phrase could plausibly take to say, erring on the slow side.
+
+    Real segments run about 10 characters per second; assuming half that keeps
+    this from mistaking an ordinary phrase for a hole.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return 0.0
+    return max(0.8, len(stripped) / 5.0)
+
+
+def _tighten_overlong_segments(
+    segments: list[Segment],
+    min_hole_seconds: float = 5.0,
+) -> list[Segment]:
+    """Shrink segments that claim far more time than their words can fill.
+
+    Whisper answers an unintelligible stretch with one segment spanning its whole
+    30-second window and a handful of words in it. Everything downstream reads a
+    segment's span as time that is already spoken for, so those dead seconds are
+    invisible: the sparse-fill check sees full coverage, and fill candidates
+    landing inside the span are rejected as conflicts. Trimming the segment back
+    to what it can actually say turns that dead time into an ordinary gap, which
+    the existing gap handling already knows how to fill.
+    """
+    tightened: list[Segment] = []
+    changed = 0
+    for segment in segments:
+        needed = _plausible_speech_seconds(segment.spoken_text)
+        if needed > 0.0 and segment.duration - needed >= min_hole_seconds:
+            tightened.append(
+                Segment(
+                    start=segment.start,
+                    end=segment.start + needed,
+                    text=segment.text,
+                    translated_text=segment.translated_text,
+                    speaker_wav=segment.speaker_wav,
+                    speaker_id=segment.speaker_id,
+                    speaker_ref_text=segment.speaker_ref_text,
+                )
+            )
+            changed += 1
+            continue
+        tightened.append(segment)
+
+    if not changed:
+        return segments
+    print(f"      Tightened over-long ASR segments: {changed}/{len(segments)}")
+    return tightened
+
+
+def _largest_unspoken_stretch(segments: list[Segment], source_duration: float) -> float:
+    """Longest run of the video with nothing being said, measured from the time
+    each segment actually speaks rather than the span it claims."""
+    if source_duration <= 0.0:
+        return 0.0
+    spoken: list[tuple[float, float]] = []
+    for segment in segments:
+        needed = _plausible_speech_seconds(segment.spoken_text)
+        if needed <= 0.0:
+            continue
+        # Audio runs from the segment's start for as long as the words take; the
+        # span it claims is bookkeeping and is exactly what hides these holes.
+        start = max(0.0, segment.start)
+        spoken.append((start, min(source_duration, start + needed)))
+    if not spoken:
+        return source_duration
+
+    largest = 0.0
+    cursor = 0.0
+    for start, end in sorted(spoken):
+        if start - cursor > largest:
+            largest = start - cursor
+        cursor = max(cursor, end)
+    return max(largest, source_duration - cursor)
 
 
 def _segment_coverage_seconds(segments: list[Segment]) -> float:
@@ -369,6 +509,23 @@ def _save_resume_state(config: DubConfig, **updates: object) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _source_asr_signature(config: DubConfig) -> str:
+    """Identify source transcripts that are safe to reuse after pipeline changes."""
+    values = (
+        "content-chaos-v3",
+        config.asr_backend,
+        config.whisper_model,
+        config.source_lang or "auto",
+        str(bool(config.force_source_language)),
+        config.whisper_task,
+        config.glitch_profile,
+        str(bool(config.artifact_chaos_mode)),
+        str(bool(config.content_chaos_backbone)),
+        str(bool(config.reference_timing_asr)),
+    )
+    return "|".join(values)
+
+
 def _file_ready(path: Path, min_size: int = 1024) -> bool:
     return path.exists() and path.stat().st_size >= min_size
 
@@ -442,11 +599,40 @@ def _restore_cached_file(cache_entry: Path | None, cache_name: str, destination:
     return _file_ready(destination, min_size=min_size)
 
 
-def _store_cached_file(cache_entry: Path | None, source: Path, cache_name: str, min_size: int = 1024) -> None:
+# Extracted audio is a hair shorter than its video often enough (container
+# padding, a trailing video-only frame) that an exact match would reject good
+# cache entries; a real truncation loses far more than this.
+_MEDIA_CACHE_DURATION_TOLERANCE = 5.0
+
+
+def _covers_source_duration(audio_path: Path, video_path: Path) -> bool:
+    """Whether cached audio actually spans the whole video it is keyed on.
+
+    A job that ran on a trimmed copy of its input (the daily-quota trim) keeps
+    the untrimmed original next to it, so the cache can end up keyed on the
+    full file while holding audio for only the first minute of it. Restoring
+    that silently dubs the opening and leaves the rest in the original voice."""
+    try:
+        audio_seconds = probe_duration(audio_path)
+        video_seconds = probe_duration(video_path)
+    except Exception:
+        return True  # can't tell - don't block the normal path over it
+    if audio_seconds <= 0 or video_seconds <= 0:
+        return True
+    return video_seconds - audio_seconds <= _MEDIA_CACHE_DURATION_TOLERANCE
+
+
+def _store_cached_file(
+    cache_entry: Path | None,
+    source: Path,
+    cache_name: str,
+    min_size: int = 1024,
+    overwrite: bool = False,
+) -> None:
     if cache_entry is None or not _file_ready(source, min_size=min_size):
         return
     destination = cache_entry / cache_name
-    if _file_ready(destination, min_size=min_size):
+    if _file_ready(destination, min_size=min_size) and not overwrite:
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
     temp_path = destination.with_name(destination.name + ".tmp")
@@ -472,6 +658,11 @@ def _restore_cached_separation(
     vocals_cache = cache_dir / "vocals.wav"
     no_vocals_cache = cache_dir / "no_vocals.wav"
     if not (_file_ready(vocals_cache) and _file_ready(no_vocals_cache)):
+        return None
+    if not _covers_source_duration(vocals_cache, mix_audio):
+        # Separated from a truncated mix by an older run - redo it rather than
+        # dub against stems that stop partway through the video.
+        print("      Media cache: ignoring separation that does not cover the full audio")
         return None
 
     stem_dir = config.workdir / "separated" / config.demucs_model / mix_audio.stem
@@ -546,7 +737,7 @@ def _seed_media_cache_from_legacy_jobs(video_path: Path, cache_entry: Path | Non
                     continue
             except Exception:
                 continue
-            if _store_legacy_media_cache(cache_entry, job_dir / "work", config):
+            if _store_legacy_media_cache(cache_entry, job_dir / "work", config, candidate):
                 print(f"      Media cache: seeded from previous job {job_dir}")
                 return True
             matched_without_work = True
@@ -562,9 +753,25 @@ def _restore_cached_separation_ready(cache_entry: Path | None, config: DubConfig
     return _file_ready(cache_dir / "vocals.wav") and _file_ready(cache_dir / "no_vocals.wav")
 
 
-def _store_legacy_media_cache(cache_entry: Path, legacy_workdir: Path, config: DubConfig) -> bool:
-    stored = False
+def _store_legacy_media_cache(
+    cache_entry: Path,
+    legacy_workdir: Path,
+    config: DubConfig,
+    video_path: Path | None = None,
+) -> bool:
     source_audio = legacy_workdir / "source_16k.wav"
+    if (
+        video_path is not None
+        and _file_ready(source_audio)
+        and not _covers_source_duration(source_audio, video_path)
+    ):
+        # That job matched by hash on its untrimmed input but actually ran on a
+        # trimmed copy of it, so its audio and separation cover only the first
+        # stretch. Seeding from it would truncate every future dub of the file.
+        print("      Media cache: skipped seeding from a job that ran on a trimmed input")
+        return False
+
+    stored = False
     if _file_ready(source_audio) and not _file_ready(cache_entry / "source_16k.wav"):
         _store_cached_file(cache_entry, source_audio, "source_16k.wav")
         stored = True
@@ -618,38 +825,49 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     source_audio = config.workdir / "source_16k.wav"
     if config.resume and _file_ready(source_audio):
         print(f"      Resume: using existing audio {source_audio}")
-    elif _restore_cached_file(media_cache, "source_16k.wav", source_audio):
+    elif _restore_cached_file(media_cache, "source_16k.wav", source_audio) and _covers_source_duration(
+        source_audio, video_path
+    ):
         print("      Media cache: restored source_16k.wav")
     else:
+        # Also the repair path for a cache entry poisoned by an older trimmed
+        # run: overwrite it with audio that covers the whole file.
         extract_audio(video_path, source_audio)
-        _store_cached_file(media_cache, source_audio, "source_16k.wav")
+        _store_cached_file(media_cache, source_audio, "source_16k.wav", overwrite=True)
     mix_audio = config.workdir / "source_mix.wav"
     separation_result = None
     bed_path = None
-    if config.separation != "none" or config.audio_bed == "instrumental":
+    # multitrack needs the untouched original mix as its own audio track even
+    # when the user didn't ask for Demucs separation.
+    needs_mix_audio = config.separation != "none" or config.audio_bed in {"instrumental", "multitrack"}
+    needs_separation = config.separation != "none" or config.audio_bed == "instrumental"
+    if needs_mix_audio:
         _report_progress(config, "Разделяю голос и фон", 10, 100, f"provider={config.separation}")
         if config.resume and _file_ready(mix_audio):
             print(f"      Resume: using existing mix audio {mix_audio}")
-        elif _restore_cached_file(media_cache, "source_mix.wav", mix_audio):
+        elif _restore_cached_file(media_cache, "source_mix.wav", mix_audio) and _covers_source_duration(
+            mix_audio, video_path
+        ):
             print("      Media cache: restored source_mix.wav")
         else:
             extract_audio_track(video_path, mix_audio)
-            _store_cached_file(media_cache, mix_audio, "source_mix.wav")
-        separation_result = _existing_separation_result(mix_audio, config) if config.resume else None
-        if separation_result is not None:
-            print(f"      Resume: using existing separation {separation_result.vocals_path.parent}")
-        else:
-            separation_result = _restore_cached_separation(media_cache, mix_audio, config)
+            _store_cached_file(media_cache, mix_audio, "source_mix.wav", overwrite=True)
+        if needs_separation:
+            separation_result = _existing_separation_result(mix_audio, config) if config.resume else None
             if separation_result is not None:
-                print(f"      Media cache: restored separation {separation_result.vocals_path.parent}")
+                print(f"      Resume: using existing separation {separation_result.vocals_path.parent}")
             else:
-                print(f"      Separating audio provider={config.separation}")
-                separation_result = separate_audio(mix_audio, config.workdir / "separated", config)
-                _store_cached_separation(media_cache, separation_result, config)
-        if separation_result and config.audio_bed == "instrumental":
-            bed_path = separation_result.instrumental_path
-        elif config.audio_bed == "instrumental":
-            raise RuntimeError("audio_bed=instrumental needs --separation demucs")
+                separation_result = _restore_cached_separation(media_cache, mix_audio, config)
+                if separation_result is not None:
+                    print(f"      Media cache: restored separation {separation_result.vocals_path.parent}")
+                else:
+                    print(f"      Separating audio provider={config.separation}")
+                    separation_result = separate_audio(mix_audio, config.workdir / "separated", config)
+                    _store_cached_separation(media_cache, separation_result, config)
+            if separation_result and config.audio_bed in {"instrumental", "multitrack"}:
+                bed_path = separation_result.instrumental_path
+            elif config.audio_bed == "instrumental":
+                raise RuntimeError("audio_bed=instrumental needs --separation demucs")
     _save_resume_state(config, audio=True, separation=separation_result is not None)
     source_duration = probe_duration(source_audio)
     _report_progress(config, "Аудио подготовлено", 20, 100, None)
@@ -671,10 +889,20 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         f"suppress_ascii={config.suppress_plain_ascii_tokens}"
     )
     source_srt_path = config.workdir / "source.srt"
-    source_asr_changed = False
-    if config.resume and _file_ready(source_srt_path, min_size=16):
+    requested_source_signature = _source_asr_signature(config)
+    stored_source_signature = resume_state.get("source_asr_signature")
+    source_resume_compatible = stored_source_signature == requested_source_signature
+    if stored_source_signature is None and not config.force_source_language:
+        # Preserve old clean/auto resumes. Old jobs with a selected input
+        # language must regenerate because that language now drives main ASR.
+        source_resume_compatible = True
+    source_file_ready = _file_ready(source_srt_path, min_size=16)
+    source_asr_changed = bool(config.resume and source_file_ready and not source_resume_compatible)
+    if source_asr_changed:
+        print("      Resume: source ASR settings changed; regenerating the main transcript")
+    if config.resume and source_file_ready and source_resume_compatible:
         resumed_lang = resume_state.get("source_lang")
-        if isinstance(resumed_lang, str) and resumed_lang:
+        if not config.force_source_language and isinstance(resumed_lang, str) and resumed_lang:
             config.source_lang = resumed_lang
         segments = read_srt(source_srt_path, translated=False)
         print(f"      Resume: loaded source ASR segments={len(segments)}")
@@ -683,7 +911,12 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         main_asr_audio = _whisper_chaos_audio(source_audio, config, purpose="main")
         segments = transcribe(main_asr_audio, config)
         segments = _clamp_segments_to_duration(segments, source_duration)
-        if config.artifact_chaos_mode and config.force_source_language and config.source_lang and not config.inject_artifacts:
+        if (
+            config.artifact_chaos_mode
+            and config.force_source_language
+            and config.source_lang
+            and not config.inject_artifacts
+        ):
             chunk_segments = _harvest_chunked_forced_artifacts(main_asr_audio, config, config, source_duration)
             if chunk_segments:
                 segments = [*segments, *chunk_segments]
@@ -719,18 +952,94 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
             config.collapse_repetitions = True
             segments = transcribe(source_audio, config)
             segments = _clamp_segments_to_duration(segments, source_duration)
+        if config.reference_timing_asr and config.force_source_language:
+            _report_progress(config, "Уточняю тайминги речи", 29, 100, "быстрый авто-ASR")
+            timing_segments, timing_lang = _reference_timing_source_asr(source_audio, config, source_duration)
+            if timing_segments:
+                write_srt(_debug_path(config, "timing_reference.srt"), timing_segments, translated=False)
+                aligned_segments = _align_forced_text_to_reference_timings(segments, timing_segments)
+                if aligned_segments:
+                    print(
+                        "      Forced text aligned to reference timings: "
+                        f"text={len(segments)} timing={len(timing_segments)} aligned={len(aligned_segments)} "
+                        f"detected={timing_lang or 'auto'}"
+                    )
+                    write_srt(
+                        _debug_path(config, "forced_text_timing_aligned.srt"),
+                        aligned_segments,
+                        translated=False,
+                    )
+                    if config.content_chaos_backbone:
+                        forced_lang = config.source_lang
+                        if forced_lang:
+                            write_srt(
+                                config.workdir / f"forced_{_safe_label(forced_lang)}_transcript.srt",
+                                aligned_segments,
+                                translated=False,
+                            )
+                        artifact_lang = _artifact_corruption_language(
+                            forced_lang,
+                            timing_lang,
+                            config,
+                        )
+                        config.artifact_source_lang = artifact_lang
+                        config.input_pivot_lang = forced_lang
+                        config.source_lang = timing_lang
+                        config.force_source_language = False
+                        config.inject_artifacts = bool(artifact_lang)
+                        # Third copy of this constant - the other two are in
+                        # bot.py and job_runner.py - and the one that actually
+                        # won, so raising LALADUB_ARTIFACT_RATIO did nothing at
+                        # all. Keep 0.20 as the floor, let a higher setting through.
+                        config.artifact_ratio = max(config.artifact_ratio, 0.20)
+                        segments = [
+                            Segment(start=item.start, end=item.end, text=item.text)
+                            for item in timing_segments
+                            if item.text.strip()
+                        ]
+                        print(
+                            "      Content chaos backbone: "
+                            f"content={len(segments)} forced_artifacts={len(aligned_segments)} "
+                            f"source={config.source_lang or 'auto'} "
+                            f"selected={forced_lang or 'none'} corruption={artifact_lang or 'none'}"
+                        )
+                    else:
+                        segments = aligned_segments
         if config.glitch_profile == "clean":
             segments = clean_segments(segments)
         write_srt(source_srt_path, segments, translated=False)
         if config.force_source_language and config.source_lang:
             write_srt(config.workdir / f"forced_{_safe_label(config.source_lang)}_transcript.srt", segments, translated=False)
-        _save_resume_state(config, source_asr=True, source_lang=config.source_lang)
+        _save_resume_state(
+            config,
+            source_asr=True,
+            source_lang=config.source_lang,
+            source_asr_signature=requested_source_signature,
+        )
     retry_segments = _retry_sparse_source_asr(source_audio, config, segments, source_duration)
     if retry_segments is not segments:
         segments = retry_segments
         source_asr_changed = True
         write_srt(source_srt_path, segments, translated=False)
         _save_resume_state(config, source_asr=True, source_lang=config.source_lang, sparse_source_fallback=True)
+    loop_cleaned_source = suppress_pathological_segment_loops(segments)
+    if len(loop_cleaned_source) != len(segments):
+        write_srt(_debug_path(config, "source_before_loop_cleanup.srt"), segments, translated=False)
+        segments = loop_cleaned_source
+        source_asr_changed = True
+        write_srt(source_srt_path, segments, translated=False)
+        _save_resume_state(
+            config,
+            source_asr=True,
+            source_lang=config.source_lang,
+            source_segment_loop_cleanup=True,
+            segment_count=len(segments),
+        )
+    segments, pre_censor_changed = _apply_experimental_censor(segments, config, stage="pre")
+    if pre_censor_changed:
+        source_asr_changed = True
+        write_srt(_debug_path(config, "source_censored.srt"), segments, translated=False)
+        _save_resume_state(config, source_asr=True, source_lang=config.source_lang, pre_censor=True)
     print(f"      ASR segments: {len(segments)}")
     _report_progress(config, "Основная речь распознана", 32, 100, f"сегментов: {len(segments)}")
 
@@ -751,7 +1060,25 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     if config.resume and not source_asr_changed and _file_ready(translated_srt_path, min_size=16):
         segments = read_srt(translated_srt_path, translated=True)
         print(f"      Resume: loaded translated segments={len(segments)}")
+        segments, repeat_clamp_changed = clamp_obvious_word_repeats_in_segments(
+            segments,
+            max_word_repeats=3,
+        )
+        loop_cleaned_segments = suppress_pathological_segment_loops(segments)
+        segment_loops_changed = len(loop_cleaned_segments) != len(segments)
+        segments = loop_cleaned_segments
+        if repeat_clamp_changed or segment_loops_changed:
+            write_srt(translated_srt_path, segments, translated=True)
+            _save_resume_state(
+                config,
+                translated=True,
+                segment_count=len(segments),
+                repeat_clamp=bool(repeat_clamp_changed),
+                segment_loop_cleanup=segment_loops_changed,
+            )
+            translation_changed = True
     else:
+        segments = _prefill_sparse_source_segments(segments, config, source_audio, source_duration)
         segments = _translate_dub_segments(segments, config)
         write_srt(_debug_path(config, "translated_clean.srt"), segments, translated=True)
         segments = _maybe_distort_translations(
@@ -773,6 +1100,10 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
                 max_phrase_repeats=config.max_phrase_repeats,
                 max_word_repeats=config.max_word_repeats,
             )
+        # Before anything looks for room to place content: a segment that claims a
+        # whole silent Whisper window makes that time look occupied, so neither
+        # artifacts nor the sparse fill can land in it.
+        segments = _tighten_overlong_segments(segments)
         if artifact_segments:
             segments = _inject_artifact_segments(
                 segments,
@@ -780,14 +1111,33 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
                 config,
                 source_duration=source_duration,
             )
-        segments = _fill_sparse_dub_segments(segments, config, source_audio, source_duration)
-        segments = _fit_segment_text_budgets(segments, config)
+        segments = _fill_sparse_dub_segments_safely(segments, config, source_audio, source_duration)
+        if config.tts.lower() not in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
+            segments = _fit_segment_text_budgets(segments, config)
+        segments, repeat_clamp_changed = clamp_obvious_word_repeats_in_segments(
+            segments,
+            max_word_repeats=3,
+        )
+        segments = suppress_pathological_segment_loops(segments)
+        segments = limit_phrase_repeats_across_segments(
+            segments, max_repeats=config.max_line_repeats
+        )
         write_srt(translated_srt_path, segments, translated=True)
         _save_resume_state(config, translated=True, segment_count=len(segments))
         translation_changed = True
-    filled_segments = _fill_sparse_dub_segments(segments, config, source_audio, source_duration)
+    filled_segments = _fill_sparse_dub_segments_safely(segments, config, source_audio, source_duration)
     if filled_segments is not segments:
-        segments = _fit_segment_text_budgets(filled_segments, config)
+        segments = filled_segments
+        if config.tts.lower() not in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
+            segments = _fit_segment_text_budgets(segments, config)
+        segments, repeat_clamp_changed = clamp_obvious_word_repeats_in_segments(
+            segments,
+            max_word_repeats=3,
+        )
+        segments = suppress_pathological_segment_loops(segments)
+        segments = limit_phrase_repeats_across_segments(
+            segments, max_repeats=config.max_line_repeats
+        )
         write_srt(translated_srt_path, segments, translated=True)
         _save_resume_state(config, translated=True, segment_count=len(segments), sparse_fill=True)
         translation_changed = True
@@ -796,21 +1146,39 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     print(f"      Dub segments: {len(segments)}")
     _report_progress(config, "Перевод подготовлен", 62, 100, f"реплик: {len(segments)}")
 
+    if getattr(config, "preprocess_only", False):
+        _save_resume_state(
+            config,
+            preprocess_complete=True,
+            translated=True,
+            segment_count=len(segments),
+        )
+        _report_progress(config, "Подготовка на ноутбуке завершена", 64, 100, f"реплик: {len(segments)}")
+        print("[preprocess] Translation package is ready; TTS remains on the coordinator")
+        return translated_srt_path
+
     tts_already_fit = config.resume and _tts_fit_complete(segments, config)
 
+    # The old Demucs vocals had metallic/warbling artifacts that clone TTS
+    # would copy, so speaker identity used to come from the full-band mix
+    # instead. BS-Roformer's separated vocals are clean enough to use
+    # directly - prefer them when separation actually ran, and fall back to
+    # the raw mix otherwise (e.g. --separation none).
+    clean_vocals_path = (
+        separation_result.vocals_path
+        if separation_result and _file_ready(separation_result.vocals_path)
+        else None
+    )
     if not tts_already_fit and _needs_speaker_references(config) and config.speaker_wav is None:
-        if separation_result is not None:
-            config.speaker_wav = separation_result.vocals_path
-        else:
-            config.speaker_wav = source_audio
+        config.speaker_wav = clean_vocals_path or (mix_audio if _file_ready(mix_audio) else source_audio)
     if not tts_already_fit and _needs_speaker_references(config) and config.speaker_wav is not None:
         config.speaker_wav = _prepare_xtts_reference(config.speaker_wav, config.workdir / "speaker_refs" / "global_clean.wav")
         print(f"      Clone TTS speaker reference: {config.speaker_wav}")
 
     if not tts_already_fit and _needs_speaker_references(config) and config.multi_speaker:
         _report_progress(config, "Готовлю голосовые референсы", 64, 100, "multi-speaker")
-        reference_audio = separation_result.vocals_path if separation_result is not None else source_audio
-        _assign_segment_speaker_refs(segments, reference_audio, config)
+        reference_audio = clean_vocals_path or (mix_audio if _file_ready(mix_audio) else source_audio)
+        _assign_segment_speaker_refs(segments, reference_audio, config, diarization_audio=source_audio)
 
     _report_progress(config, "Озвучиваю реплики", 70, 100, f"provider={config.tts}, реплик: {len(segments)}")
     print(f"[4/7] Synthesizing speech provider={config.tts}")
@@ -819,7 +1187,45 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     raw_dir.mkdir(parents=True, exist_ok=True)
     fit_dir.mkdir(parents=True, exist_ok=True)
 
-    mix_items: list[tuple[Path, int]] = []
+    tts_provider = config.tts.lower()
+    batch_provider = tts_provider in {
+        "qwen3",
+        "qwen3-tts",
+        "qwen3tts",
+        "cosyvoice",
+        "cosyvoice-tts",
+        "cosyvoicetts",
+        "cosy",
+        "moss",
+        "moss-tts",
+        "mosstts",
+        "moss-v1.5",
+    }
+    batch_items: list[tuple[int, Segment, Path]] = []
+    if batch_provider:
+        for index, segment in enumerate(segments, start=1):
+            fitted_path = fit_dir / f"{index:05d}.wav"
+            if segment.spoken_text and not (config.resume and _file_ready(fitted_path)):
+                batch_items.append((index, segment, raw_dir / f"{index:05d}.wav"))
+        if batch_items:
+            try:
+                if tts_provider in {"qwen3", "qwen3-tts", "qwen3tts"}:
+                    synthesize_qwen3_batch(batch_items, config)
+                elif tts_provider in {"cosyvoice", "cosyvoice-tts", "cosyvoicetts", "cosy"}:
+                    synthesize_cosyvoice_batch(batch_items, config)
+                elif tts_provider in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
+                    synthesize_moss_batch(batch_items, config)
+            except Exception as exc:
+                print(f"      {config.tts} batch fallback to F5: {type(exc).__name__}: {exc}")
+                fallback_config = copy(config)
+                fallback_config.tts = "f5"
+                for _index, segment, raw_path in batch_items:
+                    if _file_ready(raw_path):
+                        continue
+                    raw_path.unlink(missing_ok=True)
+                    synthesize_segment(segment, raw_path, fallback_config)
+
+    fitted_items: list[tuple[Segment, Path]] = []
     for index, segment in enumerate(segments, start=1):
         if not segment.spoken_text:
             continue
@@ -828,18 +1234,34 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         if config.resume and _file_ready(fitted_path):
             print(f"      Resume: using fitted TTS segment {index}/{len(segments)}")
         else:
-            synthesize_segment(segment, raw_path, config)
-            if config.fit_to_segments:
+            if not batch_provider:
+                synthesize_segment(segment, raw_path, config)
+            if tts_provider in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
+                # MOSS controls its own delivery and must be allowed to finish
+                # the phrase instead of being time-stretched or trimmed.
+                normalize_wav(raw_path, fitted_path)
+                if config.trim_tts_silence:
+                    _trim_tts_silence(fitted_path, config.tts_max_pause_seconds)
+            elif config.fit_to_segments:
                 fit_wav_to_duration(raw_path, fitted_path, max(0.1, segment.duration))
             else:
                 normalize_wav(raw_path, fitted_path)
-        mix_items.append((fitted_path, int(segment.start * 1000)))
+        fitted_items.append((segment, fitted_path))
         if index == len(segments) or index % 5 == 0:
             percent = 70 + round(20 * index / max(1, len(segments)))
-            _report_progress(config, "Озвучиваю реплики", percent, 100, f"сегмент {index}/{len(segments)}")
+            position = _format_video_position(segment.end, source_duration)
+            _report_progress(
+                config,
+                "Озвучиваю реплики",
+                percent,
+                100,
+                f"сегмент {index}/{len(segments)} · {position}",
+            )
         if index % 25 == 0:
             print(f"      synthesized {index}/{len(segments)}")
     _save_resume_state(config, tts_fit=True)
+
+    mix_items = _plan_overlap_aware_mix(fitted_items, source_audio, config)
 
     _report_progress(config, "Собираю аудиодорожку", 92, 100, None)
     print("[5/7] Mixing dub track")
@@ -856,6 +1278,18 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     final_original_volume = 0.0 if config.audio_bed == "dub-only" else config.original_volume
     if config.resume and _file_ready(config.output, min_size=4096):
         print(f"      Resume: using existing final video {config.output}")
+    elif config.audio_bed == "multitrack":
+        combine_video_audio_multitrack(
+            video_path=video_path,
+            original_audio_path=mix_audio,
+            dub_path=dub_track,
+            output_path=config.output,
+            dub_volume=config.dub_volume,
+            bed_volume=final_original_volume,
+            bed_path=bed_path,
+            original_lang=config.source_lang,
+            dub_lang=config.target_lang,
+        )
     else:
         combine_video_audio(
             video_path=video_path,
@@ -872,6 +1306,72 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
     return config.output
 
 
+def _catalog_artifact_segments(
+    config: DubConfig,
+    base_segments: list[Segment],
+    source_duration: float,
+) -> list[Segment]:
+    """Artifacts taken from the catalogue instead of hunted with a second ASR pass.
+
+    The hunt re-ran Whisper over the whole audio just to collect what it
+    invented - a median of 10 seconds but up to 20 minutes on long input. The
+    catalogue holds the same kind of material for 100 languages, so the phrases
+    cost nothing and are no longer limited to what this one video provoked.
+
+    Timings are spread across the video only as a starting point: the injection
+    stage re-fits each interval to the length of its text, exactly as it does
+    for hunted artifacts.
+    """
+    from .hallucination_catalog import shared_catalog
+
+    artifact_lang = config.artifact_source_lang
+    # Ask only for what can actually be injected, plus a margin for candidates
+    # that get rejected on timing. Sizing this off artifact_max_segments meant
+    # 128 phrases on a normal job - the chaos mode raises that cap to 64 - and
+    # every one of them then went through the distortion chains. That traded
+    # the ASR pass we saved for a translation bill several times larger.
+    injectable = len(base_segments) * max(0.05, float(config.artifact_ratio or 0.2))
+    wanted = int(max(8, min(32, round(injectable * 3))))
+    catalog = shared_catalog(getattr(config, "hallucination_catalog_path", None) or None)
+    phrases = catalog.phrases(
+        artifact_lang,
+        wanted,
+        seed=str(config.translation_seed or config.workdir),
+        cross_language_share=float(getattr(config, "artifact_cross_language_share", 0.15)),
+    )
+    if not phrases:
+        print("      Catalogue has no phrases for this language", flush=True)
+        return []
+
+    duration = max(1.0, source_duration)
+    step = duration / (len(phrases) + 1)
+    segments: list[Segment] = []
+    for index, phrase in enumerate(phrases, start=1):
+        start = min(duration - 0.5, max(0.0, step * index))
+        segments.append(
+            Segment(start=start, end=min(duration, start + _estimated_chaos_spoken_duration(phrase)), text=phrase)
+        )
+    print(
+        f"      Artifact catalogue: {len(segments)} phrase(s) for {artifact_lang}"
+        f" (of {catalog.size(artifact_lang)} listed)",
+        flush=True,
+    )
+    _report_progress(config, "Беру артефакты из каталога", 34, 100, f"фраз: {len(segments)}")
+    return _translate_and_clean_artifacts(
+        segments,
+        _artifact_translation_config(config, artifact_lang),
+        _debug_path(config, "artifact_catalog_translated.srt"),
+    )
+
+
+def _artifact_translation_config(config: DubConfig, artifact_lang: str) -> DubConfig:
+    artifact_config = copy(config)
+    artifact_config.source_lang = artifact_lang
+    artifact_config.input_pivot_lang = None
+    artifact_config.inject_artifacts = False
+    return artifact_config
+
+
 def _build_artifact_segments(
     source_audio: Path,
     config: DubConfig,
@@ -880,6 +1380,14 @@ def _build_artifact_segments(
     artifact_lang = config.artifact_source_lang
     if not config.inject_artifacts or not artifact_lang or artifact_lang == "auto":
         return []
+    if str(getattr(config, "artifact_source", "whisper")).lower() == "catalog":
+        # Catalogue mode skips the hunt entirely, including the same-language
+        # rule below: that rule exists because hunting in the language already
+        # transcribed finds nothing new, which does not apply to a lookup.
+        source_duration = max(
+            (segment.end for segment in base_segments), default=0.0
+        )
+        return _catalog_artifact_segments(config, base_segments, source_duration)
     same_language_hunt = bool(config.source_lang and artifact_lang == config.source_lang)
     ru_same_language_hunt = same_language_hunt and artifact_lang == "ru"
     if same_language_hunt and not ru_same_language_hunt:
@@ -907,11 +1415,9 @@ def _build_artifact_segments(
     artifact_config.force_source_language = True
     artifact_config.suppress_plain_ascii_tokens = False
     artifact_config.condition_on_previous_text = True
-    artifact_config.initial_prompt = _artifact_initial_prompt(
-        artifact_lang,
-        same_language=ru_same_language_hunt,
-        seed_material=f"{config.workdir}|artifact|full",
-    )
+    # Only accept hallucinations produced from this video's audio. Supplying
+    # known phrases here made prompted text look like a genuine Whisper find.
+    artifact_config.initial_prompt = None
     artifact_config.hallucination_silence_threshold = None
     artifact_config.collapse_repetitions = True
     try:
@@ -935,6 +1441,9 @@ def _build_artifact_segments(
             100,
             f"resume: кандидатов {len(whole_artifacts)}",
         )
+        whole_artifacts = _limit_chaos_artifacts_before_translation(
+            whole_artifacts, base_segments, config
+        )
         whole_artifacts = _translate_and_clean_artifacts(
             whole_artifacts,
             artifact_config,
@@ -943,8 +1452,25 @@ def _build_artifact_segments(
     else:
         try:
             artifact_audio = _whisper_chaos_audio(source_audio, artifact_config, purpose="artifact")
-            full_artifacts = transcribe(artifact_audio, artifact_config)
-            full_artifacts = _clamp_segments_to_duration(full_artifacts, source_duration)
+            # The chaos-backbone path has already run a full forced-language
+            # decode and saved it before the clean timing pass. Reuse that
+            # genuine current-video Whisper output instead of decoding the
+            # complete audio a second time with the same language. Short
+            # independent windows are still harvested below because those are
+            # what produce the useful extra hallucinations.
+            full_artifacts = (
+                _load_current_forced_artifact_seed(config, artifact_lang)
+                if config.content_chaos_backbone
+                else []
+            )
+            if full_artifacts:
+                print(
+                    "      Reusing main forced-ASR output for artifact layer: "
+                    f"segments={len(full_artifacts)}"
+                )
+            else:
+                full_artifacts = transcribe(artifact_audio, artifact_config)
+                full_artifacts = _clamp_segments_to_duration(full_artifacts, source_duration)
             chunk_artifacts = (
                 _harvest_chunked_forced_artifacts(artifact_audio, artifact_config, config, source_duration)
                 if config.artifact_chaos_mode
@@ -968,6 +1494,9 @@ def _build_artifact_segments(
                 write_srt(forced_source_path, whole_artifacts, translated=False)
                 write_srt(_debug_path(config, "artifact_source.srt"), whole_artifacts, translated=False)
                 if whole_artifacts:
+                    whole_artifacts = _limit_chaos_artifacts_before_translation(
+                        whole_artifacts, base_segments, config
+                    )
                     whole_artifacts = _translate_and_clean_artifacts(
                         whole_artifacts,
                         artifact_config,
@@ -977,14 +1506,6 @@ def _build_artifact_segments(
             print(f"      Whisper artifact layer skipped: {type(exc).__name__}: {exc}")
 
     artifacts = whole_artifacts if config.artifact_chaos_mode else _dedupe_artifact_segments(whole_artifacts)
-    if config.artifact_chaos_mode:
-        artifacts = _fill_sparse_artifacts_from_history(
-            artifacts,
-            config,
-            artifact_lang,
-            base_segments,
-            source_duration,
-        )
     if artifacts:
         write_srt(_debug_path(config, "artifact_translated.srt"), artifacts, translated=True)
         print(f"      Artifact candidates: {len(artifacts)}")
@@ -1009,14 +1530,79 @@ def _retry_sparse_source_asr(
     if _asr_is_too_sparse(fallback_segments, source_duration):
         return segments
 
+    merged_segments = _merge_sparse_fill_segments(segments, fallback_segments)
+    if merged_segments is segments:
+        return segments
     print(
-        "      Source ASR is sparse; using stable fallback "
-        f"segments={len(fallback_segments)} lang={detected_lang or 'auto'}"
+        "      Source ASR is sparse; merging stable fallback "
+        f"segments={len(fallback_segments)} added={len(merged_segments) - len(segments)} "
+        f"lang={detected_lang or 'auto'}"
     )
     write_srt(_debug_path(config, "sparse_source_fallback.srt"), fallback_segments, translated=False)
     if detected_lang:
         config.source_lang = detected_lang
-    return fallback_segments
+    return merged_segments
+
+
+def _prefill_sparse_source_segments(
+    segments: list[Segment],
+    config: DubConfig,
+    source_audio: Path,
+    source_duration: float,
+) -> list[Segment]:
+    """Top up a thin transcript *before* it is translated.
+
+    The sparse check needs only timings and text length, both of which the
+    untranslated segments already have. Running it afterwards meant the thin
+    set was translated and distorted first, then the fill ran and translated
+    its own set too: job 49447 paid for 30 lines and then 137 more, every one
+    of them through the distortion chains. Filling first means one pass.
+
+    Best-effort by design - the fallback ASR is an extra, so a failure here
+    leaves the original segments alone and the post-translation fill still
+    gets its turn.
+    """
+    if not _should_sparse_fill(config) or not _dub_is_too_sparse(segments, source_duration):
+        return segments
+    try:
+        fallback_source, detected_lang = _stable_fallback_source_asr(
+            source_audio, config, source_duration
+        )
+    except Exception as exc:
+        print(f"      Pre-translation fill skipped: {type(exc).__name__}: {exc}", flush=True)
+        return segments
+    if _asr_is_too_sparse(fallback_source, source_duration):
+        return segments
+
+    merged = _merge_sparse_fill_segments(segments, fallback_source)
+    if merged is segments:
+        return segments
+    if detected_lang and not config.source_lang:
+        config.source_lang = detected_lang
+    print(
+        f"      Pre-translation fill added {len(merged) - len(segments)} line(s); "
+        "translating once instead of twice",
+        flush=True,
+    )
+    _report_progress(config, "Добираю пустые места", 50, 100, f"реплик: {len(merged)}")
+    return merged
+
+
+def _fill_sparse_dub_segments_safely(
+    segments: list[Segment],
+    config: DubConfig,
+    source_audio: Path,
+    source_duration: float,
+) -> list[Segment]:
+    """Sparse fill only tops up gaps the main ASR left thin, so its failure
+    must not cost a finished dub. Whisper misdetecting the fallback language -
+    nn on music, say - used to take the whole job down with "Argos package is
+    missing for nn->id"."""
+    try:
+        return _fill_sparse_dub_segments(segments, config, source_audio, source_duration)
+    except Exception as exc:
+        print(f"      Sparse fill skipped after failure: {type(exc).__name__}: {exc}", flush=True)
+        return segments
 
 
 def _fill_sparse_dub_segments(
@@ -1025,6 +1611,9 @@ def _fill_sparse_dub_segments(
     source_audio: Path,
     source_duration: float,
 ) -> list[Segment]:
+    # Do this first: a segment claiming a whole silent window would otherwise both
+    # hide the hole from the check below and reject any fill landing inside it.
+    segments = _tighten_overlong_segments(segments)
     if not _should_sparse_fill(config) or not _dub_is_too_sparse(segments, source_duration):
         return segments
 
@@ -1110,6 +1699,33 @@ def _stable_fallback_source_asr(
     return segments, fallback.source_lang
 
 
+def _reference_timing_source_asr(
+    source_audio: Path,
+    config: DubConfig,
+    source_duration: float,
+) -> tuple[list[Segment], str | None]:
+    """Run a quick clean auto-language pass and use only its speech intervals."""
+    timing = copy(config)
+    timing.source_lang = None
+    timing.force_source_language = False
+    timing.reference_timing_asr = False
+    timing.glitch_profile = "clean"
+    timing.initial_prompt = None
+    timing.hallucination_silence_threshold = None
+    timing.inject_artifacts = False
+    timing.artifact_chaos_mode = False
+    timing.suppress_plain_ascii_tokens = False
+    try:
+        segments = transcribe(source_audio, timing)
+        segments = _clamp_segments_to_duration(segments, source_duration)
+        segments = clean_segments(segments)
+        if segments:
+            return segments, timing.source_lang
+    except Exception as exc:
+        print(f"      Fast timing ASR failed; trying stable fallback: {type(exc).__name__}: {exc}")
+    return _stable_fallback_source_asr(source_audio, config, source_duration)
+
+
 def _merge_sparse_fill_segments(segments: list[Segment], fallback_segments: list[Segment]) -> list[Segment]:
     candidates = [segment for segment in fallback_segments if segment.spoken_text]
     if not candidates:
@@ -1131,6 +1747,63 @@ def _merge_sparse_fill_segments(segments: list[Segment], fallback_segments: list
     return sorted(result, key=lambda item: (item.start, item.end))
 
 
+def _align_forced_text_to_reference_timings(
+    forced_segments: list[Segment],
+    timing_segments: list[Segment],
+) -> list[Segment]:
+    """Keep forced-ASR wording while borrowing only speech intervals from clean ASR."""
+    references = sorted(
+        (
+            segment
+            for segment in timing_segments
+            if segment.end - segment.start >= 0.15 and segment.text.strip()
+        ),
+        key=lambda item: (item.start, item.end),
+    )
+    if not references:
+        return forced_segments
+
+    text_parts: list[str] = []
+    previous = ""
+    for segment in sorted(forced_segments, key=lambda item: (item.start, item.end)):
+        text = " ".join(segment.text.split()).strip()
+        signature = re.sub(r"[\W_]+", "", text, flags=re.UNICODE).casefold()
+        if not text or (signature and signature == previous):
+            continue
+        text_parts.append(text)
+        previous = signature
+    if not text_parts:
+        return []
+
+    text = " ".join(text_parts)
+    units = re.findall(r"[\u3040-\u30ff\u3400-\u9fff]{1,4}|\S+", text)
+    if not units:
+        return []
+
+    durations = [max(0.15, segment.duration) for segment in references]
+    total_duration = sum(durations)
+    buckets: list[list[str]] = [[] for _ in references]
+    cumulative: list[float] = []
+    elapsed = 0.0
+    for duration in durations:
+        elapsed += duration
+        cumulative.append(elapsed / total_duration)
+
+    reference_index = 0
+    for unit_index, unit in enumerate(units):
+        position = (unit_index + 0.5) / len(units)
+        while reference_index < len(cumulative) - 1 and position > cumulative[reference_index]:
+            reference_index += 1
+        buckets[reference_index].append(unit)
+
+    result: list[Segment] = []
+    for reference, bucket in zip(references, buckets):
+        if not bucket:
+            continue
+        result.append(Segment(start=reference.start, end=reference.end, text=" ".join(bucket)))
+    return result
+
+
 def _fill_segment_conflicts(candidate: Segment, existing: Segment) -> bool:
     if not existing.spoken_text:
         return False
@@ -1141,11 +1814,12 @@ def _fill_segment_conflicts(candidate: Segment, existing: Segment) -> bool:
     return overlap / shortest >= 0.35
 
 
-def _load_resumable_artifact_source(config: DubConfig, artifact_lang: str) -> list[Segment]:
-    candidates = [
-        _debug_path(config, "artifact_source.srt"),
-        config.workdir / f"forced_{_safe_label(artifact_lang)}_transcript.srt",
-    ]
+def _load_resumable_artifact_source(config: DubConfig, _artifact_lang: str) -> list[Segment]:
+    # `forced_<lang>_transcript.srt` is also written by the main forced-ASR
+    # pass before the artifact layer starts. Treating it as a resumable
+    # artifact source makes every fresh job skip the short-window harvest.
+    # Only this layer's own debug output is unambiguous and safe to resume.
+    candidates = [_debug_path(config, "artifact_source.srt")]
     for path in candidates:
         if not _file_ready(path, min_size=16):
             continue
@@ -1158,6 +1832,58 @@ def _load_resumable_artifact_source(config: DubConfig, artifact_lang: str) -> li
             print(f"      Resume: loaded artifact source {path} segments={len(segments)}")
             return segments
     return []
+
+
+def _load_current_forced_artifact_seed(config: DubConfig, artifact_lang: str) -> list[Segment]:
+    """Reuse the main forced decode without suppressing fresh chunk harvest.
+
+    This is deliberately separate from ``_load_resumable_artifact_source``:
+    the latter represents a complete, already-harvested artifact layer, while
+    this file contains only the full-video seed produced earlier in the same
+    run. Fresh five-second windows must still be decoded.
+    """
+    path = config.workdir / f"forced_{_safe_label(artifact_lang)}_transcript.srt"
+    if not _file_ready(path, min_size=16):
+        return []
+    try:
+        return read_srt(path, translated=False)
+    except Exception as exc:
+        print(f"      Could not reuse forced artifact seed {path}: {type(exc).__name__}: {exc}")
+        return []
+
+
+# Ghiền Mì Gõ is a real Vietnamese channel whose videos are the usual input,
+# so Whisper faithfully transcribes its outro - the dub ends up advertising a
+# competitor, 168 times against 16 of our own across 2644 jobs. Whisper also
+# latches onto the name and stutters it ("Ghiền Mì Ghiền Mì Ghiền Mì Ghiền"),
+# so the repeats are folded back into one mention before the swap.
+_VI_E = "eêềếệểễ"
+_VI_I = "iìíịỉĩ"
+_VI_O = "oòóọỏõôồốộổỗơờớợởỡ"
+_CHANNEL_WORD = f"(?:ghi[{_VI_E}]n|m[{_VI_I}]|g[{_VI_O}])"
+_FOREIGN_CHANNEL_RE = re.compile(
+    rf"ghi[{_VI_E}]n(?:\s+{_CHANNEL_WORD})*",
+    re.IGNORECASE | re.UNICODE,
+)
+OUR_CHANNEL_NAME = "La La School"
+# Half the mentions keep the original name: the artifacts are meant to feel
+# like something that slipped through, and a name that is always ours reads
+# as deliberate branding instead.
+CHANNEL_REBRAND_SHARE = 0.5
+
+
+def _rebrand_foreign_channel(text: str, config: DubConfig) -> str:
+    if not text or not _FOREIGN_CHANNEL_RE.search(text):
+        return text
+    share = float(getattr(config, "channel_rebrand_share", CHANNEL_REBRAND_SHARE))
+    if share <= 0.0:
+        return text
+    # Seeded on the line itself, so a rerun of the same job rebrands the same
+    # mentions rather than reshuffling them.
+    digest = hashlib.sha256(f"{_translation_seed_base(config)}|{text}".encode("utf-8")).digest()
+    if share < 1.0 and (int.from_bytes(digest[:4], "big") / 0xFFFFFFFF) >= share:
+        return text
+    return _FOREIGN_CHANNEL_RE.sub(OUR_CHANNEL_NAME, text)
 
 
 def _translate_and_clean_artifacts(
@@ -1178,6 +1904,9 @@ def _translate_and_clean_artifacts(
             max_phrase_repeats=2,
             max_word_repeats=2,
         )
+    for artifact in artifacts:
+        if artifact.translated_text:
+            artifact.translated_text = _rebrand_foreign_channel(artifact.translated_text, artifact_config)
     write_srt(output_path, artifacts, translated=True)
     return artifacts
 
@@ -1218,7 +1947,23 @@ def _translate_dub_segments(segments: list[Segment], config: DubConfig) -> list[
         pivot_config.source_lang = source_lang
         pivot_config.target_lang = pivot_lang
         pivot_config.input_pivot_lang = None
-        translate_segments(pivot_segments, pivot_config)
+        try:
+            translate_segments(pivot_segments, pivot_config)
+        except Exception as exc:
+            # The pivot hop is extra flavour, not the translation itself. It is
+            # also the most fragile part: the source language is often a
+            # misdetection (is, nn) with no local route, so the hop dies the
+            # moment the online translator is rate-limited. Going direct still
+            # produces a real dub instead of losing the job.
+            print(
+                f"      Input-pivot hop {source_lang}->{pivot_lang} failed, going direct: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            direct_config = copy(config)
+            direct_config.source_lang = source_lang
+            direct_config.input_pivot_lang = None
+            return _translate_dub_segments(segments, direct_config)
 
     input_path = config.workdir / f"input_{_safe_label(pivot_lang)}.srt"
     write_srt(input_path, pivot_segments, translated=True)
@@ -1315,6 +2060,30 @@ def _normalize_lang(language: str | None) -> str | None:
     return language
 
 
+def _artifact_corruption_language(
+    selected_lang: str | None,
+    detected_lang: str | None,
+    config: DubConfig,
+) -> str | None:
+    selected = _normalize_lang(selected_lang)
+    detected = _normalize_lang(detected_lang)
+    if not selected or selected != detected or selected == "ru":
+        return selected
+
+    # A correctly selected non-Russian language used to disable the artifact
+    # layer completely. Keep the stable automatic transcript as the content
+    # backbone, but harvest the configured 20% artifact share with a
+    # deliberately wrong Whisper language. Vietnamese is the most reliable
+    # source of the familiar subtitle/subscribe hallucinations in our runs;
+    # English is the fallback when the real speech is Vietnamese.
+    artifact_lang = "en" if detected == "vi" else "vi"
+    print(
+        "      Same-language chaos fallback: "
+        f"selected={selected} detected={detected} artifact={artifact_lang}"
+    )
+    return artifact_lang
+
+
 def _artifact_initial_prompt(
     language: str | None,
     *,
@@ -1357,9 +2126,21 @@ def _translate_artifact_segments(artifacts: list[Segment], artifact_config: DubC
 
 
 def _artifact_translation_source_lang(text: str, fallback_lang: str | None) -> str:
+    if _looks_vietnamese_text(text):
+        return "vi"
     if _looks_mostly_ascii(text) and _looks_like_meta_hallucination(text):
         return "en"
     return fallback_lang or "en"
+
+
+def _looks_vietnamese_text(text: str) -> bool:
+    normalized = text.casefold()
+    if any(
+        phrase in normalized
+        for phrase in ("cảm ơn", "cám ơn", "đăng ký", "các bạn", "theo dõi", "ghiền mì gõ")
+    ):
+        return True
+    return bool(re.search(r"[ăâđêôơưàáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửữựỳýỷỹỵ]", normalized))
 
 
 def _looks_mostly_ascii(text: str) -> bool:
@@ -1479,19 +2260,27 @@ def _fill_sparse_artifacts_from_history(
     if config.target_lang != "ru":
         return artifacts
 
-    max_total = min(_chaos_artifact_count_budget(config, source_duration), 8)
+    max_total = min(max(0, config.artifact_max_segments), 8)
     if max_total <= 0:
         return artifacts
-    min_total = min(max_total, max(1, math.ceil(source_duration / 30.0)))
-    if len(artifacts) >= min_total:
+    min_total = min(5, max_total)
+    ratio_limit = round(len(base_segments) * max(0.0, min(1.0, config.artifact_ratio)))
+    if config.artifact_ratio > 0.0 and ratio_limit <= 0 and base_segments:
+        ratio_limit = 1
+    injection_slots = min(max_total, ratio_limit)
+    # Always reserve part of the existing artifact allowance for the familiar
+    # legacy corpus. This does not raise the 20% cap: the final injector still
+    # chooses at most injection_slots candidates in total.
+    legacy_quota = min(2, injection_slots)
+    sparse_needed = max(0, min_total - len(artifacts))
+    needed = max(legacy_quota, sparse_needed)
+    if needed <= 0:
         return artifacts
-
-    needed = min_total - len(artifacts)
     borrowed = _borrow_historical_artifacts(config, artifacts, base_segments, source_duration, needed)
     if not borrowed:
         return artifacts
 
-    print(f"      Historical artifact borrow: added={len(borrowed)}")
+    print(f"      Legacy/historical artifact mix: added={len(borrowed)} quota={legacy_quota}")
     write_srt(_debug_path(config, "artifact_borrowed.srt"), borrowed, translated=True)
     return [*artifacts, *borrowed]
 
@@ -1508,7 +2297,7 @@ def _borrow_historical_artifacts(
         return []
 
     existing_signatures = {_artifact_signature(segment.spoken_text or segment.text) for segment in existing}
-    texts = _historical_artifact_texts(config, existing_signatures, limit=needed * 4)
+    texts = _historical_artifact_texts(config, existing_signatures, limit=needed * 2)
     if not texts:
         return []
 
@@ -1532,9 +2321,34 @@ def _historical_artifact_texts(
     *,
     limit: int,
 ) -> list[str]:
+    seed_material = f"{_translation_seed_base(config)}|historical-artifacts"
+    seed = int.from_bytes(hashlib.sha256(seed_material.encode("utf-8", errors="ignore")).digest()[:8], "big")
+    rng = random.Random(seed)
+
+    legacy_pool = [
+        text
+        for text in _legacy_artifact_inserts_ru()
+        if _artifact_signature(text) not in existing_signatures
+    ]
+    rng.shuffle(legacy_pool)
+
+    result: list[str] = []
+    family_counts: dict[str, int] = {}
+    for text in legacy_pool:
+        family = _artifact_family(text)
+        if family_counts.get(family, 0) >= 2:
+            continue
+        family_counts[family] = family_counts.get(family, 0) + 1
+        result.append(text)
+        if len(result) >= limit:
+            return result
+
+    # The editable legacy bank normally satisfies the requested quota without
+    # scanning thousands of old runs on F:. Use real historical artifacts only
+    # as a fallback when the bank is too small or heavily deduplicated.
     runs_root = _runs_root_from_workdir(config.workdir)
     if runs_root is None or not runs_root.exists():
-        return []
+        return result
 
     paths = [
         path
@@ -1548,9 +2362,9 @@ def _historical_artifact_texts(
     ]
     paths.sort(key=lambda path: path.stat().st_mtime, reverse=True)
 
-    result: list[str] = []
+    history_pool: list[str] = []
     seen = set(existing_signatures)
-    family_counts: dict[str, int] = {}
+    seen.update(_artifact_signature(text) for text in legacy_pool)
     for path in paths[:100]:
         try:
             segments = read_srt(path, translated=True)
@@ -1562,18 +2376,34 @@ def _historical_artifact_texts(
             text = " ".join((segment.spoken_text or segment.text).split()).strip()
             if not text or not _looks_like_meta_hallucination(text):
                 continue
+            if not _artifact_text_matches_target_language(text, config.target_lang):
+                continue
             signature = _artifact_signature(text)
             if signature in seen:
                 continue
-            family = _artifact_family(text)
-            if family_counts.get(family, 0) >= 2:
-                continue
             seen.add(signature)
-            family_counts[family] = family_counts.get(family, 0) + 1
-            result.append(text)
-            if len(result) >= limit:
-                return result
+            history_pool.append(text)
+    rng.shuffle(history_pool)
+    for text in history_pool:
+        family = _artifact_family(text)
+        if family_counts.get(family, 0) >= 2:
+            continue
+        family_counts[family] = family_counts.get(family, 0) + 1
+        result.append(text)
+        if len(result) >= limit:
+            break
     return result
+
+
+def _artifact_text_matches_target_language(text: str, target_lang: str | None) -> bool:
+    """Keep historical inserts in the language the user selected for output."""
+    if target_lang != "ru":
+        return True
+    letters = [char for char in text if char.isalpha()]
+    if not letters:
+        return False
+    cyrillic = sum(1 for char in letters if "\u0400" <= char <= "\u052f")
+    return cyrillic / len(letters) >= 0.35
 
 
 def _runs_root_from_workdir(workdir: Path) -> Path | None:
@@ -1631,6 +2461,12 @@ def _artifact_signature(text: str) -> str:
 
 def _artifact_family(text: str) -> str:
     normalized = _artifact_signature(text)
+    if "lalaschool" in normalized or "la la school" in normalized or "ла ла скул" in normalized or "лалашкол" in normalized:
+        return "lalaschool"
+    if "большая семья" in normalized:
+        return "big_family"
+    if "девушки отдыхают" in normalized or "девушка отдыхает" in normalized or "девочки отдыхают" in normalized:
+        return "girls_resting"
     if "продолжение следует" in normalized:
         return "continued"
     if "редактор" in normalized or "корректор" in normalized or "семкин" in normalized or "егорова" in normalized:
@@ -1639,7 +2475,18 @@ def _artifact_family(text: str) -> str:
         return "thanks_subtitles"
     if "подогнал" in normalized:
         return "subtitle_sync"
-    if "подпис" in normalized or "subscribe" in normalized or "abonnieren" in normalized:
+    # "подпишитесь"/"подпишись" share no prefix with "подписаться", so matching
+    # only "подпис" split one family in two and doubled how many of these the
+    # per-family cap let through. Whisper's channel-outro hallucinations are
+    # almost always some phrasing of this, so they need to count as one family.
+    if (
+        "подпис" in normalized
+        or "подпиш" in normalized
+        or "subscribe" in normalized
+        or "abonnieren" in normalized
+        or "dang ky" in normalized
+        or "đăng ký" in normalized  # the signature keeps Vietnamese diacritics
+    ):
         return "subscribe"
     if "amara" in normalized:
         return "amara"
@@ -1671,6 +2518,23 @@ def _whisper_chaos_audio(source_audio: Path, config: DubConfig, *, purpose: str)
         return source_audio
 
 
+def _apply_experimental_censor(
+    segments: list[Segment],
+    config: DubConfig,
+    *,
+    stage: str,
+) -> tuple[list[Segment], bool]:
+    percent = max(0, min(100, int(config.censor_percent or 0)))
+    if percent <= 0:
+        return segments, False
+    result = apply_censor_to_segments(
+        segments,
+        percent=percent,
+        seed=f"{_translation_seed_base(config)}|{stage}",
+    )
+    return result.segments, result.replacements > 0
+
+
 def _harvest_chunked_forced_artifacts(
     source_audio: Path,
     artifact_config: DubConfig,
@@ -1682,30 +2546,31 @@ def _harvest_chunked_forced_artifacts(
 
     chunk_dir = config.workdir / "artifact_chunks"
     chunk_dir.mkdir(parents=True, exist_ok=True)
-    windows = _artifact_harvest_windows(source_duration)
+    windows = _artifact_harvest_windows(source_duration, config.artifact_ratio)
     if not windows:
         return []
 
     print(f"      Chaos artifact chunk harvest: windows={len(windows)}")
     chunk_config = copy(artifact_config)
     chunk_config.condition_on_previous_text = True
-    same_language_ru = bool(
-        artifact_config.source_lang == "ru"
-        and config.source_lang
-        and artifact_config.source_lang == config.source_lang
-    )
     result: list[Segment] = []
     for index, (start, duration) in enumerate(windows, start=1):
-        chunk_config.initial_prompt = _artifact_initial_prompt(
-            artifact_config.source_lang,
-            same_language=same_language_ru,
-            seed_material=f"{config.workdir}|artifact|chunk|{index}",
-        ) or artifact_config.initial_prompt
+        chunk_config.initial_prompt = None
         chunk_path = chunk_dir / f"{index:04d}_{start:.2f}_{duration:.2f}.wav"
         try:
             extract_wav_slice(source_audio, chunk_path, start, duration)
             chunk_segments = transcribe(chunk_path, chunk_config)
             chunk_segments = _clamp_segments_to_duration(chunk_segments, duration)
+            # Short independent decodes are deliberately prone to useful
+            # hallucinations, but occasionally end in hundreds of copies of
+            # one word or phrase. Keep that flavour without letting the tail
+            # dominate the translated subtitle and TTS duration.
+            chunk_segments = collapse_repetitions_in_segments(
+                chunk_segments,
+                max_phrase_repeats=4,
+                max_word_repeats=4,
+                max_ngram_words=8,
+            )
             result.extend(_offset_segments(chunk_segments, start, source_duration))
         except Exception as exc:
             print(f"      Chaos artifact chunk skipped {index}/{len(windows)}: {type(exc).__name__}: {exc}")
@@ -1716,32 +2581,39 @@ def _harvest_chunked_forced_artifacts(
     return result
 
 
-def _artifact_harvest_windows(source_duration: float) -> list[tuple[float, float]]:
-    chunk_seconds = 12.0 if source_duration <= 80.0 else 18.0
-    stride = 6.0 if source_duration <= 80.0 else 12.0
-    max_windows = 18 if source_duration <= 180.0 else 24
-    windows: list[tuple[float, float]] = []
-    start = 0.0
-    while start < source_duration and len(windows) < max_windows:
-        duration = min(chunk_seconds, source_duration - start)
-        if duration >= 3.0:
-            windows.append((start, duration))
-        start += stride
+def _artifact_harvest_windows(
+    source_duration: float,
+    artifact_ratio: float = 0.20,
+) -> list[tuple[float, float]]:
+    chunk_seconds = 5.0
+    max_windows = 12
+    if source_duration < 0.5:
+        return []
 
-    tail_start = max(0.0, source_duration - chunk_seconds)
-    if windows and source_duration - (windows[-1][0] + windows[-1][1]) > 1.0:
-        windows.append((tail_start, min(chunk_seconds, source_duration - tail_start)))
-    elif not windows:
-        windows.append((tail_start, min(chunk_seconds, source_duration - tail_start)))
+    starts = [index * chunk_seconds for index in range(int(source_duration // chunk_seconds) + 1)]
+    windows = [
+        (start, min(chunk_seconds, source_duration - start))
+        for start in starts
+        if source_duration - start >= 0.5
+    ]
+    # We ultimately inject only ``artifact_ratio`` of the dialogue. Decode
+    # roughly twice that share of the timeline to leave enough candidates
+    # after filtering, with a small floor for short clips. The previous fixed
+    # cap decoded 24 independent windows even when only 20% could be used.
+    coverage = max(0.10, min(1.0, float(artifact_ratio) * 2.0))
+    target_windows = min(max_windows, max(3, math.ceil(len(windows) * coverage)))
+    target_windows = min(len(windows), target_windows)
+    if len(windows) <= target_windows:
+        return windows
 
-    deduped: list[tuple[float, float]] = []
-    seen: set[tuple[int, int]] = set()
-    for start, duration in windows[:max_windows]:
-        key = (round(start * 10), round(duration * 10))
-        if key not in seen and duration >= 3.0:
-            seen.add(key)
-            deduped.append((start, duration))
-    return deduped
+    # Do not make long videos spend minutes decoding hundreds of tiny files.
+    # Sample the same 5-second windows evenly over the complete timeline.
+    last_start = max(0.0, source_duration - chunk_seconds)
+    step = last_start / (target_windows - 1)
+    return [
+        (min(last_start, round(index * step, 3)), chunk_seconds)
+        for index in range(target_windows)
+    ]
 
 
 def _offset_segments(segments: list[Segment], offset: float, source_duration: float) -> list[Segment]:
@@ -1821,6 +2693,8 @@ def _maybe_distort_translations(
     print(f"      Distorting translation through {len(chains)} chain variant(s): {summary}")
     changed = 0
     fallback_count = 0
+    second_pass_count = 0
+    second_pass_failures = 0
     for index, segment in enumerate(segments):
         text = (segment.translated_text or segment.text).strip()
         if not text:
@@ -1828,7 +2702,7 @@ def _maybe_distort_translations(
         if _looks_like_meta_hallucination(segment.text) or _looks_like_meta_hallucination(text):
             continue
 
-        chain = _select_translation_distortion_chain(config, chains, index, text)
+        chain = _select_translation_distortion_chain(config, chains, index, text, pass_index=0)
         try:
             distorted = translate_text_chain(text, chain, config).strip()
             if _bad_pivot_result(distorted, text):
@@ -1845,6 +2719,21 @@ def _maybe_distort_translations(
                 )
             distorted = _telephone_distort_text(text)
 
+        if distorted and _should_apply_translation_second_pass(config, index, text):
+            second_chain = _select_translation_distortion_chain(config, chains, index, distorted, pass_index=1)
+            try:
+                second_distorted = translate_text_chain(distorted, second_chain, config).strip()
+                if not _bad_pivot_result(second_distorted, distorted):
+                    distorted = second_distorted
+                    second_pass_count += 1
+            except Exception as exc:
+                second_pass_failures += 1
+                if second_pass_failures <= 3:
+                    print(
+                        "      Second pivot pass skipped after failure: "
+                        f"{' -> '.join(second_chain)}: {type(exc).__name__}: {exc}"
+                    )
+
         if distorted:
             segment.translated_text = distorted
             changed += int(distorted != text)
@@ -1852,7 +2741,8 @@ def _maybe_distort_translations(
     if output_path is not None:
         write_srt(output_path, segments, translated=True)
     fallback_detail = f", fallback={fallback_count}" if fallback_count else ""
-    print(f"      Distorted translated segments: {changed}/{len(segments)}{fallback_detail}")
+    second_pass_detail = f", pass2={second_pass_count}" if second_pass_count else ""
+    print(f"      Distorted translated segments: {changed}/{len(segments)}{fallback_detail}{second_pass_detail}")
     return segments
 
 
@@ -1924,11 +2814,87 @@ def _telephone_distort_text(text: str) -> str:
     return result or text
 
 
+_DEEP_PHONETIC_VARIANTS = {
+    "гена": ("Джена", "Генай", "Генна"),
+    "геннадий": ("Генадия", "Дженнадий", "Генандий"),
+    "чебурашка": ("Чевлашка", "Чебураха", "Чеворшка"),
+    "полотенце": ("полотенза", "потенциг", "полотенсия"),
+    "полотенца": ("полотензы", "потенцига", "полотенсии"),
+    "крокодил": ("кракодил", "крокодиль", "крокадила"),
+    "ванную": ("вандай", "ваннуй", "ванную комнату"),
+    "ванной": ("ванней", "вандальной", "ванной комнате"),
+    "косяк": ("косак", "косячек", "космик"),
+    "косячок": ("косяжок", "косачок", "косячер"),
+    "телевизор": ("телевизион", "телевизер", "телевизорный"),
+    "шкаф": ("шкаб", "шкафий", "шкав"),
+}
+
+
+def _apply_deep_phonetic_chaos(segments: list[Segment], config: DubConfig) -> list[Segment]:
+    changed = 0
+    for index, segment in enumerate(segments):
+        text = segment.spoken_text
+        if not text:
+            continue
+        seed_material = f"{_translation_seed_base(config)}|deep-phonetic|{index}|{text[:96]}"
+        rng = random.Random(
+            int.from_bytes(hashlib.sha256(seed_material.encode("utf-8", errors="ignore")).digest()[:8], "big")
+        )
+
+        def replace_known(match: re.Match[str]) -> str:
+            word = match.group(0)
+            variants = _DEEP_PHONETIC_VARIANTS.get(word.casefold())
+            if not variants or rng.random() > 0.68:
+                return word
+            replacement = rng.choice(variants)
+            return replacement if word[:1].isupper() else replacement.casefold()
+
+        names = "|".join(
+            sorted((re.escape(item) for item in _DEEP_PHONETIC_VARIANTS), key=len, reverse=True)
+        )
+        damaged = re.sub(rf"\b(?:{names})\b", replace_known, text, flags=re.IGNORECASE)
+        damaged = re.sub(r"\bпотому что\b", "патамушта", damaged, flags=re.IGNORECASE)
+        damaged = re.sub(r"\bчто\b", "што", damaged, flags=re.IGNORECASE)
+        damaged = re.sub(r"\bсейчас\b", "щас", damaged, flags=re.IGNORECASE)
+        words = damaged.split()
+        for position, word in enumerate(words):
+            bare = re.sub(r"[^А-Яа-яЁё]", "", word)
+            if len(bare) < 6 or rng.random() > 0.26:
+                continue
+            vowels = [offset for offset, char in enumerate(word) if char.casefold() in "аеёиоуыэюя"]
+            if len(vowels) < 2:
+                continue
+            offset = rng.choice(vowels[1:])
+            words[position] = word[:offset] + rng.choice("аеоиуы") + word[offset + 1 :]
+        damaged = " ".join(words)
+        damaged = re.sub(r"\s+", " ", damaged).strip()
+        if damaged and damaged != text:
+            segment.translated_text = damaged
+            changed += 1
+    print(f"      Deep phonetic chaos: changed={changed}/{len(segments)}")
+    return segments
+
+
+# Argos splits text into sentences before translating, and its sentence
+# splitter simply has no model for these languages - "No processors to load
+# for language ms". They translate fine *into*, so a chain reaching one is
+# only broken on the hop back out. Online translators handle them, so a chain
+# through one works right up until the online side hits its rate limit; then
+# the local fallback cannot run either and the whole chain collapses into
+# mechanical text mangling. That was 99% of every collapsed chain in the logs.
+# Empty now that MiniSBD chunking (see translation.py) reads every language
+# the packages cover. Kept as the place to list a language whose local
+# translation is broken, so a chain through one is dropped with a reason in
+# the log rather than silently degrading into mangled output.
+UNPARSEABLE_PIVOT_LANGS: frozenset[str] = frozenset()
+
+
 def _translation_distortion_chains(config: DubConfig) -> list[list[str]]:
     target = config.target_lang.strip()
     if not target:
         return []
 
+    max_hops = max(2, int(getattr(config, "max_translation_hops", 3) or 3))
     chains: list[list[str]] = []
     seen: set[tuple[str, ...]] = set()
     for raw_variant in config.translation_pivots.split("|"):
@@ -1941,8 +2907,23 @@ def _translation_distortion_chains(config: DubConfig) -> list[list[str]]:
         for pivot in pivots:
             if pivot and pivot != chain[-1]:
                 chain.append(pivot)
+        # One hop = one request to the translation API, so trim the tail rather
+        # than let a long variant spend seven of them on a single line.
+        del chain[max_hops:]
         if chain[-1] != target:
             chain.append(target)
+        # A chain is only as good as its weakest hop: one language the local
+        # translator cannot read makes the whole variant collapse whenever the
+        # online side is rate-limited. Better to drop the variant than to serve
+        # mangled text from it.
+        blocked = [lang for lang in chain[:-1] if lang in UNPARSEABLE_PIVOT_LANGS]
+        if blocked:
+            print(
+                f"      Skipping pivot chain {' -> '.join(chain)}: "
+                f"no local sentence splitter for {', '.join(sorted(set(blocked)))}"
+            )
+            continue
+
         key = tuple(chain)
         if len(chain) >= 3 and key not in seen:
             seen.add(key)
@@ -1959,17 +2940,38 @@ def _normalize_pivot_token(token: str, config: DubConfig) -> str | None:
     return token
 
 
+def _translation_seed_base(config: DubConfig) -> str:
+    return str(config.translation_seed or config.workdir)
+
+
 def _select_translation_distortion_chain(
     config: DubConfig,
     chains: list[list[str]],
     segment_index: int,
     text: str,
+    *,
+    pass_index: int = 0,
 ) -> list[str]:
     if len(chains) == 1:
         return chains[0]
-    seed_material = f"{config.workdir}|{segment_index}|{text[:96]}|{config.translation_pivots}"
+    seed_material = (
+        f"{_translation_seed_base(config)}|{config.translation_chaos}|"
+        f"{segment_index}|{pass_index}|{text[:96]}|{config.translation_pivots}"
+    )
     seed = int.from_bytes(hashlib.sha256(seed_material.encode("utf-8", errors="ignore")).digest()[:8], "big")
     return random.Random(seed).choice(chains)
+
+
+def _should_apply_translation_second_pass(config: DubConfig, segment_index: int, text: str) -> bool:
+    ratio = max(0.0, min(1.0, config.translation_second_pass_ratio))
+    if ratio <= 0.0:
+        return False
+    seed_material = (
+        f"{_translation_seed_base(config)}|{config.translation_chaos}|"
+        f"second-pass|{segment_index}|{text[:96]}|{config.translation_pivots}"
+    )
+    bucket = int.from_bytes(hashlib.sha256(seed_material.encode("utf-8", errors="ignore")).digest()[:8], "big")
+    return (bucket / float(1 << 64)) < ratio
 
 
 def _looks_like_meta_hallucination(text: str) -> bool:
@@ -1988,13 +2990,68 @@ def _dedupe_artifact_segments(segments: list[Segment]) -> list[Segment]:
     return result
 
 
+def _artifact_injection_limit(
+    base_segments: list[Segment],
+    candidates: list[Segment],
+    config: DubConfig,
+) -> int:
+    if not base_segments or not candidates:
+        return 0
+    source_count = len(base_segments)
+    if source_count < max(0, config.artifact_min_source_segments):
+        print(
+            "      Artifact injection limited: "
+            f"source_segments={source_count} < min={config.artifact_min_source_segments}"
+        )
+        return 0
+
+    absolute_max = max(0, int(config.artifact_max_segments))
+    if absolute_max <= 0:
+        return 0
+
+    ratio = max(0.0, min(1.0, float(config.artifact_ratio)))
+    ratio_limit = round(source_count * ratio)
+    if ratio > 0.0 and ratio_limit <= 0:
+        ratio_limit = 1
+    limit = min(absolute_max, ratio_limit, len(candidates))
+    print(
+        "      Artifact injection limit: "
+        f"source_segments={source_count}, ratio={ratio:.2f}, "
+        f"ratio_limit={ratio_limit}, absolute_max={absolute_max}, candidates={len(candidates)}, limit={limit}"
+    )
+    return max(0, limit)
+
+
+def _limit_chaos_artifacts_before_translation(
+    candidates: list[Segment],
+    base_segments: list[Segment],
+    config: DubConfig,
+) -> list[Segment]:
+    if not config.artifact_chaos_mode or not candidates:
+        return candidates
+    needed = _artifact_injection_limit(base_segments, candidates, config)
+    if needed <= 0:
+        return []
+    # Keep a small reserve for timing conflicts or failed translations, but do
+    # not run expensive multilingual chains over a bank that cannot be used.
+    limit = min(len(candidates), max(needed, needed * 2))
+    if limit >= len(candidates):
+        return candidates
+    ranked = sorted(candidates, key=_chaos_artifact_rank, reverse=True)
+    print(f"      Artifact pre-translation limit: {len(candidates)} -> {limit} (needed={needed})")
+    return ranked[:limit]
+
+
 def _inject_artifact_segments(
     segments: list[Segment],
     artifacts: list[Segment],
     config: DubConfig,
     source_duration: float,
 ) -> list[Segment]:
-    candidates = [artifact for artifact in artifacts if artifact.spoken_text]
+    candidates = suppress_pathological_segment_loops(
+        [artifact for artifact in artifacts if artifact.spoken_text]
+    )
+    candidates = limit_repeated_segment_phrases(candidates)
     if not candidates:
         return segments
     if config.artifact_chaos_mode:
@@ -2002,7 +3059,9 @@ def _inject_artifact_segments(
     if not segments:
         return segments
 
-    max_count = min(max(0, config.artifact_max_segments), len(candidates))
+    max_count = _artifact_injection_limit(segments, candidates, config)
+    if max_count <= 0:
+        return segments
     replacements: list[Segment] = []
     used_segment_indices: set[int] = set()
     used_ranges: list[tuple[float, float]] = []
@@ -2060,34 +3119,16 @@ def _inject_chaos_artifact_segments(
     config: DubConfig,
     source_duration: float,
 ) -> list[Segment]:
-    max_count = min(_chaos_artifact_count_budget(config, source_duration), len(candidates))
+    max_count = _artifact_injection_limit(segments, candidates, config)
     if max_count <= 0:
         return segments
-
-    max_artifact_seconds = max(1.15, source_duration * 0.30)
-    base_duration = sum(segment.duration for segment in segments)
-    max_replaced_base_seconds = base_duration * 0.60
     ranked = sorted(candidates, key=_chaos_artifact_rank, reverse=True)
     replacements: list[Segment] = []
     used_ranges: list[tuple[float, float]] = []
-    used_signatures: set[str] = set()
-    removed_segment_indices: set[int] = set()
 
-    for artifact in ranked:
-        if len(replacements) >= max_count:
-            break
-        available_artifact_seconds = max_artifact_seconds - sum(
-            used_end - used_start for used_start, used_end in used_ranges
-        )
-        text = _shorten_artifact_text(
-            artifact.spoken_text,
-            max_words=min(32, max(2, int(available_artifact_seconds / 0.42))),
-            max_chars=min(240, max(28, int(available_artifact_seconds * 18.0))),
-        )
+    for artifact in ranked[:max_count]:
+        text = _shorten_artifact_text(artifact.spoken_text, max_words=32, max_chars=240)
         if not text:
-            continue
-        signature = _artifact_signature(text)
-        if signature in used_signatures:
             continue
 
         start, end = _chaos_artifact_replacement_interval(artifact, text, source_duration)
@@ -2095,22 +3136,8 @@ def _inject_chaos_artifact_segments(
             continue
         if any(_chaos_ranges_conflict(start, end, used_start, used_end) for used_start, used_end in used_ranges):
             continue
-        if sum(used_end - used_start for used_start, used_end in used_ranges) + (end - start) > max_artifact_seconds:
-            continue
-
-        candidate_ranges = [*used_ranges, (start, end)]
-        candidate_removed_indices = {
-            index
-            for index, segment in enumerate(segments)
-            if _base_segment_replaced_by_chaos_artifact(segment, candidate_ranges)
-        }
-        candidate_removed_seconds = sum(segments[index].duration for index in candidate_removed_indices)
-        if base_duration > 0.0 and candidate_removed_seconds > max_replaced_base_seconds:
-            continue
 
         used_ranges.append((start, end))
-        used_signatures.add(signature)
-        removed_segment_indices = candidate_removed_indices
         replacements.append(
             Segment(
                 start=start,
@@ -2123,31 +3150,18 @@ def _inject_chaos_artifact_segments(
     if not replacements:
         return segments
 
+    replacement_ranges = [(segment.start, segment.end) for segment in replacements]
     kept_segments = [
         segment
-        for index, segment in enumerate(segments)
-        if index not in removed_segment_indices
+        for segment in segments
+        if not _base_segment_replaced_by_chaos_artifact(segment, replacement_ranges)
     ]
     removed_count = len(segments) - len(kept_segments)
-    artifact_seconds = sum(segment.duration for segment in replacements)
-    removed_seconds = sum(segments[index].duration for index in removed_segment_indices)
-    print(
-        "      Chaos artifact replacements: "
-        f"{len(replacements)}/{max_count}, artifact_seconds={artifact_seconds:.1f}/{max_artifact_seconds:.1f}, "
-        f"base_removed={removed_count} ({removed_seconds:.1f}/{max_replaced_base_seconds:.1f}s)"
-    )
+    print(f"      Chaos artifact replacements: {len(replacements)}, base_removed={removed_count}")
 
     sorted_replacements = sorted(replacements, key=lambda item: (item.start, item.end))
     write_srt(_debug_path(config, "artifact_injected.srt"), sorted_replacements, translated=True)
     return sorted([*kept_segments, *sorted_replacements], key=lambda item: (item.start, item.end))
-
-
-def _chaos_artifact_count_budget(config: DubConfig, source_duration: float) -> int:
-    absolute_limit = max(0, config.artifact_max_segments)
-    if absolute_limit <= 0 or source_duration <= 0.0:
-        return 0
-    duration_limit = max(1, math.ceil(source_duration / 15.0))
-    return min(absolute_limit, duration_limit)
 
 
 def _chaos_artifact_rank(artifact: Segment) -> tuple[int, int, float, int, float]:
@@ -2208,12 +3222,24 @@ def _chaos_ranges_conflict(left_start: float, left_end: float, right_start: floa
     return overlap / shortest >= 0.35
 
 
+# A base line is dropped only when an artifact genuinely takes its place. The
+# old thresholds - 0.6s of overlap, or 35% of the line - meant two artifacts
+# displaced four real lines (median, over 617 jobs), because an artifact is
+# longer than the short lines it lands among and clipped each of them.
+#
+# Overlapping speech was the reason for that caution, from the days when TTS
+# could not fit a target duration. The mix handles overlap now: it ducks and
+# separates conflicting spans. Two dubbed lines briefly over each other is a
+# far smaller loss than deleting one of them outright.
+CHAOS_ARTIFACT_DISPLACEMENT_SHARE = 0.7
+
+
 def _base_segment_replaced_by_chaos_artifact(segment: Segment, ranges: list[tuple[float, float]]) -> bool:
     if segment.duration <= 0.0:
         return False
     for start, end in ranges:
         overlap = _overlap_seconds(segment.start, segment.end, start, end)
-        if overlap >= 0.6 or overlap / segment.duration >= 0.35:
+        if overlap / segment.duration >= CHAOS_ARTIFACT_DISPLACEMENT_SHARE:
             return True
     return False
 
@@ -2461,11 +3487,183 @@ def _tts_fit_complete(segments: list[Segment], config: DubConfig) -> bool:
     return bool(spoken_indices) and all(_file_ready(fit_dir / f"{index:05d}.wav") for index in spoken_indices)
 
 
+def _plan_overlap_aware_mix(
+    fitted_items: list[tuple[Segment, Path]],
+    source_audio: Path,
+    config: DubConfig,
+) -> list[tuple[Path, int, float, float | None]]:
+    """Keep useful background overlap while ducking competing foreground lines."""
+    if not fitted_items:
+        return []
+
+    try:
+        import numpy as np
+
+        source_samples, sample_rate = _read_wav_mono(source_audio)
+    except Exception as exc:
+        print(f"      Overlap loudness analysis skipped: {type(exc).__name__}: {exc}")
+        source_samples, sample_rate = None, 0
+
+    rms_levels: list[float] = []
+    for segment, _path in fitted_items:
+        rms = 0.0
+        if source_samples is not None and sample_rate > 0:
+            start_sample = max(0, round(segment.start * sample_rate))
+            end_sample = min(source_samples.size, round(segment.end * sample_rate))
+            excerpt = source_samples[start_sample:end_sample]
+            if excerpt.size:
+                rms = float(np.sqrt(np.mean(excerpt * excerpt)))
+        rms_levels.append(rms)
+
+    positive_levels = sorted(level for level in rms_levels if level > 1e-5)
+    median_rms = positive_levels[len(positive_levels) // 2] if positive_levels else 0.0
+    background_cutoff = median_rms * 0.42
+    is_background = [
+        bool(median_rms > 0.0 and level > 0.0 and level < background_cutoff)
+        for level in rms_levels
+    ]
+
+    artifact_segments: list[Segment] = []
+    artifact_path = _debug_path(config, "artifact_injected.srt")
+    if artifact_path.is_file():
+        try:
+            artifact_segments = read_srt(artifact_path, translated=True)
+        except Exception:
+            artifact_segments = []
+
+    def is_artifact(segment: Segment) -> bool:
+        signature = _artifact_signature(segment.spoken_text)
+        return any(
+            abs(segment.start - artifact.start) <= 0.12
+            and (
+                signature == _artifact_signature(artifact.spoken_text)
+                or abs(segment.end - artifact.end) <= 0.12
+            )
+            for artifact in artifact_segments
+        )
+
+    artifact_flags = [is_artifact(segment) for segment, _path in fitted_items]
+    gains = [0.52 if background else 1.0 for background in is_background]
+    duck_after: list[float | None] = [None] * len(fitted_items)
+    durations: list[float] = []
+    for _segment, path in fitted_items:
+        try:
+            durations.append(probe_duration(path))
+        except Exception:
+            durations.append(0.0)
+
+    actions: list[dict[str, object]] = []
+    for index in range(len(fitted_items) - 1):
+        segment, _path = fitted_items[index]
+        next_segment, _next_path = fitted_items[index + 1]
+        generated_end = segment.start + durations[index]
+        overlap = generated_end - next_segment.start
+        if overlap <= 0.35:
+            continue
+
+        current_artifact = artifact_flags[index]
+        next_artifact = artifact_flags[index + 1]
+        different_speakers = bool(
+            segment.speaker_id
+            and next_segment.speaker_id
+            and segment.speaker_id != next_segment.speaker_id
+        )
+        reason = ""
+        if current_artifact and not next_artifact:
+            duck_after[index] = max(0.0, next_segment.start - segment.start)
+            reason = "artifact_yields_to_main"
+        elif next_artifact and not current_artifact:
+            gains[index + 1] = min(gains[index + 1], 0.55)
+            reason = "artifact_under_main_tail"
+        elif different_speakers and (is_background[index] or is_background[index + 1]):
+            # A quiet second voice is a useful part of the scene. Its base gain
+            # already follows the source RMS, so retain the overlap untouched.
+            reason = "different_speaker_background_allowed"
+        elif different_speakers and overlap <= 1.25:
+            reason = "different_speaker_short_overlap_allowed"
+        elif different_speakers and rms_levels[index + 1] < rms_levels[index]:
+            gains[index + 1] = min(gains[index + 1], 0.58)
+            reason = "quieter_next_speaker_lowered"
+        else:
+            duck_after[index] = max(0.0, next_segment.start - segment.start)
+            reason = "foreground_conflict_duck_previous"
+
+        actions.append(
+            {
+                "segment": index + 1,
+                "next_segment": index + 2,
+                "overlap_seconds": round(overlap, 3),
+                "reason": reason,
+            }
+        )
+
+    manifest = {
+        "median_source_rms": round(median_rms, 6),
+        "background_cutoff_rms": round(background_cutoff, 6),
+        "segments": [
+            {
+                "segment": index + 1,
+                "start": round(segment.start, 3),
+                "end": round(segment.end, 3),
+                "generated_seconds": round(durations[index], 3),
+                "source_rms": round(rms_levels[index], 6),
+                "background": is_background[index],
+                "artifact": artifact_flags[index],
+                "speaker": segment.speaker_id or "",
+                "gain": round(gains[index], 3),
+                "duck_after_seconds": None if duck_after[index] is None else round(duck_after[index], 3),
+            }
+            for index, (segment, _path) in enumerate(fitted_items)
+        ],
+        "overlap_actions": actions,
+    }
+    (config.workdir / "overlap_mix_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(
+        "      Overlap-aware mix: "
+        f"background={sum(is_background)}/{len(fitted_items)}, conflicts={len(actions)}, "
+        f"ducked={sum(item is not None for item in duck_after)}"
+    )
+    return [
+        (path, int(segment.start * 1000), gains[index], duck_after[index])
+        for index, (segment, path) in enumerate(fitted_items)
+    ]
+
+
 def _needs_speaker_references(config: DubConfig) -> bool:
-    return config.tts.lower() in {"xtts", "f5", "f5tts"}
+    return config.tts.lower() in {
+        "xtts",
+        "f5",
+        "f5tts",
+        "qwen3",
+        "qwen3-tts",
+        "qwen3tts",
+        "cosyvoice",
+        "cosyvoice-tts",
+        "cosyvoicetts",
+        "cosy",
+        "moss",
+        "moss-tts",
+        "mosstts",
+        "moss-v1.5",
+    }
 
 
-def _assign_segment_speaker_refs(segments: list[Segment], reference_audio: Path, config: DubConfig) -> None:
+def _assign_segment_speaker_refs(
+    segments: list[Segment],
+    reference_audio: Path,
+    config: DubConfig,
+    *,
+    diarization_audio: Path | None = None,
+) -> None:
+    if config.speaker_clustering and diarization_audio is not None:
+        try:
+            if _assign_pyannote_speaker_refs(segments, diarization_audio, reference_audio, config):
+                return
+        except Exception as exc:
+            print(f"      Pyannote diarization fallback to legacy clustering: {type(exc).__name__}: {exc}")
+
     refs_dir = config.workdir / "speaker_refs"
     refs_dir.mkdir(parents=True, exist_ok=True)
     source_duration = probe_duration(reference_audio)
@@ -2553,6 +3751,355 @@ def _assign_segment_speaker_refs(segments: list[Segment], reference_audio: Path,
     print(
         "      XTTS speaker clustering: "
         f"{extracted} refs, {len(candidates)} usable, {len(bank_paths)} speaker banks from {reference_audio}"
+    )
+
+
+def _assign_pyannote_speaker_refs(
+    segments: list[Segment],
+    diarization_audio: Path,
+    reference_audio: Path,
+    config: DubConfig,
+) -> bool:
+    python_path = config.diarization_python
+    if python_path is None:
+        return False
+    if not python_path.is_absolute():
+        python_path = _repo_root() / python_path
+    runner_path = _repo_root() / "tools" / "diarization_runner.py"
+    if not python_path.is_file() or not runner_path.is_file():
+        print(f"      Pyannote diarization unavailable: {python_path}")
+        return False
+
+    cache_dir = config.diarization_cache_dir
+    if not cache_dir.is_absolute():
+        cache_dir = _repo_root() / cache_dir
+    token_file = config.diarization_token_file
+    if token_file is not None and not token_file.is_absolute():
+        token_file = _repo_root() / token_file
+    output_path = config.workdir / "speaker_bank" / "diarization.json"
+    command = [
+        str(python_path), str(runner_path),
+        "--audio", str(diarization_audio),
+        "--output", str(output_path),
+        "--model", config.diarization_model,
+        "--device", config.diarization_device,
+        "--cache-dir", str(cache_dir),
+    ]
+    if token_file is not None:
+        command.extend(["--token-file", str(token_file)])
+    if config.speaker_count_exact is not None and config.speaker_count_exact > 1:
+        command.extend(["--num-speakers", str(config.speaker_count_exact)])
+    else:
+        command.extend(["--max-speakers", str(max(1, config.max_speaker_clusters))])
+
+    print(
+        "      Running pyannote diarization: "
+        f"exact={config.speaker_count_exact or 'auto'} max={config.max_speaker_clusters}"
+    )
+    completed = subprocess.run(
+        command,
+        cwd=str(_repo_root()),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=max(60, int(config.diarization_timeout_seconds)),
+        check=False,
+    )
+    if completed.returncode != 0:
+        details = " ".join((completed.stderr or completed.stdout or "").split())[-1200:]
+        raise RuntimeError(f"diarization runner failed ({completed.returncode}): {details}")
+    if not output_path.is_file():
+        raise RuntimeError("diarization runner did not create diarization.json")
+    data = json.loads(output_path.read_text(encoding="utf-8"))
+    turns: list[tuple[float, float, str]] = []
+    for item in data.get("turns", []):
+        if not isinstance(item, dict):
+            continue
+        start = max(0.0, float(item.get("start", 0.0)))
+        end = max(start, float(item.get("end", start)))
+        speaker = str(item.get("speaker", "")).strip()
+        if speaker and end - start >= 0.1:
+            turns.append((start, end, speaker))
+    if not turns:
+        return False
+
+    speaker_order = list(dict.fromkeys(speaker for _start, _end, speaker in turns))
+    bank_paths = _build_pyannote_speaker_bank(turns, speaker_order, reference_audio, config)
+    if not bank_paths:
+        return False
+    # pyannote sometimes reports a "speaker" whose turns are all too short to
+    # build a voice reference from (typically noise or a stray interjection,
+    # not a real extra character). Drop those turns before picking the
+    # dominant speaker per utterance below - otherwise a line that mostly
+    # overlaps a bank-less phantom speaker loses the vote to nobody and
+    # falls all the way back to the raw full-mix reference instead of to the
+    # closest real, voiced speaker.
+    turns = [turn for turn in turns if turn[2] in bank_paths]
+    if not turns:
+        return False
+    # A translated or injected subtitle is already one TTS utterance. Splitting
+    # its words at every diarization boundary made a single sentence jump
+    # between voices, especially when pyannote produced sub-second jitter.
+    # Assign the dominant overlapping speaker to the complete utterance.
+    assigned = 0
+    for segment in segments:
+        if not segment.spoken_text:
+            continue
+        speaker = _speaker_for_interval(segment.start, segment.end, turns)
+        bank_path = bank_paths.get(speaker)
+        if bank_path is None:
+            continue
+        segment.speaker_id = speaker
+        segment.speaker_wav = bank_path
+        segment.speaker_ref_text = ""
+        assigned += 1
+    if config.speaker_wav is not None:
+        for segment in segments:
+            if segment.spoken_text and segment.speaker_wav is None:
+                segment.speaker_id = "global"
+                segment.speaker_wav = config.speaker_wav
+    _write_pyannote_speaker_map(segments, turns, bank_paths, data, config)
+    print(
+        "      Pyannote speaker diarization: "
+        f"speakers={len(bank_paths)} turns={len(turns)} assigned={assigned}/{len(segments)}"
+    )
+    return assigned > 0
+
+
+def _split_segments_at_speaker_changes(
+    segments: list[Segment],
+    turns: list[tuple[float, float, str]],
+    bank_paths: dict[str, Path],
+) -> list[Segment]:
+    result: list[Segment] = []
+    for segment in segments:
+        text = segment.spoken_text
+        if not text:
+            result.append(segment)
+            continue
+        runs = _speaker_runs_for_segment(segment.start, segment.end, turns)
+        words = text.split()
+        while len(runs) > len(words) and len(runs) > 1:
+            shortest = min(range(len(runs)), key=lambda index: runs[index][1] - runs[index][0])
+            runs = _merge_speaker_run_at(runs, shortest)
+        if len(runs) <= 1 or len(words) < 2:
+            result.append(segment)
+            continue
+
+        durations = [max(0.05, end - start) for start, end, _speaker in runs]
+        word_counts = _allocate_words_by_duration(len(words), durations)
+        offset = 0
+        for (start, end, speaker), count in zip(runs, word_counts):
+            piece = " ".join(words[offset : offset + count]).strip()
+            offset += count
+            if not piece:
+                continue
+            result.append(
+                Segment(
+                    start=start,
+                    end=end,
+                    text=piece,
+                    translated_text=piece,
+                    speaker_wav=bank_paths.get(speaker),
+                    speaker_id=speaker,
+                    speaker_ref_text="",
+                )
+            )
+    return result
+
+
+def _speaker_runs_for_segment(
+    start: float,
+    end: float,
+    turns: list[tuple[float, float, str]],
+) -> list[tuple[float, float, str]]:
+    raw = [
+        (max(start, turn_start), min(end, turn_end), speaker)
+        for turn_start, turn_end, speaker in turns
+        if _overlap_seconds(start, end, turn_start, turn_end) >= 0.18
+    ]
+    if not raw:
+        return []
+    raw.sort(key=lambda item: (item[0], item[1]))
+    runs: list[tuple[float, float, str]] = []
+    for run_start, run_end, speaker in raw:
+        if runs and runs[-1][2] == speaker and run_start - runs[-1][1] <= 0.45:
+            previous = runs[-1]
+            runs[-1] = (previous[0], max(previous[1], run_end), speaker)
+        else:
+            runs.append((run_start, run_end, speaker))
+
+    # Tiny alternating islands are usually boundary jitter, not a real turn.
+    changed = True
+    while changed and len(runs) > 1:
+        changed = False
+        for index, run in enumerate(runs):
+            if run[1] - run[0] >= 0.35:
+                continue
+            runs = _merge_speaker_run_at(runs, index)
+            changed = True
+            break
+
+    while len(runs) > 8:
+        shortest = min(range(len(runs)), key=lambda index: runs[index][1] - runs[index][0])
+        runs = _merge_speaker_run_at(runs, shortest)
+
+    if len(runs) <= 1:
+        speaker = runs[0][2]
+        return [(start, end, speaker)]
+
+    bounded: list[tuple[float, float, str]] = []
+    boundaries = [start]
+    for current, following in zip(runs, runs[1:]):
+        boundaries.append(max(boundaries[-1], min(end, (current[1] + following[0]) / 2.0)))
+    boundaries.append(end)
+    for index, (_run_start, _run_end, speaker) in enumerate(runs):
+        bounded_start = boundaries[index]
+        bounded_end = boundaries[index + 1]
+        if bounded_end - bounded_start >= 0.12:
+            bounded.append((bounded_start, bounded_end, speaker))
+    return bounded
+
+
+def _merge_speaker_run_at(
+    runs: list[tuple[float, float, str]],
+    index: int,
+) -> list[tuple[float, float, str]]:
+    if len(runs) <= 1:
+        return runs
+    if index <= 0:
+        target = 1
+    elif index >= len(runs) - 1:
+        target = index - 1
+    else:
+        previous_duration = runs[index - 1][1] - runs[index - 1][0]
+        following_duration = runs[index + 1][1] - runs[index + 1][0]
+        target = index - 1 if previous_duration >= following_duration else index + 1
+    merged_start = min(runs[index][0], runs[target][0])
+    merged_end = max(runs[index][1], runs[target][1])
+    merged_speaker = runs[target][2]
+    kept = [item for position, item in enumerate(runs) if position not in {index, target}]
+    kept.append((merged_start, merged_end, merged_speaker))
+    kept.sort(key=lambda item: (item[0], item[1]))
+    collapsed: list[tuple[float, float, str]] = []
+    for item in kept:
+        if collapsed and collapsed[-1][2] == item[2]:
+            previous = collapsed[-1]
+            collapsed[-1] = (previous[0], max(previous[1], item[1]), item[2])
+        else:
+            collapsed.append(item)
+    return collapsed
+
+
+def _allocate_words_by_duration(word_count: int, durations: list[float]) -> list[int]:
+    if not durations:
+        return []
+    remaining_words = word_count
+    remaining_duration = sum(durations)
+    counts: list[int] = []
+    for index, duration in enumerate(durations):
+        remaining_runs = len(durations) - index
+        if remaining_runs == 1:
+            count = remaining_words
+        else:
+            proportional = round(remaining_words * duration / max(0.05, remaining_duration))
+            count = max(1, min(proportional, remaining_words - (remaining_runs - 1)))
+        counts.append(count)
+        remaining_words -= count
+        remaining_duration -= duration
+    return counts
+
+
+def _speaker_for_interval(start: float, end: float, turns: list[tuple[float, float, str]]) -> str:
+    overlaps: dict[str, float] = {}
+    for turn_start, turn_end, speaker in turns:
+        overlap = _overlap_seconds(start, end, turn_start, turn_end)
+        if overlap > 0.0:
+            overlaps[speaker] = overlaps.get(speaker, 0.0) + overlap
+    if overlaps:
+        return max(overlaps, key=overlaps.get)
+    midpoint = (start + end) / 2.0
+    return min(turns, key=lambda item: abs((item[0] + item[1]) / 2.0 - midpoint))[2]
+
+
+def _build_pyannote_speaker_bank(
+    turns: list[tuple[float, float, str]],
+    speaker_order: list[str],
+    reference_audio: Path,
+    config: DubConfig,
+) -> dict[str, Path]:
+    bank_dir = config.workdir / "speaker_bank"
+    clips_dir = bank_dir / "diarization_clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    result: dict[str, Path] = {}
+    for speaker_index, speaker in enumerate(speaker_order, start=1):
+        candidates = sorted(
+            ((start, end) for start, end, label in turns if label == speaker and end - start >= 0.85),
+            key=lambda item: item[1] - item[0],
+            reverse=True,
+        )
+        selected: list[Path] = []
+        selected_seconds = 0.0
+        for clip_index, (start, end) in enumerate(candidates[:8], start=1):
+            margin = min(0.18, (end - start) * 0.08)
+            start += margin
+            duration = min(5.5, max(0.45, end - start - margin))
+            clip_path = clips_dir / f"speaker_{speaker_index:02d}_{clip_index:02d}.wav"
+            try:
+                extract_wav_slice(reference_audio, clip_path, start, duration)
+                if _file_ready(clip_path):
+                    selected.append(clip_path)
+                    selected_seconds += duration
+            except Exception as exc:
+                print(f"      Diarization ref skipped {speaker}/{clip_index}: {type(exc).__name__}: {exc}")
+            if selected_seconds >= 10.0:
+                break
+        if not selected:
+            continue
+        raw_path = bank_dir / f"speaker_{speaker_index:02d}_raw.wav"
+        clean_path = bank_dir / f"speaker_{speaker_index:02d}.wav"
+        try:
+            concat_wavs(selected, raw_path)
+            result[speaker] = _prepare_xtts_reference(raw_path, clean_path)
+        except Exception as exc:
+            print(f"      Diarization bank fallback {speaker}: {type(exc).__name__}: {exc}")
+            result[speaker] = selected[0]
+    return result
+
+
+def _write_pyannote_speaker_map(
+    segments: list[Segment],
+    turns: list[tuple[float, float, str]],
+    bank_paths: dict[str, Path],
+    runner_data: dict[str, object],
+    config: DubConfig,
+) -> None:
+    bank_dir = config.workdir / "speaker_bank"
+    rows = [
+        {
+            "segment": index,
+            "start": round(segment.start, 3),
+            "end": round(segment.end, 3),
+            "speaker": segment.speaker_id or "",
+            "ref": str(segment.speaker_wav or ""),
+            "text": re.sub(r"\s+", " ", segment.spoken_text).strip()[:180],
+        }
+        for index, segment in enumerate(segments, start=1)
+        if segment.spoken_text
+    ]
+    summary = {
+        "provider": "pyannote",
+        "model": config.diarization_model,
+        "exact_speakers": config.speaker_count_exact,
+        "max_speakers": config.max_speaker_clusters,
+        "speakers": {speaker: str(path) for speaker, path in bank_paths.items()},
+        "turns": len(turns),
+        "segments": rows,
+        "runner": runner_data,
+    }
+    (bank_dir / "speaker_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
 
@@ -2707,6 +4254,73 @@ def _basic_speaker_feature_vector(samples, sample_rate: int, rms: float):
         ],
         dtype=np.float64,
     )
+
+
+def _trim_tts_silence(path: Path, max_pause_seconds: float) -> bool:
+    """Tighten a synthesized phrase in place: drop the silence MOSS pads around the
+    phrase and clamp the pauses it leaves inside one.
+
+    MOSS is deliberately never time-stretched (it owns its own delivery), so its
+    padding is the one thing that can be reclaimed without touching the voice.
+    On real jobs a quarter of the generated audio is silence, which is what pushes
+    phrases into each other's slots - a phrase of two words can otherwise occupy
+    seven seconds. Only silence is removed here, never speech, so the delivery
+    itself comes out unchanged.
+    """
+    import numpy as np
+
+    samples, sample_rate = _read_wav_mono(path)
+    if samples is None or sample_rate <= 0 or samples.size == 0:
+        return False
+
+    frame = max(1, int(sample_rate * 0.02))
+    frame_count = samples.size // frame
+    if frame_count <= 1:
+        return False
+    frames = samples[: frame_count * frame].reshape(frame_count, frame)
+    rms = np.sqrt(np.maximum(0.0, (frames * frames).mean(axis=1)))
+    peak = float(rms.max())
+    if peak <= 0.0:
+        return False
+    voiced = rms > max(peak * 0.02, 0.003)
+    voiced_index = np.flatnonzero(voiced)
+    if voiced_index.size == 0:
+        return False
+
+    # A little air on both sides keeps the phrase from sounding clipped.
+    pad = max(1, int(0.05 / 0.02))
+    max_pause = max(0, int(max(0.0, max_pause_seconds) / 0.02))
+    first, last = int(voiced_index[0]), int(voiced_index[-1])
+    keep = np.zeros(frame_count, dtype=bool)
+    keep[max(0, first - pad) : min(frame_count, last + pad + 1)] = True
+
+    # Clamp each run of silence between two voiced frames to max_pause.
+    run_start: int | None = None
+    for index in range(first, last + 2):
+        silent = index <= last and not voiced[index]
+        if silent and run_start is None:
+            run_start = index
+        elif not silent and run_start is not None:
+            run_length = index - run_start
+            if run_length > max_pause:
+                drop_from = run_start + max_pause // 2
+                drop_to = index - (max_pause - max_pause // 2)
+                keep[drop_from:drop_to] = False
+            run_start = None
+
+    if keep.all():
+        return False
+    trimmed = frames[keep].reshape(-1)
+    if trimmed.size == 0:
+        return False
+
+    data = np.clip(trimmed, -1.0, 1.0)
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes((data * 32767.0).astype("<i2").tobytes())
+    return True
 
 
 def _read_wav_mono(path: Path):

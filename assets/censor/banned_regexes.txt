@@ -1,0 +1,28 @@
+# One Python regular expression per line. Blank lines and lines starting with # are ignored.
+# Keep these broad: this is the experimental comedy/glitch censor mode.
+\bнигг[еэ]р\w*\b
+\bн[еэ]гр\w*\b
+\bnigg(?:er|a|ah|uh|let)?s?\b
+\bchink\w*\b
+\bgook\w*\b
+\bspic\w*\b
+\bkike\w*\b
+\bfagg?ot\w*\b
+\btrann(?:y|ies)\b
+\b(?:i\s+hate|hate)\s+(?:those\s+|all\s+)?(?:nigg\w+|black\s+people|jews|gays|fags|trann\w+)\b
+\bя\s+ненавижу\s+(?:этих\s+|всех\s+)?[^\s,.!?;:]{2,24}\b
+\b(?:убей|убить|застрелить|расстрелять)\s+(?:этого|эту|этих|всех)?\s*[^\s,.!?;:]{2,24}\b
+# Russian sexist / homophobic insult stems and inflections.
+\bшлюх\w*\b
+\bпроститут\w*\b
+\bшалав\w*\b
+\bпотаскух\w*\b
+\bдавалк\w*\b
+\bпедик\w*\b
+\bпедераст\w*\b
+\bпид(?:ор|ар|ерас|орас)\w*\b
+\bгомик\w*\b
+# English variants and transliterations.
+\b(?:whore|slut|skank|hooker|thot)s?\b
+\b(?:fag|faggot|dyke)s?\b
+\b(?:shl(?:u|yu|yuk)ha|shalava|pedik|pederast)\w*\b

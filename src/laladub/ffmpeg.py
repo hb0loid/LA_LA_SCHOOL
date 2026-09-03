@@ -35,7 +35,7 @@ def probe_duration(path: Path) -> float:
             "-v",
             "error",
             "-show_entries",
-            "format=duration",
+            "format=duration:stream=codec_type,duration",
             "-of",
             "json",
             str(path),
@@ -45,13 +45,25 @@ def probe_duration(path: Path) -> float:
         text=True,
     )
     data = json.loads(result.stdout)
+
+    # Some Telegram MP4 files contain a valid short video stream alongside an
+    # AAC edit list whose declared duration is many hours. The container then
+    # reports the bogus audio duration as the duration of the whole file. For
+    # video jobs the visible video stream is the authoritative playback length.
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") != "video":
+            continue
+        duration = stream.get("duration")
+        if duration is not None and float(duration) > 0:
+            return float(duration)
+
     duration = data.get("format", {}).get("duration")
-    if duration is not None:
+    if duration is not None and float(duration) > 0:
         return float(duration)
 
     for stream in data.get("streams", []):
         duration = stream.get("duration")
-        if duration is not None:
+        if duration is not None and float(duration) > 0:
             return float(duration)
 
     if path.suffix.lower() == ".wav":
@@ -62,6 +74,39 @@ def probe_duration(path: Path) -> float:
                 return frames / float(rate)
 
     raise ToolError(f"Could not determine media duration: {path}")
+
+
+def probe_video_dimensions(path: Path) -> tuple[int, int] | None:
+    """Frame size of the first video stream, or None when it cannot be read."""
+    ffprobe = require_tool("ffprobe")
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        streams = json.loads(result.stdout).get("streams") or []
+    except Exception:
+        return None
+    if not streams:
+        return None
+    width = streams[0].get("width")
+    height = streams[0].get("height")
+    if not width or not height:
+        return None
+    return int(width), int(height)
 
 
 def has_video_stream(path: Path) -> bool:
@@ -112,8 +157,6 @@ def make_audio_visual_video(
     target_duration = duration if duration is not None else probe_duration(audio_path)
     target_duration = max(0.1, target_duration)
     resolution = max(64, int(resolution))
-    if temp_dir.exists():
-        shutil.rmtree(temp_dir)
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     sources = _find_visual_source_videos(source_roots, exclude_dirs=exclude_dirs or [])
@@ -123,7 +166,6 @@ def make_audio_visual_video(
 
     safety_cache: dict[Path, bool] = {}
     segment_paths: list[Path] = []
-    segment_manifest: list[dict[str, str]] = []
     visual_duration = 0.0
     attempts = 0
     max_attempts = max(30, min(800, int(target_duration / max(min_slice_seconds, 0.1) * 3)))
@@ -159,34 +201,32 @@ def make_audio_visual_video(
         input_duration = min(max(0.2, out_duration * speed), max(0.2, source_duration))
         max_start = max(0.0, source_duration - input_duration)
         start = random.uniform(0.0, max_start) if max_start > 0.05 else 0.0
-        source_job = _visual_source_job_id(source)
-        source_label = _visual_source_label(source, source_job)
-        segment_path = temp_dir / f"visual_segment_{len(segment_paths):04d}_{source_label}.mp4"
+        segment_path = temp_dir / f"visual_segment_{len(segment_paths):04d}.mp4"
         try:
             _make_visual_segment(source, segment_path, start, input_duration, speed, resolution)
         except subprocess.CalledProcessError:
             segment_path.unlink(missing_ok=True)
             continue
         if segment_path.exists() and segment_path.stat().st_size > 1024:
+            try:
+                actual_duration = probe_duration(segment_path)
+            except Exception:
+                segment_path.unlink(missing_ok=True)
+                continue
+            if actual_duration < 0.1:
+                segment_path.unlink(missing_ok=True)
+                continue
             segment_paths.append(segment_path)
-            segment_manifest.append(
-                {
-                    "segment": segment_path.name,
-                    "source_job": source_job or "",
-                    "source": str(source),
-                    "source_start": f"{start:.3f}",
-                    "source_duration": f"{input_duration:.3f}",
-                    "speed": f"{speed:.3f}",
-                    "output_duration": f"{out_duration:.3f}",
-                }
-            )
-            visual_duration += out_duration
+            # A short source clip can yield less video than the requested
+            # out_duration after speed-up.  Counting the requested value made
+            # the loop stop early and players held the final frame until the
+            # longer audio track ended.
+            visual_duration += actual_duration
 
     if not segment_paths:
         _make_fallback_audio_video(audio_path, output_path, target_duration, resolution)
         return
 
-    _write_visual_segments_manifest(temp_dir / "visual_segments_manifest.tsv", segment_manifest)
     _concat_visual_segments_with_audio(segment_paths, audio_path, output_path, target_duration)
 
 
@@ -244,23 +284,15 @@ def _find_visual_source_videos(
                 continue
             if path.name.lower().startswith("input_audio_visual"):
                 continue
-            if _is_generated_visual_source(path):
-                continue
             seen.add(resolved)
             raw_candidates.append(path)
 
     random.shuffle(raw_candidates)
     raw_candidates.sort(key=_visual_source_priority)
-    candidates: list[Path] = []
-    for path in raw_candidates:
-        if len(candidates) >= max_candidates:
-            break
-        try:
-            if has_video_stream(path):
-                candidates.append(path)
-        except Exception:
-            continue
-    return candidates
+    # The actual segment extraction below already rejects unreadable inputs.
+    # Avoid launching ffprobe once per candidate here; trusted libraries can
+    # contain thousands of clips and the old pre-scan delayed every audio job.
+    return raw_candidates[:max_candidates]
 
 
 def _visual_source_priority(path: Path) -> int:
@@ -272,56 +304,6 @@ def _visual_source_priority(path: Path) -> int:
     if "watermarked" in name:
         return 3
     return 2
-
-
-def _is_generated_visual_source(path: Path) -> bool:
-    name = path.name.lower()
-    if "_fun_visual" in name:
-        return True
-    if name.startswith("dubbed"):
-        return True
-    if name.startswith("debug"):
-        return True
-    if "watermarked" in name:
-        return True
-    generated_dirs = {"audio_visual_segments", "fun_visual_segments", "work", "tts_fit", "tts_raw", "separated"}
-    return any(part.lower() in generated_dirs for part in path.parts)
-
-
-def _visual_source_job_id(path: Path) -> str | None:
-    for part in reversed(path.parts[:-1]):
-        if part.isdigit():
-            return part
-        if part.startswith("job_") and len(part) > 4:
-            return part
-    return None
-
-
-def _visual_source_label(path: Path, source_job: str | None) -> str:
-    file_label = _safe_filename_fragment(path.stem)[:40] or "video"
-    if source_job:
-        return f"job{_safe_filename_fragment(source_job)}_{file_label}"
-    return file_label
-
-
-def _safe_filename_fragment(value: str) -> str:
-    result = "".join(ch.lower() if ch.isascii() and ch.isalnum() else "_" for ch in value)
-    result = "_".join(part for part in result.split("_") if part)
-    return result or "unknown"
-
-
-def _write_visual_segments_manifest(path: Path, rows: list[dict[str, str]]) -> None:
-    if not rows:
-        return
-    columns = ["segment", "source_job", "source", "source_start", "source_duration", "speed", "output_duration"]
-    lines = ["\t".join(columns)]
-    for row in rows:
-        lines.append("\t".join(_tsv_value(row.get(column, "")) for column in columns))
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _tsv_value(value: str) -> str:
-    return value.replace("\t", " ").replace("\r", " ").replace("\n", " ")
 
 
 def _is_relative_to(path: Path, directory: Path) -> bool:
@@ -345,7 +327,8 @@ def _make_visual_segment(
     scale_filter = (
         f"setpts=PTS/{max(0.1, speed):.4f},"
         f"scale={resolution}:{resolution}:force_original_aspect_ratio=increase,"
-        f"crop={resolution}:{resolution},fps=30,format=yuv420p"
+        f"crop={resolution}:{resolution},fps=30,setsar=1,format=yuv420p,"
+        "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709"
     )
     run(
         [
@@ -392,8 +375,6 @@ def _concat_visual_segments_with_audio(
         [
             ffmpeg,
             "-y",
-            "-fflags",
-            "+genpts",
             "-f",
             "concat",
             "-safe",
@@ -408,16 +389,8 @@ def _concat_visual_segments_with_audio(
             "0:v:0",
             "-map",
             "1:a:0",
-            "-vf",
-            "fps=30,format=yuv420p",
             "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "24",
-            "-pix_fmt",
-            "yuv420p",
+            "copy",
             "-c:a",
             "aac",
             "-shortest",
@@ -479,6 +452,8 @@ def extract_audio(video_path: Path, wav_path: Path) -> None:
             "-i",
             str(video_path),
             "-vn",
+            "-af",
+            "asetpts=N/SR/TB",
             "-ac",
             "1",
             "-ar",
@@ -500,6 +475,8 @@ def extract_audio_track(video_path: Path, wav_path: Path, sample_rate: int = 441
             "-i",
             str(video_path),
             "-vn",
+            "-af",
+            "asetpts=N/SR/TB",
             "-ac",
             str(channels),
             "-ar",
@@ -514,6 +491,7 @@ def extract_audio_track(video_path: Path, wav_path: Path, sample_rate: int = 441
 def trim_video(input_path: Path, output_path: Path, duration: float) -> None:
     ffmpeg = require_tool("ffmpeg")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    duration = max(0.1, duration)
     run(
         [
             ffmpeg,
@@ -521,13 +499,30 @@ def trim_video(input_path: Path, output_path: Path, duration: float) -> None:
             "-i",
             str(input_path),
             "-t",
-            f"{max(0.1, duration):.3f}",
+            f"{duration:.3f}",
             "-map",
-            "0",
-            "-c",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c:v",
             "copy",
+            # Re-encode the first audio stream instead of preserving malformed
+            # AAC edit lists/timestamps from Telegram uploads. Copying them was
+            # able to turn a normal 23-second clip into a 0.02-second WAV.
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-af",
+            # Reset timestamps before trimming. Some Telegram files number AAC
+            # packets in samples but declare a 1-second time base, making each
+            # normal 1024-sample frame appear 1024 seconds apart. Trimming first
+            # would therefore keep only the first one or two packets.
+            f"asetpts=N/SR/TB,atrim=0:{duration:.3f}",
             "-avoid_negative_ts",
             "make_zero",
+            "-movflags",
+            "+faststart",
             str(output_path),
         ]
     )
@@ -543,7 +538,23 @@ def compress_video_for_telegram(
 ) -> None:
     duration = max(1.0, probe_duration(input_path))
     total_kbit_budget = target_size_mb * 8192 * 0.90
-    video_bitrate_k = max(320, int(total_kbit_budget / duration - audio_bitrate_k))
+    audio_tracks = _probe_audio_stream_count(input_path)
+    total_bitrate_k = max(64, int(total_kbit_budget / duration))
+    video_bitrate_k, effective_audio_bitrate_k = _telegram_bitrate_plan(
+        total_bitrate_k,
+        audio_tracks=audio_tracks,
+        requested_audio_bitrate_k=audio_bitrate_k,
+    )
+    # Very low bitrates spread over 720p turn into blocks. Reducing the frame
+    # size gives long Telegram videos a much cleaner picture for the same file
+    # budget. Short videos keep the caller's normal width limit.
+    effective_max_width = max_width
+    if video_bitrate_k < 140:
+        effective_max_width = min(effective_max_width, 480)
+    elif video_bitrate_k < 240:
+        effective_max_width = min(effective_max_width, 640)
+    elif video_bitrate_k < 400:
+        effective_max_width = min(effective_max_width, 854)
     maxrate_k = max(video_bitrate_k, int(video_bitrate_k * 1.35))
     bufsize_k = maxrate_k * 2
     ffmpeg = require_tool("ffmpeg")
@@ -556,10 +567,13 @@ def compress_video_for_telegram(
             str(input_path),
             "-map",
             "0:v:0",
+            # Every audio stream, not just the first: a multitrack dub carries the
+            # original alongside it, and mapping 0:a:0 alone silently threw that
+            # second track away for any video large enough to need compressing.
             "-map",
-            "0:a:0?",
+            "0:a?",
             "-vf",
-            f"scale=w='if(gt(iw,{max_width}),{max_width},iw)':h=-2",
+            f"scale=w='if(gt(iw,{effective_max_width}),{effective_max_width},iw)':h=-2",
             "-c:v",
             "libx264",
             "-preset",
@@ -575,7 +589,7 @@ def compress_video_for_telegram(
             "-c:a",
             "aac",
             "-b:a",
-            f"{audio_bitrate_k}k",
+            f"{effective_audio_bitrate_k}k",
             "-ac",
             "2",
             "-movflags",
@@ -583,6 +597,53 @@ def compress_video_for_telegram(
             str(output_path),
         ]
     )
+
+
+def _probe_audio_stream_count(path: Path) -> int:
+    ffprobe = require_tool("ffprobe")
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        streams = json.loads(result.stdout).get("streams") or []
+        return max(1, len(streams))
+    except Exception:
+        return 1
+
+
+def _telegram_bitrate_plan(
+    total_bitrate_k: int,
+    *,
+    audio_tracks: int,
+    requested_audio_bitrate_k: int,
+) -> tuple[int, int]:
+    """Fit every mapped audio track and the video inside one total budget."""
+    total_bitrate_k = max(64, int(total_bitrate_k))
+    audio_tracks = max(1, int(audio_tracks))
+    requested_audio_bitrate_k = max(16, int(requested_audio_bitrate_k))
+    min_video_bitrate_k = 40
+    audio_bitrate_k = min(
+        requested_audio_bitrate_k,
+        max(24, int(total_bitrate_k * 0.40 / audio_tracks)),
+    )
+    if audio_bitrate_k * audio_tracks + min_video_bitrate_k > total_bitrate_k:
+        audio_bitrate_k = max(16, (total_bitrate_k - min_video_bitrate_k) // audio_tracks)
+    video_bitrate_k = max(min_video_bitrate_k, total_bitrate_k - audio_bitrate_k * audio_tracks)
+    return video_bitrate_k, audio_bitrate_k
 
 
 def make_silence(wav_path: Path, duration: float, sample_rate: int = 44100) -> None:
@@ -636,7 +697,10 @@ def prepare_voice_reference(input_path: Path, output_path: Path, sample_rate: in
             str(input_path),
             "-vn",
             "-af",
-            "highpass=f=70,lowpass=f=7600,afftdn=nf=-25,dynaudnorm=f=75:g=15,volume=1.15",
+            # Preserve speaker timbre for cloning. Aggressive FFT denoising
+            # and dynamic normalization made Demucs/reference artifacts more
+            # prominent and could turn one voice into a metallic average.
+            "highpass=f=65,lowpass=f=10000,volume=1.05,alimiter=limit=0.95",
             "-ac",
             "1",
             "-ar",
@@ -651,6 +715,19 @@ def prepare_voice_reference(input_path: Path, output_path: Path, sample_rate: in
 def make_whisper_chaos_audio(input_path: Path, output_path: Path, gain_db: float = 50.0) -> None:
     ffmpeg = require_tool("ffmpeg")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # This path is intentionally not "clean" audio. It is a hard ASR helper for
+    # quiet/uneven meme clips where Whisper misses speech under loud effects.
+    # The old version was just volume+limiter; this aggressively flattens voice
+    # dynamics before limiting.
+    voice_crush_filter = (
+        "highpass=f=70,"
+        "lowpass=f=7800,"
+        "compand=attacks=0.002:decays=0.04:"
+        "points=-90/-35|-60/-14|-35/-4|-12/0|0/0,"
+        "acompressor=threshold=-35dB:ratio=20:attack=1:release=50:makeup=16,"
+        "volume=6dB,"
+        "alimiter=limit=1.0"
+    )
     run(
         [
             ffmpeg,
@@ -659,7 +736,7 @@ def make_whisper_chaos_audio(input_path: Path, output_path: Path, gain_db: float
             str(input_path),
             "-vn",
             "-af",
-            f"volume={gain_db:.1f}dB,alimiter=limit=0.98",
+            voice_crush_filter,
             "-ac",
             "1",
             "-ar",
@@ -680,6 +757,14 @@ def extract_wav_slice(
 ) -> None:
     ffmpeg = require_tool("ffmpeg")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    effective_duration = max(0.15, duration)
+    # A hard -ss/-t cut lands mid-waveform on both edges (confirmed: real
+    # slices start/end tens of percent off zero amplitude), which is an
+    # audible click on every reference clip and artifact chunk. A short
+    # fade removes it without touching alignment or duration.
+    fade_seconds = min(0.015, effective_duration / 4)
+    fade_out_start = max(0.0, effective_duration - fade_seconds)
+    audio_filter = f"afade=t=in:st=0:d={fade_seconds:.4f},afade=t=out:st={fade_out_start:.4f}:d={fade_seconds:.4f}"
     run(
         [
             ffmpeg,
@@ -687,10 +772,12 @@ def extract_wav_slice(
             "-ss",
             f"{max(0.0, start):.3f}",
             "-t",
-            f"{max(0.15, duration):.3f}",
+            f"{effective_duration:.3f}",
             "-i",
             str(input_path),
             "-vn",
+            "-af",
+            audio_filter,
             "-ac",
             "1",
             "-ar",
@@ -812,7 +899,7 @@ def fit_wav_to_duration(
 
 
 def delayed_mix(
-    items: list[tuple[Path, int]],
+    items: list[tuple[Path, int] | tuple[Path, int, float, float | None]],
     duration: float,
     output_path: Path,
     temp_dir: Path,
@@ -836,14 +923,36 @@ def delayed_mix(
         return
 
     cmd = [ffmpeg, "-y"]
-    for audio_path, _delay_ms in items:
+    normalized_items: list[tuple[Path, int, float, float | None]] = []
+    for item in items:
+        if len(item) == 2:
+            audio_path, delay_ms = item
+            normalized_items.append((audio_path, delay_ms, 1.0, None))
+        else:
+            audio_path, delay_ms, gain, duck_after_seconds = item
+            normalized_items.append((audio_path, delay_ms, gain, duck_after_seconds))
+
+    for audio_path, _delay_ms, _gain, _duck_after_seconds in normalized_items:
         cmd.extend(["-i", str(audio_path)])
 
     filter_parts: list[str] = []
     labels: list[str] = []
-    for idx, (_audio_path, delay_ms) in enumerate(items):
+    for idx, (_audio_path, delay_ms, gain, duck_after_seconds) in enumerate(normalized_items):
         label = f"a{idx}"
-        filter_parts.append(f"[{idx}:a]adelay={max(0, delay_ms)}:all=1[{label}]")
+        filters = [f"volume={max(0.0, gain):.3f}"]
+        if duck_after_seconds is not None:
+            # Keep the full phrase but move its tail behind the newly started
+            # foreground line. The expression runs before adelay, so t is
+            # relative to this individual clip.
+            duck_at = max(0.0, duck_after_seconds)
+            duck_done = duck_at + 0.18
+            filters.append(
+                "volume='if(lt(t,"
+                f"{duck_at:.3f}),1,if(lt(t,{duck_done:.3f}),"
+                f"1-(t-{duck_at:.3f})*3.8889,0.30))':eval=frame"
+            )
+        filters.append(f"adelay={max(0, delay_ms)}:all=1")
+        filter_parts.append(f"[{idx}:a]{','.join(filters)}[{label}]")
         labels.append(f"[{label}]")
 
     joined_labels = "".join(labels)
@@ -941,4 +1050,99 @@ def combine_video_audio(
             "-shortest",
             str(output_path),
         ]
+    _run_mux_with_video_fallback(cmd)
+
+
+# ISO 639-2/B tags for the language codes this project's UI exposes. Falls
+# back to "und" (undefined) so an unmapped code never breaks the mux.
+_MP4_LANGUAGE_TAGS = {
+    "ru": "rus",
+    "en": "eng",
+    "uk": "ukr",
+    "vi": "vie",
+    "ko": "kor",
+    "ja": "jpn",
+    "zh": "zho",
+    "th": "tha",
+    "de": "deu",
+    "es": "spa",
+    "fr": "fra",
+}
+
+
+def mp4_language_tag(code: str | None) -> str:
+    if not code:
+        return "und"
+    return _MP4_LANGUAGE_TAGS.get(code.strip().lower(), "und")
+
+
+def combine_video_audio_multitrack(
+    video_path: Path,
+    original_audio_path: Path,
+    dub_path: Path,
+    output_path: Path,
+    dub_volume: float,
+    bed_volume: float = 1.0,
+    bed_path: Path | None = None,
+    original_lang: str | None = None,
+    dub_lang: str | None = None,
+) -> None:
+    """Mux video with two separate audio streams instead of pre-mixing them:
+    the dub (optionally laid over the instrumental bed) and the untouched
+    original. A player can then switch tracks instead of only ever hearing one
+    fixed mix.
+
+    The dub track is built exactly as the single-track mux builds it, bed volume
+    included, so switching this on does not change how the video sounds by
+    default - it only adds the original alongside.
+    """
+    ffmpeg = require_tool("ffmpeg")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [ffmpeg, "-y", "-i", str(video_path), "-i", str(original_audio_path), "-i", str(dub_path)]
+    if bed_path is not None:
+        cmd.extend(["-i", str(bed_path)])
+        filter_complex = (
+            f"[2:a]volume={dub_volume:.3f}[dubv];"
+            f"[3:a]volume={bed_volume:.3f}[bed];"
+            "[bed][dubv]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+            "alimiter=limit=0.95[dubout]"
+        )
+    else:
+        filter_complex = f"[2:a]volume={dub_volume:.3f}[dubout]"
+
+    cmd.extend(
+        [
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "0:v:0",
+            # The dub goes first on purpose. Players that ignore the default
+            # disposition and simply take the first audio stream - Telegram's own
+            # viewer among the likely ones - must still get the dub, not the
+            # untranslated original.
+            "-map",
+            "[dubout]",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            "-metadata:s:a:0",
+            f"language={mp4_language_tag(dub_lang)}",
+            "-metadata:s:a:0",
+            "title=Dub",
+            "-metadata:s:a:1",
+            f"language={mp4_language_tag(original_lang)}",
+            "-metadata:s:a:1",
+            "title=Original",
+            "-disposition:a:0",
+            "default",
+            "-disposition:a:1",
+            "0",
+            str(output_path),
+        ]
+    )
     _run_mux_with_video_fallback(cmd)

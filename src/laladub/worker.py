@@ -8,21 +8,25 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .bot_config import load_bot_settings
+from .bot_config import BotSettings, load_bot_settings
 from .job_runner import execute_job, result_manifest, save_job_snapshot
 
 
 DEFAULT_CONFIG_PATH = Path("worker_config.json")
 LOCAL_VERSION_PATH = Path("worker_version.json")
+LOCAL_STATE_PATH = Path(".worker_state.json")
 UPDATE_EXIT_CODE = 42
 
 
@@ -45,8 +49,17 @@ def main(argv: list[str] | None = None) -> None:
     if not config_path.exists() and not args.no_save_config:
         _save_worker_config(config_path, {"server": server, "token": token, "worker_id": worker_id})
 
-    client = CoordinatorClient(server, token)
+    client = CoordinatorClient(server, token, worker_id)
+    token = _rotate_worker_token(
+        client,
+        config_path=config_path,
+        file_config=file_config,
+        server=server,
+        worker_id=worker_id,
+        save_config=not args.no_save_config,
+    )
     workdir.mkdir(parents=True, exist_ok=True)
+    _ensure_windows_autostart()
     print(f"LaLaDub worker started: id={worker_id} server={server} workdir={workdir}", flush=True)
 
     if args.auto_update and _remote_update_available(client):
@@ -76,10 +89,19 @@ def main(argv: list[str] | None = None) -> None:
             time.sleep(poll_seconds)
 
 
+# Enough to ride out a router hiccup without keeping a dead link alive for long.
+UPLOAD_ATTEMPTS = 4
+UPLOAD_RETRY_SECONDS = 5.0
+
+
 class CoordinatorClient:
-    def __init__(self, server: str, token: str) -> None:
+    def __init__(self, server: str, token: str, worker_id: str = "worker") -> None:
         self.server = server.rstrip("/")
         self.token = token
+        # Sent with every progress and heartbeat post. The coordinator needs it
+        # to tell a worker is alive even when the job it reports on is one the
+        # coordinator has already taken back.
+        self.worker_id = str(worker_id or "worker")
         self._parsed = urllib.parse.urlparse(self.server)
         if self._parsed.scheme not in {"http", "https"}:
             raise ValueError("Worker server must be http:// or https:// URL.")
@@ -116,13 +138,41 @@ class CoordinatorClient:
                 "current": current,
                 "total": total,
                 "detail": detail,
+                "worker_id": self.worker_id,
             },
+        )
+
+    def heartbeat(self, job_id: str) -> None:
+        # A short timeout on purpose. The coordinator drops the lease after a
+        # fixed silence; a single call blocking on the default timeout outlasts
+        # that window, so the job is taken away from a worker still running it.
+        self._request_json(
+            "POST",
+            f"/api/v1/jobs/{urllib.parse.quote(job_id)}/progress",
+            {"heartbeat_only": True, "worker_id": self.worker_id},
+            timeout=20,
         )
 
     def upload_file(self, job_id: str, kind: str, path: Path) -> None:
         query = urllib.parse.urlencode({"filename": path.name})
         request_path = f"/api/v1/jobs/{urllib.parse.quote(job_id)}/result/{urllib.parse.quote(kind)}?{query}"
-        self._upload_file(request_path, path)
+        # This carries the whole job home. One dropped connection used to throw
+        # away everything the laptop had just spent twenty minutes computing,
+        # and the job was then redone from scratch on the main PC. The upload
+        # is a PUT to a fixed path, so repeating it is safe.
+        for attempt in range(UPLOAD_ATTEMPTS):
+            try:
+                self._upload_file(request_path, path)
+                return
+            except (OSError, http.client.HTTPException) as exc:
+                if attempt == UPLOAD_ATTEMPTS - 1:
+                    raise
+                print(
+                    f"Result upload failed ({type(exc).__name__}: {exc}); "
+                    f"retrying {attempt + 2}/{UPLOAD_ATTEMPTS}",
+                    flush=True,
+                )
+                time.sleep(UPLOAD_RETRY_SECONDS * (attempt + 1))
 
     def complete(self, job_id: str, manifest: dict[str, Any]) -> None:
         self._request_json("POST", f"/api/v1/jobs/{urllib.parse.quote(job_id)}/complete", manifest)
@@ -141,6 +191,7 @@ class CoordinatorClient:
         payload: dict[str, Any] | None = None,
         *,
         none_on_204: bool = False,
+        timeout: float = 120,
     ) -> Any:
         data = None
         headers = self._auth_headers()
@@ -149,7 +200,7 @@ class CoordinatorClient:
             headers["Content-Type"] = "application/json; charset=utf-8"
         request = urllib.request.Request(self._url(path), data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 if response.status == 204 and none_on_204:
                     return None
                 body = response.read()
@@ -236,13 +287,24 @@ def _run_lease(client: CoordinatorClient, lease: dict[str, Any], workdir: Path) 
     input_path = job_dir / _safe_name(input_filename)
     print(f"Leased job {job_id}: downloading {input_filename}", flush=True)
 
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_lease_heartbeat_loop,
+        args=(client, job_id, heartbeat_stop),
+        name=f"laladub-heartbeat-{_safe_name(job_id)}",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+
     try:
         client.download_input(job_id, input_path)
         job = dict(remote_job)
         job["job_dir"] = str(job_dir)
         job["input_path"] = str(input_path)
         save_job_snapshot(job_dir, job, status="running")
-        settings = load_bot_settings(require_token=False)
+        settings = _settings_for_worker_job(load_bot_settings(require_token=False), job)
+        if settings.artifact_whisper_device == "cuda" and str(job.get("remote_stage") or "").strip().lower() == "preprocess":
+            print("Worker preprocessing acceleration: artifact Whisper uses CUDA.", flush=True)
         reporter = ProgressReporter(client, job_id)
         reporter("Worker started", 1, 100, f"input={job.get('source_lang') or 'auto'}")
         result = execute_job(job, settings, progress_callback=reporter)
@@ -256,6 +318,32 @@ def _run_lease(client: CoordinatorClient, lease: dict[str, Any], workdir: Path) 
         print(traceback_text, flush=True)
         save_job_snapshot(job_dir, remote_job, status="failed", error=str(exc))
         client.fail(job_id, "".join(traceback.format_exception_only(type(exc), exc)).strip(), traceback_text)
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=2.0)
+
+
+def _settings_for_worker_job(settings: BotSettings, job: dict[str, Any]) -> BotSettings:
+    if str(job.get("remote_stage") or "").strip().lower() != "preprocess" or not _cuda_available():
+        return settings
+    return replace(settings, artifact_whisper_device="cuda")
+
+
+def _lease_heartbeat_loop(client: CoordinatorClient, job_id: str, stop: threading.Event) -> None:
+    while not stop.wait(10.0):
+        try:
+            client.heartbeat(job_id)
+        except Exception as exc:
+            print(f"Worker heartbeat failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
 
 
 def _upload_result_files(client: CoordinatorClient, job_id: str, result: Any) -> None:
@@ -298,6 +386,54 @@ def _save_worker_config(path: Path, data: dict[str, str]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _rotate_worker_token(
+    client: CoordinatorClient,
+    *,
+    config_path: Path,
+    file_config: dict[str, str],
+    server: str,
+    worker_id: str,
+    save_config: bool,
+) -> str:
+    try:
+        manifest = client.worker_manifest()
+    except Exception as exc:
+        print(f"Worker token sync skipped: {type(exc).__name__}: {exc}", flush=True)
+        return client.token
+    new_token = str((manifest or {}).get("worker_token") or "").strip() or client.token
+    canonical_server = str((manifest or {}).get("worker_server") or "").strip().rstrip("/")
+    saved_server = canonical_server if _server_health_available(canonical_server) else server
+    token_changed = new_token != client.token
+    server_changed = saved_server.rstrip("/") != server.rstrip("/")
+    if not token_changed and not server_changed:
+        return client.token
+
+    client.token = new_token
+    if save_config:
+        updated = dict(file_config)
+        updated.update({"server": saved_server, "token": new_token, "worker_id": worker_id})
+        _save_worker_config(config_path, updated)
+    if token_changed:
+        print("Worker authentication token synchronized.", flush=True)
+    if server_changed:
+        print(f"Worker server switched to stable hostname: {saved_server}", flush=True)
+    return new_token
+
+
+def _server_health_available(server: str) -> bool:
+    if not server:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(server)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return False
+        request = urllib.request.Request(f"{server.rstrip('/')}/health")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return 200 <= response.status < 300
+    except Exception:
+        return False
+
+
 def _remote_update_available(client: CoordinatorClient) -> bool:
     try:
         manifest = client.worker_manifest()
@@ -310,23 +446,83 @@ def _remote_update_available(client: CoordinatorClient) -> bool:
     if not remote_build:
         return False
     local_build = _local_build_id()
-    return remote_build != local_build
+    return bool(local_build and remote_build != local_build)
+
+
+def _local_version_candidates() -> list[Path]:
+    """Every file that can tell us which build this worker is running.
+
+    worker_version.json ships inside the package, but the launcher records the
+    build it just installed in .worker_state.json instead - so the file the
+    updater writes and the file this check reads were not the same one. Read
+    both, from the working directory and from the package root, since a worker
+    started without the launcher's chdir would otherwise see neither. An unknown
+    local build makes the update check below answer "no" forever, which is how a
+    worker ends up stuck on old code with nothing in its log.
+    """
+    names = [LOCAL_VERSION_PATH.name, LOCAL_STATE_PATH.name]
+    roots = [Path.cwd(), Path(__file__).resolve().parents[2]]
+    candidates: list[Path] = []
+    for name in names:
+        for root in roots:
+            path = root / name
+            if path not in candidates:
+                candidates.append(path)
+    return candidates
 
 
 def _local_build_id() -> str:
-    try:
-        data = json.loads(LOCAL_VERSION_PATH.read_text(encoding="utf-8-sig"))
-    except Exception:
-        return ""
-    if not isinstance(data, dict):
-        return ""
-    return str(data.get("build_id") or data.get("sha256") or "").strip()
+    for path in _local_version_candidates():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        build_id = str(data.get("build_id") or data.get("sha256") or "").strip()
+        if build_id:
+            return build_id
+    # Staying quiet here is what let a stalled worker keep running old code
+    # unnoticed: no local build means the update check below always says no.
+    print(
+        "Worker build id is unknown (worker_version.json missing or unreadable); "
+        "auto-update cannot run until it is restored.",
+        flush=True,
+    )
+    return ""
 
 
 def _default_worker_id() -> str:
     user = getpass.getuser()
     host = socket.gethostname()
     return f"{host}-{user}"
+
+
+def _ensure_windows_autostart() -> None:
+    if os.name != "nt":
+        return
+    installer = Path.cwd() / "Install-Worker-Autostart.ps1"
+    if not installer.is_file():
+        return
+    try:
+        subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+                str(installer),
+            ],
+            cwd=Path.cwd(),
+            check=False,
+            timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        print(f"Worker autostart setup skipped: {type(exc).__name__}: {exc}", flush=True)
 
 
 def _safe_name(value: str) -> str:

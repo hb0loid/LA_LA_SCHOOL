@@ -1,0 +1,11 @@
+# One literal phrase per line. Blank lines and lines starting with # are ignored.
+kill yourself
+go kill yourself
+go back to your country
+white power
+sieg heil
+heil hitler
+gas the jews
+убей себя
+иди убейся
+вали в свою страну

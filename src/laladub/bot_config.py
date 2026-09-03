@@ -20,13 +20,25 @@ class BotSettings:
     job_retention_seconds: float
     cleanup_interval_seconds: float
     paid_users: frozenset[int]
+    paid_users_file: Path
+    admin_users: frozenset[int]
+    admin_users_file: Path
+    proposal_enabled: bool
+    proposal_db: Path
+    premium_db: Path
+    preset_db: Path
+    library_db: Path
+    review_db: Path
+    library_dir: Path
+    premium_price_stars: int
+    premium_days: int
+    paysupport_contact: str
     max_active_jobs: int
     max_active_jobs_per_user: int
     watermark_text: str
     watermark_image: Path | None
     max_file_mb: int
-    free_max_duration_seconds: float
-    paid_max_duration_seconds: float
+    max_file_mb_premium: int
     translator: str
     tts: str
     voice: str | None
@@ -59,42 +71,95 @@ class BotSettings:
     f5_cross_fade_duration: float
     f5_remove_silence: bool
     f5_timeout_seconds: int
+    qwen3_python: Path | None
+    qwen3_model: str
+    qwen3_cache_dir: Path
+    qwen3_timeout_seconds: int
+    cosyvoice_python: Path | None
+    cosyvoice_repo_dir: Path
+    cosyvoice_model_dir: Path
+    cosyvoice_model_id: str
+    cosyvoice_mode: str
+    cosyvoice_instruction: str
+    cosyvoice_device: str
+    cosyvoice_speed: float
+    cosyvoice_timeout_seconds: int
+    moss_python: Path | None
+    moss_model_dir: Path
+    moss_codec_dir: Path
+    moss_device: str
+    moss_timeout_seconds: int
     multi_speaker: bool
     speaker_reference_seconds: float
     speaker_clustering: bool
     max_speaker_clusters: int
     speaker_cluster_threshold: float
+    diarization_python: Path | None
+    diarization_model: str
+    diarization_device: str
+    diarization_cache_dir: Path
+    diarization_token_file: Path | None
+    diarization_timeout_seconds: int
     separation: str
     separation_device: str
     demucs_model: str
+    bsroformer_python: Path | None
+    bsroformer_model_dir: Path
+    bsroformer_model_file: str
+    bsroformer_timeout_seconds: int
     audio_bed: str
     asr_backend: str
     default_asr_method: str
     whisper_model: str
     whisper_only_model: str
     whisper_only_device: str
+    artifact_whisper_device: str
     whisper_device: str
     whisper_compute_type: str
     suppress_plain_ascii_tokens: bool
     original_volume: float
     dub_volume: float
+    trim_tts_silence: bool
+    tts_max_pause_seconds: float
     collapse_repetitions: bool
     max_phrase_repeats: int
     max_word_repeats: int
     inject_artifacts: bool
     artifact_max_segments: int
+    artifact_ratio: float
+    artifact_min_source_segments: int
     artifact_min_gap_seconds: float
     distort_translation: bool
     translation_pivots: str
+    max_translation_hops: int
+    channel_rebrand_share: float
+    max_line_repeats: int
+    artifact_source: str
+    artifact_cross_language_share: float
+    translation_second_pass_ratio: float
 
     def is_paid(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.paid_users
+
+    def is_admin(self, user_id: int | None) -> bool:
+        return user_id is not None and user_id in self.admin_users
 
 
 def load_bot_settings(*, require_token: bool = True) -> BotSettings:
     token = os.environ.get("LALADUB_BOT_TOKEN", "").strip()
     if require_token and not token:
         raise RuntimeError("Set LALADUB_BOT_TOKEN to your Telegram bot token.")
+
+    paid_users_file = Path(os.environ.get("LALADUB_PAID_USERS_FILE", "paid_users.txt"))
+    if paid_users_file.is_file():
+        paid_users = _parse_user_ids_file(paid_users_file)
+    else:
+        paid_users = _parse_user_ids(os.environ.get("LALADUB_PAID_USERS", ""))
+
+    admin_users_file = Path(os.environ.get("LALADUB_ADMIN_USERS_FILE", "admins.txt"))
+    admin_users = _parse_user_ids(os.environ.get("LALADUB_ADMIN_USERS", ""))
+    if admin_users_file.is_file():
+        admin_users.update(_parse_user_ids_file(admin_users_file))
 
     return BotSettings(
         token=token,
@@ -111,16 +176,30 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         worker_version=os.environ.get("LALADUB_WORKER_VERSION", "0.1.0").strip() or "0.1.0",
         job_retention_seconds=max(0.0, float(os.environ.get("LALADUB_JOB_RETENTION_SECONDS", "2592000"))),
         cleanup_interval_seconds=max(60.0, float(os.environ.get("LALADUB_CLEANUP_INTERVAL_SECONDS", "3600"))),
-        paid_users=frozenset(_parse_user_ids(os.environ.get("LALADUB_PAID_USERS", ""))),
+        paid_users=frozenset(paid_users),
+        paid_users_file=paid_users_file,
+        admin_users=frozenset(admin_users),
+        admin_users_file=admin_users_file,
+        proposal_enabled=_parse_bool(os.environ.get("LALADUB_PROPOSAL_ENABLED", "1")),
+        proposal_db=Path(os.environ.get("LALADUB_PROPOSAL_DB", "runs/proposal/proposals.sqlite3")),
+        premium_db=Path(os.environ.get("LALADUB_PREMIUM_DB", "runs/premium/subscriptions.sqlite3")),
+        preset_db=Path(os.environ.get("LALADUB_PRESET_DB", "runs/presets/presets.sqlite3")),
+        library_db=Path(os.environ.get("LALADUB_LIBRARY_DB", "runs/library/library.sqlite3")),
+        review_db=Path(os.environ.get("LALADUB_REVIEW_DB", "runs/reviews/text_reviews.sqlite3")),
+        library_dir=Path(os.environ.get("LALADUB_LIBRARY_DIR", "runs/library/videos")),
+        premium_price_stars=max(1, int(os.environ.get("LALADUB_PREMIUM_PRICE_STARS", "250"))),
+        premium_days=max(1, int(os.environ.get("LALADUB_PREMIUM_DAYS", "30"))),
+        paysupport_contact=os.environ.get("LALADUB_PAYSUPPORT_CONTACT", "свяжись с администратором бота").strip()
+        or "свяжись с администратором бота",
         max_active_jobs=max(1, int(os.environ.get("LALADUB_MAX_ACTIVE_JOBS", "2"))),
         max_active_jobs_per_user=max(1, int(os.environ.get("LALADUB_MAX_ACTIVE_JOBS_PER_USER", "1"))),
         watermark_text=os.environ.get("LALADUB_WATERMARK_TEXT", "La La Local Dub"),
         watermark_image=_optional_path(os.environ.get("LALADUB_WATERMARK_IMAGE")),
         max_file_mb=int(os.environ.get("LALADUB_MAX_FILE_MB", "200")),
-        free_max_duration_seconds=float(os.environ.get("LALADUB_FREE_MAX_DURATION_SECONDS", "60")),
-        paid_max_duration_seconds=float(os.environ.get("LALADUB_PAID_MAX_DURATION_SECONDS", "0")),
+        # 0 means no limit. Premium users and admins are trusted with the disk.
+        max_file_mb_premium=int(os.environ.get("LALADUB_MAX_FILE_MB_PREMIUM", "0")),
         translator=os.environ.get("LALADUB_TRANSLATOR", "hybrid"),
-        tts=os.environ.get("LALADUB_TTS", "xtts"),
+        tts=os.environ.get("LALADUB_TTS", "moss"),
         voice=_empty_to_none(os.environ.get("LALADUB_VOICE", "Microsoft Irina Desktop")),
         speaker_wav=_optional_path(os.environ.get("LALADUB_SPEAKER_WAV")),
         xtts_model=os.environ.get("LALADUB_XTTS_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2"),
@@ -141,7 +220,7 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         audio_visual_source_dir=_optional_path(os.environ.get("LALADUB_AUDIO_VISUAL_SOURCE_DIR")),
         audio_visual_resolution=max(64, int(os.environ.get("LALADUB_AUDIO_VISUAL_RESOLUTION", "512"))),
         audio_visual_max_slice_seconds=max(0.2, float(os.environ.get("LALADUB_AUDIO_VISUAL_MAX_SLICE_SECONDS", "3.0"))),
-        audio_visual_safety_enabled=_parse_bool(os.environ.get("LALADUB_AUDIO_VISUAL_SAFETY_ENABLED", "0")),
+        audio_visual_safety_enabled=_parse_bool(os.environ.get("LALADUB_AUDIO_VISUAL_SAFETY_ENABLED", "1")),
         audio_visual_safety_model=os.environ.get(
             "LALADUB_AUDIO_VISUAL_SAFETY_MODEL",
             "Falconsai/nsfw_image_detection",
@@ -161,35 +240,102 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         f5_cross_fade_duration=float(os.environ.get("LALADUB_F5_CROSS_FADE_DURATION", "0.15")),
         f5_remove_silence=_parse_bool(os.environ.get("LALADUB_F5_REMOVE_SILENCE", "0")),
         f5_timeout_seconds=int(os.environ.get("LALADUB_F5_TIMEOUT_SECONDS", "1800")),
+        qwen3_python=_optional_path(os.environ.get("LALADUB_QWEN3_PYTHON", ".venv-qwen3tts\\Scripts\\python.exe")),
+        qwen3_model=os.environ.get("LALADUB_QWEN3_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
+        qwen3_cache_dir=Path(os.environ.get("LALADUB_QWEN3_CACHE_DIR", "models/qwen3tts")),
+        qwen3_timeout_seconds=int(os.environ.get("LALADUB_QWEN3_TIMEOUT_SECONDS", "1800")),
+        cosyvoice_python=_optional_path(os.environ.get("LALADUB_COSYVOICE_PYTHON", ".venv-cosyvoice\\Scripts\\python.exe")),
+        cosyvoice_repo_dir=Path(os.environ.get("LALADUB_COSYVOICE_REPO_DIR", "models/cosyvoice/CosyVoice")),
+        cosyvoice_model_dir=Path(
+            os.environ.get("LALADUB_COSYVOICE_MODEL_DIR", "models/cosyvoice/pretrained_models/Fun-CosyVoice3-0.5B")
+        ),
+        cosyvoice_model_id=os.environ.get("LALADUB_COSYVOICE_MODEL_ID", "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"),
+        cosyvoice_mode=os.environ.get("LALADUB_COSYVOICE_MODE", "cross_lingual"),
+        cosyvoice_instruction=os.environ.get(
+            "LALADUB_COSYVOICE_INSTRUCTION",
+            "You are a helpful assistant.<|endofprompt|>",
+        ),
+        cosyvoice_device=os.environ.get("LALADUB_COSYVOICE_DEVICE", "auto"),
+        cosyvoice_speed=float(os.environ.get("LALADUB_COSYVOICE_SPEED", "1.0")),
+        cosyvoice_timeout_seconds=int(os.environ.get("LALADUB_COSYVOICE_TIMEOUT_SECONDS", "1800")),
+        moss_python=_optional_path(os.environ.get("LALADUB_MOSS_PYTHON", ".venv-moss\\Scripts\\python.exe")),
+        moss_model_dir=Path(
+            os.environ.get("LALADUB_MOSS_MODEL_DIR", "models/moss/MOSS-TTS-Local-Transformer-v1.5")
+        ),
+        moss_codec_dir=Path(os.environ.get("LALADUB_MOSS_CODEC_DIR", "models/moss/MOSS-Audio-Tokenizer-v2")),
+        moss_device=os.environ.get("LALADUB_MOSS_DEVICE", "auto"),
+        moss_timeout_seconds=int(os.environ.get("LALADUB_MOSS_TIMEOUT_SECONDS", "1800")),
         multi_speaker=_parse_bool(os.environ.get("LALADUB_MULTI_SPEAKER", "1")),
         speaker_reference_seconds=float(os.environ.get("LALADUB_SPEAKER_REFERENCE_SECONDS", "5.0")),
         speaker_clustering=_parse_bool(os.environ.get("LALADUB_SPEAKER_CLUSTERING", "1")),
         max_speaker_clusters=max(1, int(os.environ.get("LALADUB_MAX_SPEAKER_CLUSTERS", "6"))),
         speaker_cluster_threshold=float(os.environ.get("LALADUB_SPEAKER_CLUSTER_THRESHOLD", "0.08")),
-        separation=os.environ.get("LALADUB_SEPARATION", "demucs"),
+        diarization_python=_optional_path(
+            os.environ.get("LALADUB_DIARIZATION_PYTHON", ".venv-diarization\\Scripts\\python.exe")
+        ),
+        diarization_model=os.environ.get(
+            "LALADUB_DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1"
+        ),
+        diarization_device=os.environ.get("LALADUB_DIARIZATION_DEVICE", "auto"),
+        diarization_cache_dir=Path(os.environ.get("LALADUB_DIARIZATION_CACHE_DIR", "models/diarization")),
+        diarization_token_file=_optional_path(
+            os.environ.get("LALADUB_DIARIZATION_TOKEN_FILE", ".secrets\\HuggingFace-Token.txt")
+        ),
+        diarization_timeout_seconds=int(os.environ.get("LALADUB_DIARIZATION_TIMEOUT_SECONDS", "1800")),
+        separation=os.environ.get("LALADUB_SEPARATION", "bsroformer"),
         separation_device=os.environ.get("LALADUB_SEPARATION_DEVICE", "cpu"),
         demucs_model=os.environ.get("LALADUB_DEMUCS_MODEL", "htdemucs"),
+        bsroformer_python=_optional_path(
+            os.environ.get("LALADUB_BSROFORMER_PYTHON", ".venv-bsroformer\\Scripts\\python.exe")
+        ),
+        bsroformer_model_dir=Path(os.environ.get("LALADUB_BSROFORMER_MODEL_DIR", "models/audio-separator")),
+        bsroformer_model_file=os.environ.get(
+            "LALADUB_BSROFORMER_MODEL_FILE", "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+        ),
+        bsroformer_timeout_seconds=int(os.environ.get("LALADUB_BSROFORMER_TIMEOUT_SECONDS", "600")),
         audio_bed=os.environ.get("LALADUB_AUDIO_BED", "instrumental"),
         asr_backend=os.environ.get("LALADUB_ASR_BACKEND", "faster-whisper"),
         default_asr_method=os.environ.get("LALADUB_DEFAULT_ASR_METHOD", "ow-large-v3-chaos-backbone").strip().lower(),
         whisper_model=os.environ.get("LALADUB_WHISPER_MODEL", "small"),
         whisper_only_model=os.environ.get("LALADUB_WHISPER_ONLY_MODEL", "turbo"),
         whisper_only_device=os.environ.get("LALADUB_WHISPER_ONLY_DEVICE", "cpu"),
+        artifact_whisper_device=os.environ.get("LALADUB_ARTIFACT_WHISPER_DEVICE", "cpu"),
         whisper_device=os.environ.get("LALADUB_WHISPER_DEVICE", "cpu"),
         whisper_compute_type=os.environ.get("LALADUB_WHISPER_COMPUTE_TYPE", "int8"),
         suppress_plain_ascii_tokens=_parse_bool(os.environ.get("LALADUB_SUPPRESS_PLAIN_ASCII_TOKENS", "0")),
         original_volume=float(os.environ.get("LALADUB_ORIGINAL_VOLUME", "0.35")),
         dub_volume=float(os.environ.get("LALADUB_DUB_VOLUME", "1.0")),
+        trim_tts_silence=_parse_bool(os.environ.get("LALADUB_TRIM_TTS_SILENCE", "1")),
+        tts_max_pause_seconds=max(0.0, float(os.environ.get("LALADUB_TTS_MAX_PAUSE_SECONDS", "0.3"))),
         collapse_repetitions=_parse_bool(os.environ.get("LALADUB_COLLAPSE_REPETITIONS", "1")),
         max_phrase_repeats=int(os.environ.get("LALADUB_MAX_PHRASE_REPEATS", "2")),
         max_word_repeats=int(os.environ.get("LALADUB_MAX_WORD_REPEATS", "3")),
         inject_artifacts=_parse_bool(os.environ.get("LALADUB_INJECT_ARTIFACTS", "1")),
         artifact_max_segments=int(os.environ.get("LALADUB_ARTIFACT_MAX_SEGMENTS", "12")),
+        artifact_ratio=max(0.0, min(1.0, float(os.environ.get("LALADUB_ARTIFACT_RATIO", "0.20")))),
+        artifact_min_source_segments=max(0, int(os.environ.get("LALADUB_ARTIFACT_MIN_SOURCE_SEGMENTS", "5"))),
         artifact_min_gap_seconds=float(os.environ.get("LALADUB_ARTIFACT_MIN_GAP_SECONDS", "0.5")),
         distort_translation=_parse_bool(os.environ.get("LALADUB_DISTORT_TRANSLATION", "1")),
         translation_pivots=os.environ.get(
             "LALADUB_TRANSLATION_PIVOTS",
-            "input,en|en,de|en,fr|en,es|input,en,de|en,es,de",
+            "input,en|input,ja,en|input,tr,de,en|en,de|en,fr|en,es|en,ja,ko|en,tr,ar|input,en,de|input,ja,ko,en|input,tr,ar,en|en,th,he,en|en,ms,he,en",
+        ),
+        max_translation_hops=max(2, int(os.environ.get("LALADUB_MAX_TRANSLATION_HOPS", "3"))),
+        # Share of foreign-channel mentions in artifacts renamed to ours.
+        channel_rebrand_share=min(
+            1.0, max(0.0, float(os.environ.get("LALADUB_CHANNEL_REBRAND_SHARE", "0.5")))
+        ),
+        # How often one short line may repeat across a video. 0 disables it.
+        max_line_repeats=max(0, int(os.environ.get("LALADUB_MAX_LINE_REPEATS", "5"))),
+        # "catalog" looks artifacts up instead of hunting them with a second
+        # ASR pass; "whisper" restores the old hunt.
+        artifact_source=os.environ.get("LALADUB_ARTIFACT_SOURCE", "catalog").strip().lower(),
+        artifact_cross_language_share=min(
+            1.0, max(0.0, float(os.environ.get("LALADUB_ARTIFACT_CROSS_LANGUAGE_SHARE", "0.15")))
+        ),
+        translation_second_pass_ratio=max(
+            0.0,
+            min(1.0, float(os.environ.get("LALADUB_TRANSLATION_SECOND_PASS_RATIO", "0.0"))),
         ),
     )
 
@@ -202,6 +348,15 @@ def _parse_user_ids(raw: str) -> set[int]:
             continue
         result.add(int(chunk))
     return result
+
+
+def _parse_user_ids_file(path: Path) -> set[int]:
+    values: list[str] = []
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        value = line.split("#", 1)[0].strip()
+        if value:
+            values.append(value)
+    return _parse_user_ids(",".join(values))
 
 
 def _empty_to_none(value: str | None) -> str | None:

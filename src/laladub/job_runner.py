@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import time
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from .asr import clear_openai_whisper_cache
 from .bot_config import BotSettings
 from .models import DubConfig
 from .pipeline import run_dub, run_transcript
+from .tts import clear_tts_model_caches
 from .watermark import add_watermark
 
 
@@ -55,9 +59,23 @@ class JobExecutionResult:
     transcript_filename: str | None = None
     transcript_text: str = ""
     documents: list[JobDocument] = field(default_factory=list)
+    preprocess_seconds: float | None = None
 
 
 def execute_job(
+    job: dict[str, Any],
+    settings: BotSettings,
+    *,
+    progress_callback: ProgressCallback | None = None,
+) -> JobExecutionResult:
+    try:
+        return _execute_job(job, settings, progress_callback=progress_callback)
+    finally:
+        clear_openai_whisper_cache()
+        clear_tts_model_caches()
+
+
+def _execute_job(
     job: dict[str, Any],
     settings: BotSettings,
     *,
@@ -68,6 +86,9 @@ def execute_job(
     job_dir.mkdir(parents=True, exist_ok=True)
     output_path = job_dir / "dubbed.mp4"
 
+    if str(job.get("remote_stage") or "").strip().lower() == "preprocess":
+        return _execute_preprocess_job(job, settings, output_path, progress_callback)
+
     if job.get("mode") == "raw_text":
         return _execute_raw_text_job(job, settings, output_path, progress_callback)
 
@@ -76,16 +97,17 @@ def execute_job(
     result = run_dub(input_path, config)
     send_path = result
 
-    watermarked_path = job_dir / "dubbed_watermarked.mp4"
-    if progress_callback:
-        progress_callback("Adding watermark", 98, 100, None)
-    add_watermark(
-        result,
-        watermarked_path,
-        text=settings.watermark_text,
-        image_path=settings.watermark_image,
-    )
-    send_path = watermarked_path
+    if job.get("watermark_enabled", True):
+        watermarked_path = job_dir / "dubbed_watermarked.mp4"
+        if progress_callback:
+            progress_callback("Adding watermark", 98, 100, None)
+        add_watermark(
+            result,
+            watermarked_path,
+            text=settings.watermark_text,
+            image_path=settings.watermark_image,
+        )
+        send_path = watermarked_path
 
     transcript_text = _read_transcript_text(job_dir / "work" / "translated.srt")
     transcript_path: Path | None = None
@@ -125,7 +147,46 @@ def result_manifest(result: JobExecutionResult) -> dict[str, Any]:
             }
             for document in result.documents
         ]
+    if result.mode == "preprocess" and result.documents:
+        data["preprocess"] = {"filename": result.documents[0].path.name}
+        data["preprocess_seconds"] = result.preprocess_seconds
     return data
+
+
+def _execute_preprocess_job(
+    job: dict[str, Any],
+    settings: BotSettings,
+    output_path: Path,
+    progress_callback: ProgressCallback | None,
+) -> JobExecutionResult:
+    job_dir = Path(str(job["job_dir"]))
+    input_path = Path(str(job["input_path"]))
+    workdir = job_dir / "work"
+    if workdir.exists():
+        shutil.rmtree(workdir)
+
+    config = _build_dub_config(job, settings, output_path)
+    config.progress_callback = progress_callback
+    config.resume = True
+    config.preprocess_only = True
+    started_at = time.monotonic()
+    run_dub(input_path, config)
+    elapsed = time.monotonic() - started_at
+
+    archive_path = job_dir / "preprocess_bundle.zip"
+    archive_path.unlink(missing_ok=True)
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+        for path in sorted(workdir.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(workdir).as_posix())
+    if not archive_path.is_file() or archive_path.stat().st_size < 1024:
+        raise RuntimeError("Remote preprocessing created an empty artifact package.")
+
+    return JobExecutionResult(
+        mode="preprocess",
+        documents=[JobDocument(archive_path, archive_path.name, "Prepared dubbing artifacts")],
+        preprocess_seconds=elapsed,
+    )
 
 
 def _execute_raw_text_job(
@@ -195,17 +256,39 @@ def _execute_raw_text_job(
 
 def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: Path) -> DubConfig:
     job_dir = Path(str(job["job_dir"]))
+    target_lang = target_lang_value(job.get("target_lang"))
+    tts_provider = str(job.get("tts_provider") or settings.tts)
+    if tts_provider.lower() not in {
+        "f5", "f5tts", "qwen3", "qwen3-tts", "qwen3tts",
+        "cosyvoice", "cosyvoice-tts", "cosyvoicetts", "cosy",
+        "moss", "moss-tts", "mosstts", "moss-v1.5",
+    }:
+        tts_provider = settings.tts
+    if target_lang == "uk" and tts_provider.lower() in {
+        "qwen3",
+        "qwen3-tts",
+        "qwen3tts",
+        "cosyvoice",
+        "cosyvoice-tts",
+        "cosyvoicetts",
+        "cosy",
+        "moss",
+        "moss-tts",
+        "mosstts",
+        "moss-v1.5",
+    }:
+        tts_provider = "f5"
     config = DubConfig(
         output=output_path,
         workdir=job_dir / "work",
         source_lang=None,
-        target_lang=target_lang_value(job.get("target_lang")),
+        target_lang=target_lang,
         asr_backend=settings.asr_backend,
         whisper_model=settings.whisper_model,
         whisper_device=settings.whisper_device,
         whisper_compute_type=settings.whisper_compute_type,
         translator=settings.translator,
-        tts=settings.tts,
+        tts=tts_provider,
         voice=settings.voice,
         speaker_wav=settings.speaker_wav,
         xtts_model=settings.xtts_model,
@@ -228,34 +311,71 @@ def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: P
         f5_cross_fade_duration=settings.f5_cross_fade_duration,
         f5_remove_silence=settings.f5_remove_silence,
         f5_timeout_seconds=settings.f5_timeout_seconds,
+        qwen3_python=settings.qwen3_python,
+        qwen3_model=settings.qwen3_model,
+        qwen3_cache_dir=settings.qwen3_cache_dir,
+        qwen3_timeout_seconds=settings.qwen3_timeout_seconds,
+        cosyvoice_python=settings.cosyvoice_python,
+        cosyvoice_repo_dir=settings.cosyvoice_repo_dir,
+        cosyvoice_model_dir=settings.cosyvoice_model_dir,
+        cosyvoice_model_id=settings.cosyvoice_model_id,
+        cosyvoice_mode=settings.cosyvoice_mode,
+        cosyvoice_instruction=settings.cosyvoice_instruction,
+        cosyvoice_device=settings.cosyvoice_device,
+        cosyvoice_speed=settings.cosyvoice_speed,
+        cosyvoice_timeout_seconds=settings.cosyvoice_timeout_seconds,
+        moss_python=settings.moss_python,
+        moss_model_dir=settings.moss_model_dir,
+        moss_codec_dir=settings.moss_codec_dir,
+        moss_device=settings.moss_device,
+        moss_timeout_seconds=settings.moss_timeout_seconds,
         multi_speaker=settings.multi_speaker,
         speaker_reference_seconds=settings.speaker_reference_seconds,
         speaker_clustering=settings.speaker_clustering,
         max_speaker_clusters=settings.max_speaker_clusters,
         speaker_cluster_threshold=settings.speaker_cluster_threshold,
+        diarization_python=settings.diarization_python,
+        diarization_model=settings.diarization_model,
+        diarization_device=settings.diarization_device,
+        diarization_cache_dir=settings.diarization_cache_dir,
+        diarization_token_file=settings.diarization_token_file,
+        diarization_timeout_seconds=settings.diarization_timeout_seconds,
         separation=settings.separation,
         separation_device=settings.separation_device,
         demucs_model=settings.demucs_model,
+        bsroformer_python=settings.bsroformer_python,
+        bsroformer_model_dir=settings.bsroformer_model_dir,
+        bsroformer_model_file=settings.bsroformer_model_file,
+        bsroformer_timeout_seconds=settings.bsroformer_timeout_seconds,
         audio_bed=settings.audio_bed,
         glitch_profile=job.get("glitch_profile", "clean"),
         original_volume=settings.original_volume,
         dub_volume=settings.dub_volume,
+        trim_tts_silence=settings.trim_tts_silence,
+        tts_max_pause_seconds=settings.tts_max_pause_seconds,
         force_source_language=False,
         suppress_plain_ascii_tokens=settings.suppress_plain_ascii_tokens,
         asr_retry_on_repetition=True,
         artifact_source_lang=job.get("source_lang") or None,
         artifact_whisper_model=settings.whisper_only_model,
-        artifact_whisper_device=settings.whisper_only_device,
+        artifact_whisper_device=settings.artifact_whisper_device,
         inject_artifacts=settings.inject_artifacts,
         artifact_max_segments=settings.artifact_max_segments,
+        artifact_ratio=settings.artifact_ratio,
+        artifact_min_source_segments=settings.artifact_min_source_segments,
         artifact_min_gap_seconds=settings.artifact_min_gap_seconds,
         distort_translation=settings.distort_translation,
+        translation_chaos=translation_chaos_value(job.get("translation_chaos")) or "crooked",
+        translation_seed=ensure_translation_seed(job),
         translation_pivots=settings.translation_pivots,
+        translation_second_pass_ratio=settings.translation_second_pass_ratio,
         collapse_repetitions=settings.collapse_repetitions,
         max_phrase_repeats=settings.max_phrase_repeats,
         max_word_repeats=settings.max_word_repeats,
+        censor_percent=int(job.get("censor_percent") or 0),
     )
     apply_text_extraction_method(config, job, settings)
+    apply_translation_chaos(config, job, settings)
     apply_speaker_count(config, job)
     return config
 
@@ -280,8 +400,40 @@ def target_lang_value(value: Any) -> str:
     return text if text in {"ru", "uk", "en"} else "ru"
 
 
+def translation_chaos_value(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    aliases = {
+        "normal": "normal",
+        "clean": "normal",
+        "аккуратно": "normal",
+        "нормально": "normal",
+        "crooked": "crooked",
+        "current": "crooked",
+        "криво": "crooked",
+        "nightmare": "nightmare",
+        "кошмар": "nightmare",
+        "кошмарно": "nightmare",
+        "destroy": "destroy",
+        "full": "destroy",
+        "garbage": "destroy",
+        "уничтожить": "destroy",
+        "распад": "destroy",
+    }
+    return aliases.get(text)
+
+
+def ensure_translation_seed(job: dict[str, Any]) -> str:
+    seed = str(job.get("translation_seed") or "").strip()
+    if not seed:
+        job_dir = str(job.get("job_dir") or "").strip()
+        seed = Path(job_dir).name if job_dir else "unknown"
+        job["translation_seed"] = seed
+    return seed
+
+
 def apply_speaker_count(config: DubConfig, job: dict[str, Any]) -> None:
     count = speaker_count_value(job.get("speaker_count"))
+    config.speaker_count_exact = count
     if count is None:
         return
     config.max_speaker_clusters = count
@@ -291,6 +443,63 @@ def apply_speaker_count(config: DubConfig, job: dict[str, Any]) -> None:
     else:
         config.multi_speaker = True
         config.speaker_clustering = True
+
+
+def apply_translation_chaos(config: DubConfig, job: dict[str, Any], settings: BotSettings) -> None:
+    chaos = translation_chaos_value(job.get("translation_chaos")) or "crooked"
+    job["translation_chaos"] = chaos
+    config.translation_chaos = chaos
+    config.translation_seed = ensure_translation_seed(job)
+
+    if config.content_chaos_backbone:
+        config.translation_chaos = "destroy"
+        config.translation_pivots = (
+            f"{settings.translation_pivots}|"
+            "input,ja,ko,tr,ar,en|input,zh,ja,ko,en|"
+            "en,ja,ko,tr,en|en,th,he,en"
+        )
+        config.translation_second_pass_ratio = max(settings.translation_second_pass_ratio, 0.72)
+        # Was pinned at 0.20, which silently ignored LALADUB_ARTIFACT_RATIO in
+        # the mode nearly every job uses (3416 of 3552). The floor keeps the
+        # old density as the minimum; raising the setting now actually works.
+        config.artifact_ratio = max(settings.artifact_ratio, 0.20)
+        config.artifact_max_segments = max(config.artifact_max_segments, 64)
+        return
+
+    if chaos == "normal":
+        config.translation_pivots = "input,en|en,de|en,fr|en,es"
+        config.translation_second_pass_ratio = 0.12
+        config.artifact_ratio = min(config.artifact_ratio, 0.10)
+        config.artifact_max_segments = min(config.artifact_max_segments, 16)
+        return
+
+    if chaos == "crooked":
+        config.translation_pivots = settings.translation_pivots
+        config.translation_second_pass_ratio = settings.translation_second_pass_ratio
+        return
+
+    if chaos == "nightmare":
+        config.translation_pivots = (
+            f"{settings.translation_pivots}|"
+            "input,ja,ko,en|input,tr,ar,he,en|input,zh,ja,en|"
+            "en,de,fr,es,en|en,ja,ko,tr,en|en,th,he,ar,en|en,ms,he,ar,en|"
+            "input,en,ja,ko,tr,ar,en"
+        )
+        config.translation_second_pass_ratio = max(settings.translation_second_pass_ratio, 0.70)
+        config.artifact_ratio = max(config.artifact_ratio, 0.30)
+        config.artifact_max_segments = max(config.artifact_max_segments, 64)
+        return
+
+    if chaos == "destroy":
+        config.translation_pivots = (
+            f"{settings.translation_pivots}|"
+            "input,ja,ko,tr,ar,en|"
+            "input,zh,ja,ko,en|"
+            "en,ja,ko,tr,en"
+        )
+        config.translation_second_pass_ratio = max(settings.translation_second_pass_ratio, 0.55)
+        config.artifact_ratio = max(config.artifact_ratio, 0.45)
+        config.artifact_max_segments = max(config.artifact_max_segments, 96)
 
 
 def apply_text_extraction_method(config: DubConfig, job: dict[str, Any], settings: BotSettings) -> None:
@@ -322,10 +531,12 @@ def apply_text_extraction_method(config: DubConfig, job: dict[str, Any], setting
     config.suppress_plain_ascii_tokens = False
     config.asr_retry_on_repetition = not forced
     config.asr_fallback_on_sparse = False
+    config.reference_timing_asr = False
     config.artifact_source_lang = None
     config.input_pivot_lang = None
     config.inject_artifacts = False
     config.artifact_chaos_mode = False
+    config.content_chaos_backbone = False
     config.distort_main_translation = False
     config.glitch_profile = "faithful" if forced else "clean"
 
@@ -352,16 +563,30 @@ def apply_text_extraction_method(config: DubConfig, job: dict[str, Any], setting
         config.glitch_profile = "faithful"
         config.collapse_repetitions = False
         config.distort_main_translation = True
+    elif chaos_backbone and selected_source:
+        config.source_lang = selected_source
+        config.force_source_language = True
+        config.asr_retry_on_repetition = False
+        config.asr_fallback_on_sparse = True
+        config.reference_timing_asr = True
+        config.input_pivot_lang = selected_source
+        config.artifact_source_lang = selected_source
+        config.inject_artifacts = True
+        config.artifact_chaos_mode = True
+        config.content_chaos_backbone = True
+        config.glitch_profile = "faithful"
+        config.collapse_repetitions = True
+        config.distort_main_translation = True
     elif chaos_backbone:
         config.source_lang = None
         config.force_source_language = False
         config.asr_retry_on_repetition = True
         config.asr_fallback_on_sparse = False
-        config.input_pivot_lang = selected_source
-        config.artifact_source_lang = selected_source
-        config.inject_artifacts = bool(settings.inject_artifacts and selected_source)
-        config.artifact_chaos_mode = True
-        config.artifact_max_segments = max(0, settings.artifact_max_segments)
+        config.reference_timing_asr = False
+        config.input_pivot_lang = None
+        config.artifact_source_lang = None
+        config.inject_artifacts = False
+        config.artifact_chaos_mode = False
         config.glitch_profile = "clean"
         config.distort_main_translation = True
     elif hunt_artifacts:

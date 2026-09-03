@@ -34,6 +34,11 @@ def main(argv: list[str] | None = None) -> None:
             translator=args.translator,
             libretranslate_url=args.libretranslate_url,
             libretranslate_api_key=args.libretranslate_api_key,
+            llm_base_url=args.llm_base_url,
+            llm_api_key=args.llm_api_key,
+            llm_model=args.llm_model,
+            llm_temperature=args.llm_temperature,
+            llm_timeout_seconds=args.llm_timeout_seconds,
             tts=args.tts,
             voice=args.voice,
             sapi_rate=args.sapi_rate,
@@ -52,6 +57,7 @@ def main(argv: list[str] | None = None) -> None:
             f5_ckpt_file=args.f5_ckpt_file,
             f5_vocab_file=args.f5_vocab_file,
             f5_cache_dir=args.f5_cache_dir,
+            media_cache_dir=args.media_cache_dir,
             f5_device=args.f5_device,
             f5_speed=args.f5_speed,
             f5_nfe_step=args.f5_nfe_step,
@@ -60,11 +66,29 @@ def main(argv: list[str] | None = None) -> None:
             f5_cross_fade_duration=args.f5_cross_fade_duration,
             f5_remove_silence=args.f5_remove_silence,
             f5_timeout_seconds=args.f5_timeout_seconds,
+            cosyvoice_python=args.cosyvoice_python,
+            cosyvoice_repo_dir=args.cosyvoice_repo_dir,
+            cosyvoice_model_dir=args.cosyvoice_model_dir,
+            cosyvoice_model_id=args.cosyvoice_model_id,
+            cosyvoice_mode=args.cosyvoice_mode,
+            cosyvoice_instruction=args.cosyvoice_instruction,
+            cosyvoice_device=args.cosyvoice_device,
+            cosyvoice_speed=args.cosyvoice_speed,
+            cosyvoice_timeout_seconds=args.cosyvoice_timeout_seconds,
+            moss_python=args.moss_python,
+            moss_model_dir=args.moss_model_dir,
+            moss_codec_dir=args.moss_codec_dir,
+            moss_device=args.moss_device,
+            moss_timeout_seconds=args.moss_timeout_seconds,
             multi_speaker=not args.no_multi_speaker,
             speaker_reference_seconds=args.speaker_reference_seconds,
             separation=args.separation,
             separation_device=args.separation_device,
             demucs_model=args.demucs_model,
+            bsroformer_python=args.bsroformer_python,
+            bsroformer_model_dir=args.bsroformer_model_dir,
+            bsroformer_model_file=args.bsroformer_model_file,
+            bsroformer_timeout_seconds=args.bsroformer_timeout_seconds,
             audio_bed=args.audio_bed,
             glitch_profile=args.glitch_profile,
             ghost_gap_seconds=args.ghost_gap_seconds,
@@ -74,6 +98,10 @@ def main(argv: list[str] | None = None) -> None:
             max_phrase_repeats=args.max_phrase_repeats,
             max_word_repeats=args.max_word_repeats,
             fit_to_segments=not args.no_fit_to_segments,
+            trim_tts_silence=not args.no_trim_tts_silence,
+            tts_max_pause_seconds=args.tts_max_pause_seconds,
+            translation_pivots=args.translation_pivots,
+            translation_second_pass_ratio=args.translation_second_pass_ratio,
             keep_workdir=True,
         )
         run_dub(args.video, config)
@@ -122,12 +150,23 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument(
         "--translator",
         default="identity",
-        choices=["identity", "hybrid", "googleweb", "mymemory", "argos", "libretranslate"],
-        help="Translation provider.",
+        choices=["identity", "hybrid", "googleweb", "mymemory", "argos", "libretranslate", "llm"],
+        help="Translation provider. llm sends the whole transcript to an OpenAI-compatible "
+        "chat completions endpoint (local LM Studio/Ollama, OpenAI, DeepSeek, ...) in one pass.",
     )
     dub.add_argument("--libretranslate-url", default="http://127.0.0.1:5000/translate")
     dub.add_argument("--libretranslate-api-key", default=None)
-    dub.add_argument("--tts", default="sapi", choices=["sapi", "piper", "xtts", "f5", "none"], help="TTS provider.")
+    dub.add_argument("--llm-base-url", default="http://127.0.0.1:1234/v1", help="OpenAI-compatible API base URL.")
+    dub.add_argument("--llm-api-key", default=None, help="API key, if the endpoint needs one.")
+    dub.add_argument("--llm-model", default="openai/gpt-oss-20b", help="Model name/id to request.")
+    dub.add_argument("--llm-temperature", type=float, default=0.9, help="Sampling temperature.")
+    dub.add_argument("--llm-timeout-seconds", type=int, default=180)
+    dub.add_argument(
+        "--tts",
+        default="sapi",
+        choices=["sapi", "piper", "xtts", "f5", "cosyvoice", "moss", "none"],
+        help="TTS provider.",
+    )
     dub.add_argument("--voice", default=None, help="SAPI voice name.")
     dub.add_argument("--sapi-rate", type=int, default=0, help="SAPI rate from -10 to 10.")
     dub.add_argument("--sapi-volume", type=int, default=100, help="SAPI volume from 0 to 100.")
@@ -145,6 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument("--f5-ckpt-file", type=Path, default=None)
     dub.add_argument("--f5-vocab-file", type=Path, default=None)
     dub.add_argument("--f5-cache-dir", type=Path, default=Path("models/f5tts"))
+    dub.add_argument("--media-cache-dir", type=Path, default=Path("runs/cache/media"))
     dub.add_argument("--f5-device", default="auto", choices=["auto", "cpu", "cuda"])
     dub.add_argument("--f5-speed", type=float, default=1.0)
     dub.add_argument("--f5-nfe-step", type=int, default=32)
@@ -153,6 +193,24 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument("--f5-cross-fade-duration", type=float, default=0.15)
     dub.add_argument("--f5-remove-silence", action="store_true")
     dub.add_argument("--f5-timeout-seconds", type=int, default=1800)
+    dub.add_argument("--cosyvoice-python", type=Path, default=Path(".venv-cosyvoice") / "Scripts" / "python.exe")
+    dub.add_argument("--cosyvoice-repo-dir", type=Path, default=Path("models/cosyvoice/CosyVoice"))
+    dub.add_argument(
+        "--cosyvoice-model-dir",
+        type=Path,
+        default=Path("models/cosyvoice/pretrained_models/Fun-CosyVoice3-0.5B"),
+    )
+    dub.add_argument("--cosyvoice-model-id", default="FunAudioLLM/Fun-CosyVoice3-0.5B-2512")
+    dub.add_argument("--cosyvoice-mode", default="cross_lingual", choices=["cross_lingual", "zero_shot"])
+    dub.add_argument("--cosyvoice-instruction", default="You are a helpful assistant.<|endofprompt|>")
+    dub.add_argument("--cosyvoice-device", default="auto", choices=["auto", "cpu", "cuda"])
+    dub.add_argument("--cosyvoice-speed", type=float, default=1.0)
+    dub.add_argument("--cosyvoice-timeout-seconds", type=int, default=1800)
+    dub.add_argument("--moss-python", type=Path, default=Path(".venv-moss") / "Scripts" / "python.exe")
+    dub.add_argument("--moss-model-dir", type=Path, default=Path("models/moss/MOSS-TTS-Local-Transformer-v1.5"))
+    dub.add_argument("--moss-codec-dir", type=Path, default=Path("models/moss/MOSS-Audio-Tokenizer-v2"))
+    dub.add_argument("--moss-device", default="auto", choices=["auto", "cpu", "cuda"])
+    dub.add_argument("--moss-timeout-seconds", type=int, default=1800)
     dub.add_argument("--no-multi-speaker", action="store_true", help="Use one speaker reference for all segments.")
     dub.add_argument(
         "--speaker-reference-seconds",
@@ -160,14 +218,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=3.5,
         help="Seconds of source vocals to use as per-segment XTTS speaker reference.",
     )
-    dub.add_argument("--separation", default="none", choices=["none", "demucs"], help="Vocal separation provider.")
-    dub.add_argument("--separation-device", default="cpu", choices=["cpu", "cuda"], help="Separation device.")
+    dub.add_argument(
+        "--separation",
+        default="none",
+        choices=["none", "demucs", "bsroformer"],
+        help="Vocal separation provider.",
+    )
+    dub.add_argument("--separation-device", default="cpu", choices=["cpu", "cuda", "auto"], help="Separation device.")
     dub.add_argument("--demucs-model", default="htdemucs", help="Demucs model name.")
+    dub.add_argument("--bsroformer-python", type=Path, default=Path(".venv-bsroformer") / "Scripts" / "python.exe")
+    dub.add_argument("--bsroformer-model-dir", type=Path, default=Path("models/audio-separator"))
+    dub.add_argument("--bsroformer-model-file", default="model_bs_roformer_ep_317_sdr_12.9755.ckpt")
+    dub.add_argument("--bsroformer-timeout-seconds", type=int, default=600)
     dub.add_argument(
         "--audio-bed",
         default="original",
-        choices=["original", "instrumental", "dub-only"],
-        help="Final audio bed behind the dub.",
+        choices=["original", "instrumental", "dub-only", "multitrack"],
+        help="Final audio bed behind the dub. multitrack keeps the original audio and "
+        "the dub as two separate selectable tracks instead of mixing them.",
     )
     dub.add_argument(
         "--glitch-profile",
@@ -178,9 +246,31 @@ def build_parser() -> argparse.ArgumentParser:
     dub.add_argument("--ghost-gap-seconds", type=float, default=2.7, help="Minimum pause length for ghost insertions.")
     dub.add_argument("--original-volume", type=float, default=0.18, help="Original audio volume in final mix.")
     dub.add_argument("--dub-volume", type=float, default=1.0, help="Dub audio volume in final mix.")
+    dub.add_argument(
+        "--no-trim-tts-silence",
+        action="store_true",
+        help="Keep the silence MOSS pads around and inside a phrase instead of tightening it.",
+    )
+    dub.add_argument(
+        "--tts-max-pause-seconds",
+        type=float,
+        default=0.3,
+        help="Longest pause kept inside a synthesized phrase when trimming silence.",
+    )
     dub.add_argument("--no-collapse-repetitions", action="store_true", help="Keep repeated ASR/translation loops.")
     dub.add_argument("--max-phrase-repeats", type=int, default=2, help="Maximum consecutive repeated phrase copies.")
     dub.add_argument("--max-word-repeats", type=int, default=3, help="Maximum consecutive repeated single words.")
+    dub.add_argument(
+        "--translation-pivots",
+        default="input,en|input,ja,en|input,tr,de,en|en,de|en,fr|en,es|en,ja,ko|en,tr,ar|input,en,de|input,ja,ko,en|input,tr,ar,en|en,th,he,en|en,ms,he,en",
+        help="Round-trip pivot chains separated by |.",
+    )
+    dub.add_argument(
+        "--translation-second-pass-ratio",
+        type=float,
+        default=0.0,
+        help="Share of regular translated segments that go through a second pivot pass.",
+    )
     dub.add_argument("--no-fit-to-segments", action="store_true", help="Do not time-stretch TTS clips.")
 
     subparsers.add_parser("voices", help="List Windows SAPI voices.")
