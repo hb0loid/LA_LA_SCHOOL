@@ -419,8 +419,11 @@ while ($true) {
   # that caused it.
   foreach ($runLog in @($runOut, $runErr)) {
     if (Test-Path -LiteralPath $runLog) {
-      Get-Content -LiteralPath $runLog -ErrorAction SilentlyContinue |
-        Add-Content -LiteralPath $WorkerLog -Encoding UTF8 -ErrorAction SilentlyContinue
+      try {
+        # Appending the text itself, not piping through Get-Content: that
+        # re-encodes, and worker.log was already a mix of UTF-8 and UTF-16.
+        [IO.File]::AppendAllText($WorkerLog, [IO.File]::ReadAllText($runLog), (New-Object Text.UTF8Encoding($false)))
+      } catch {}
       Remove-Item -LiteralPath $runLog -Force -ErrorAction SilentlyContinue
     }
   }

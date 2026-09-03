@@ -355,15 +355,30 @@ REPORT_TAIL_BYTES = 6000
 
 
 def _log_tail(path: Path, limit: int = REPORT_TAIL_BYTES) -> str:
+    """The tail of a log file, whatever encoding it was written in.
+
+    Windows PowerShell 5.1 redirects native output as UTF-16, so the first
+    report that arrived read as text with a space between every letter. Which of
+    the two a given file is depends on how its lines got there, so sniff rather
+    than assume.
+    """
+    wide = False
     try:
         size = path.stat().st_size
         with path.open("rb") as handle:
-            if size > limit:
-                handle.seek(size - limit)
+            wide = handle.read(2) == b"\xff\xfe"
+            start = max(0, size - limit)
+            if wide and start % 2:
+                # Landing mid-character turns the whole tail into nonsense.
+                start += 1
+            handle.seek(start)
             data = handle.read()
     except Exception:
         return ""
-    text = data.decode("utf-8", errors="replace").strip()
+    if not wide:
+        wide = data.count(0) > len(data) // 4
+    text = data.decode("utf-16-le" if wide else "utf-8", errors="replace")
+    text = text.replace("﻿", "").replace("\x00", "").strip()
     if size > limit:
         # The first line is half a line; drop it rather than report a fragment.
         text = text.split("\n", 1)[-1]

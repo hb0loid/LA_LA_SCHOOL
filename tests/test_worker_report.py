@@ -82,5 +82,33 @@ class StallHeartbeatTests(unittest.TestCase):
             thread.join(timeout=2)
             self.assertFalse(thread.is_alive())
 
+
+class LogEncodingTests(unittest.TestCase):
+    """Windows PowerShell 5.1 redirects native output as UTF-16, so the first
+    report that arrived read as text with a space between every letter."""
+
+    def test_a_utf16_log_is_read_as_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "worker.log"
+            path.write_bytes("﻿worker started\nDetected language: ru\n".encode("utf-16-le"))
+            self.assertEqual(
+                _log_tail(path).splitlines(), ["worker started", "Detected language: ru"]
+            )
+
+    def test_a_utf8_log_still_reads_as_before(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "worker.log"
+            path.write_bytes("worker started\nDetected language: ru\n".encode("utf-8"))
+            self.assertEqual(
+                _log_tail(path).splitlines(), ["worker started", "Detected language: ru"]
+            )
+
+    def test_a_long_utf16_tail_does_not_land_mid_character(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "worker.log"
+            body = "﻿" + ("filler line\n" * 2000) + "the part that matters\n"
+            path.write_bytes(body.encode("utf-16-le"))
+            self.assertTrue(_log_tail(path).endswith("the part that matters"))
+
 if __name__ == "__main__":
     unittest.main()
