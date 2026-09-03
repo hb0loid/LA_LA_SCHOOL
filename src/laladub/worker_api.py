@@ -165,8 +165,8 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
         try:
             worker_id = (urllib.parse.parse_qs(parsed.query).get("worker_id") or [None])[0]
             job_id, _ = self._match_job_path(parsed.path)
-            if worker_id or job_id:
-                self._scheduler().note_worker_seen(worker_id, job_id)
+            address = str(self.client_address[0]) if self.client_address else None
+            self._scheduler().note_worker_seen(worker_id, job_id, address)
         except Exception:
             pass
 

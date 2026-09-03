@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -83,5 +84,46 @@ class WorkerTtlTests(unittest.TestCase):
                 async with scheduler._lock:
                     scheduler.note_worker_seen("worker-pc")
                     self.assertIn("worker-pc", scheduler._remote_workers)
+
+        asyncio.run(run())
+
+
+class ReclaimTests(unittest.TestCase):
+    """Reclaiming is now driven by the machine, not by one job's bookkeeping.
+
+    Tuning the per-job window never worked: at 90 seconds jobs were taken from
+    machines that were working, and after the window went to 240 the next two
+    timeouts measured 240s and 247s.
+    """
+
+    def test_a_talking_worker_keeps_its_job(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                scheduler = _scheduler(Path(tempdir))
+                scheduler.note_worker_seen(None, None, "192.168.1.67")
+                # The job's own bookkeeping is ancient, but the machine spoke
+                # a moment ago - so it keeps the work.
+                quiet = time.time() - scheduler.remote_traffic_at
+                self.assertLess(quiet, 180.0)
+
+        asyncio.run(run())
+
+    def test_progress_for_an_unknown_job_still_counts_as_traffic(self) -> None:
+        """The exact request every earlier version threw away."""
+
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                scheduler = _scheduler(Path(tempdir))
+                scheduler.note_worker_seen(None, "no-such-job", "192.168.1.67")
+                self.assertGreater(scheduler.remote_traffic_at, 0.0)
+                self.assertIn("192.168.1.67", scheduler._remote_workers)
+
+        asyncio.run(run())
+
+    def test_a_worker_that_never_spoke_is_quiet(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                scheduler = _scheduler(Path(tempdir))
+                self.assertEqual(scheduler.remote_traffic_at, 0.0)
 
         asyncio.run(run())

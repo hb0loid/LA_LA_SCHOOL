@@ -2748,6 +2748,13 @@ def _find_recoverable_jobs(settings: BotSettings) -> list[dict[str, Any]]:
 # under this on the laptop; anything longer is a real absence worth hearing.
 WORKER_UPDATE_QUIET_SECONDS = 300.0
 
+# How long every worker has to be silent before we believe the machine is gone.
+# Nothing a worker does internally stops it answering, so silence here is real.
+WORKER_SILENCE_SECONDS = 180.0
+# And how stale one job's own bookkeeping must be before that job is reclaimed.
+# Only consulted once the machine has already gone quiet.
+LEASE_SILENCE_SECONDS = 180.0
+
 
 async def _worker_presence_loop(application: object) -> None:
     """Says out loud when the worker goes missing, and when it returns.
@@ -2772,7 +2779,11 @@ async def _worker_presence_loop(application: object) -> None:
             if time.time() - served_at < WORKER_UPDATE_QUIET_SECONDS:
                 await asyncio.sleep(60)
                 continue
-            message = presence.observe(int(live.get("remote_workers_online") or 0))
+            # Same one fact the scheduler uses to decide whether to reclaim a
+            # job, so the alert and the reclaim can never disagree again.
+            quiet_for = time.time() - scheduler.remote_traffic_at
+            online = 1 if quiet_for <= WORKER_SILENCE_SECONDS else 0
+            message = presence.observe(online)
             if message:
                 print(f"Worker presence: {message.splitlines()[0]}", flush=True)
                 for admin_id in admins:
@@ -2979,6 +2990,9 @@ class _JobScheduler:
         self._items_by_key: dict[str, _QueuedJob] = {}
         self._leased: dict[str, _QueuedJob] = {}
         self._remote_workers: dict[str, dict[str, Any]] = {}
+        # When any worker last spoke to us at all, whoever it was. Written from
+        # the HTTP thread; the one liveness fact nothing else can spoil.
+        self.remote_traffic_at: float = 0.0
         # Thirty seconds was the whole reason the worker kept "disappearing".
         # A worker deep in one long step says nothing but its heartbeat, and the
         # coordinator only has to be busy for half a minute to miss it. Two
@@ -3159,19 +3173,24 @@ class _JobScheduler:
         while True:
             await asyncio.sleep(15.0)
             now = time.time()
+            # Tuning this number never worked: at 90 seconds jobs were taken from
+            # working machines, and after raising it to 240 the very next two
+            # timeouts measured 240s and 247s. A pause inside a job has no upper
+            # bound worth guessing at, so stop guessing. A job is only reclaimed
+            # when the worker itself has gone quiet - not when one job's
+            # bookkeeping went stale while the machine kept talking to us.
+            worker_quiet = now - self.remote_traffic_at > WORKER_SILENCE_SECONDS
             async with self._lock:
-                stale = [
-                    item
-                    for item in self._leased.values()
-                    if item.execution_kind == "remote_preprocess"
-                    and now - float(item.remote_last_seen_at or 0.0)
-                    # Heartbeats come every 10 seconds, so 90 was nine misses -
-                    # except one slow post could block the worker's heartbeat
-                    # thread for longer than that on its own, and the job was
-                    # taken away from a worker still running it. Nine jobs were
-                    # lost that way and redone on the main PC.
-                    > (240.0 if item.remote_heartbeat_seen else 1200.0)
-                ]
+                stale = (
+                    [
+                        item
+                        for item in self._leased.values()
+                        if item.execution_kind == "remote_preprocess"
+                        and now - float(item.remote_last_seen_at or 0.0) > LEASE_SILENCE_SECONDS
+                    ]
+                    if worker_quiet
+                    else []
+                )
                 await self._dispatch_locked(context)
             for item in stale:
                 silence = now - float(item.remote_last_seen_at or 0.0)
@@ -3636,21 +3655,33 @@ class _JobScheduler:
         wait = work_seconds / slots
         return (max(15.0, wait * 0.65), max(30.0, wait * 1.45))
 
-    def note_worker_seen(self, worker_id: str | None, job_id: str | None = None) -> None:
+    def note_worker_seen(
+        self,
+        worker_id: str | None,
+        job_id: str | None = None,
+        address: str | None = None,
+    ) -> None:
         """Records that a worker just spoke to us. Called from the HTTP thread.
 
-        Deliberately takes no lock and touches no event loop: the point is that
-        a busy coordinator must never be able to make a live worker look dead.
-        Dict and attribute writes are atomic enough for a timestamp.
+        Deliberately takes no lock and touches no event loop: a busy coordinator
+        must never be able to make a live worker look dead. Dict and attribute
+        writes are atomic enough for a timestamp.
+
+        Identity is best-effort and falls back to the address the request came
+        from, because the fact worth recording is that *some* worker is alive.
+        Every earlier version needed to know which one, and so learned nothing
+        from a request it could not attribute - which is exactly the request a
+        worker sends about a job we have already taken back.
         """
         now = time.time()
+        self.remote_traffic_at = now
         if job_id:
             item = self._leased.get(job_id)
             if item is not None:
                 item.remote_last_seen_at = now
                 if not worker_id:
                     worker_id = item.worker_id
-        name = str(worker_id or "").strip()
+        name = str(worker_id or address or "").strip()
         if not name:
             return
         state = dict(self._remote_workers.get(name) or {})
