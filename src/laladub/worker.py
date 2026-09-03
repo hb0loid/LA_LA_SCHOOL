@@ -89,6 +89,11 @@ def main(argv: list[str] | None = None) -> None:
             time.sleep(poll_seconds)
 
 
+# Enough to ride out a router hiccup without keeping a dead link alive for long.
+UPLOAD_ATTEMPTS = 4
+UPLOAD_RETRY_SECONDS = 5.0
+
+
 class CoordinatorClient:
     def __init__(self, server: str, token: str, worker_id: str = "worker") -> None:
         self.server = server.rstrip("/")
@@ -151,7 +156,23 @@ class CoordinatorClient:
     def upload_file(self, job_id: str, kind: str, path: Path) -> None:
         query = urllib.parse.urlencode({"filename": path.name})
         request_path = f"/api/v1/jobs/{urllib.parse.quote(job_id)}/result/{urllib.parse.quote(kind)}?{query}"
-        self._upload_file(request_path, path)
+        # This carries the whole job home. One dropped connection used to throw
+        # away everything the laptop had just spent twenty minutes computing,
+        # and the job was then redone from scratch on the main PC. The upload
+        # is a PUT to a fixed path, so repeating it is safe.
+        for attempt in range(UPLOAD_ATTEMPTS):
+            try:
+                self._upload_file(request_path, path)
+                return
+            except (OSError, http.client.HTTPException) as exc:
+                if attempt == UPLOAD_ATTEMPTS - 1:
+                    raise
+                print(
+                    f"Result upload failed ({type(exc).__name__}: {exc}); "
+                    f"retrying {attempt + 2}/{UPLOAD_ATTEMPTS}",
+                    flush=True,
+                )
+                time.sleep(UPLOAD_RETRY_SECONDS * (attempt + 1))
 
     def complete(self, job_id: str, manifest: dict[str, Any]) -> None:
         self._request_json("POST", f"/api/v1/jobs/{urllib.parse.quote(job_id)}/complete", manifest)
