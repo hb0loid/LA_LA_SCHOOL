@@ -6,8 +6,9 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
-from laladub.bot import _JobScheduler
+from laladub.bot import _ApplicationContext, _JobScheduler
 from laladub.bot_config import load_bot_settings
 
 
@@ -34,7 +35,63 @@ class WorkerLivenessTests(unittest.TestCase):
                 async with scheduler._lock:
                     counts = scheduler._remote_worker_counts_locked()
                 self.assertEqual(counts["online"], 1)
-                self.assertEqual(counts["busy"], 0)
+                self.assertEqual(counts["busy"], 1)
+
+        asyncio.run(run())
+
+    def test_recovered_pending_job_is_reattached_to_the_worker(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                job_dir = root / "123" / "456"
+                job_dir.mkdir(parents=True)
+                input_path = job_dir / "input.mp4"
+                input_path.write_bytes(b"video")
+                settings = replace(
+                    load_bot_settings(require_token=False),
+                    workdir=root,
+                    executor_mode="hybrid",
+                    max_active_jobs=2,
+                    max_local_jobs=0,
+                )
+                scheduler = _JobScheduler(settings)
+                application = SimpleNamespace(
+                    bot=SimpleNamespace(),
+                    bot_data={"job_scheduler": scheduler},
+                    create_task=asyncio.create_task,
+                )
+                context = _ApplicationContext(application)
+                job = {
+                    "job_dir": str(job_dir),
+                    "input_path": str(input_path),
+                    "user_id": 123,
+                    "chat_id": 123,
+                    "mode": "dub",
+                    "target_lang": "ru",
+                    "tts_provider": "moss",
+                    "recovered_at": time.time(),
+                }
+                await scheduler.enqueue(
+                    context,
+                    chat_id=123,
+                    user_id=123,
+                    job=job,
+                    status_message=None,
+                )
+                job_id = "123_456"
+                self.assertEqual((await scheduler.snapshot())["pending_total"], 1)
+
+                await scheduler.remote_progress(
+                    job_id,
+                    {"heartbeat_only": True, "worker_id": "worker-pc"},
+                )
+
+                snapshot = await scheduler.snapshot()
+                self.assertEqual(snapshot["pending_total"], 0)
+                self.assertEqual(snapshot["leased_remote"], 1)
+                self.assertEqual(snapshot["active_total"], 1)
+                self.assertEqual(snapshot["remote_workers_busy"], 1)
+                self.assertEqual(job["worker_id"], "worker-pc")
 
         asyncio.run(run())
 

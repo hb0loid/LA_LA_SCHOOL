@@ -40,6 +40,7 @@ class Submission:
     publication_message_id: int | None
     created_at: float
     updated_at: float
+    author_comment: str | None = None
 
 
 class ProposalStore:
@@ -82,6 +83,7 @@ class ProposalStore:
                     publication_chat_id INTEGER,
                     publication_message_id INTEGER,
                     comment_posted_at REAL,
+                    author_comment TEXT,
                     processing_by INTEGER,
                     processing_at REAL,
                     created_at REAL NOT NULL,
@@ -185,6 +187,8 @@ class ProposalStore:
                 )
             if "comment_posted_at" not in columns:
                 connection.execute("ALTER TABLE submissions ADD COLUMN comment_posted_at REAL")
+            if "author_comment" not in columns:
+                connection.execute("ALTER TABLE submissions ADD COLUMN author_comment TEXT")
             migrated = connection.execute(
                 "SELECT value FROM store_metadata WHERE key = 'karma_milli_v1'"
             ).fetchone()
@@ -209,6 +213,7 @@ class ProposalStore:
         output_filename: str,
         duration_ms: int = 0,
         karma_before_milli: int = 0,
+        author_comment: str | None = None,
     ) -> tuple[Submission, bool]:
         now = time.time()
         with self._connect() as connection:
@@ -216,8 +221,9 @@ class ProposalStore:
                 """
                 INSERT OR IGNORE INTO submissions (
                     job_number, user_id, chat_id, author_name, author_username,
-                    video_path, output_filename, duration_ms, karma_before_milli, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    video_path, output_filename, duration_ms, karma_before_milli,
+                    author_comment, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_number,
@@ -229,6 +235,7 @@ class ProposalStore:
                     output_filename,
                     max(0, int(duration_ms)),
                     int(karma_before_milli),
+                    author_comment,
                     now,
                     now,
                 ),
@@ -241,6 +248,7 @@ class ProposalStore:
                     SET author_name = ?, author_username = ?, video_path = ?,
                         output_filename = ?,
                         duration_ms = CASE WHEN ? > 0 THEN ? ELSE duration_ms END,
+                        author_comment = COALESCE(?, author_comment),
                         updated_at = ?
                     WHERE user_id = ? AND job_number = ?
                     """,
@@ -251,6 +259,7 @@ class ProposalStore:
                         output_filename,
                         max(0, int(duration_ms)),
                         max(0, int(duration_ms)),
+                        author_comment,
                         now,
                         user_id,
                         job_number,
@@ -927,6 +936,7 @@ def _submission_from_row(row: sqlite3.Row) -> Submission:
         ),
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),
+        author_comment=str(row["author_comment"]) if row["author_comment"] else None,
     )
 
 

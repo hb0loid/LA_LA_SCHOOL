@@ -804,7 +804,7 @@ async def _publish_to_channel(bot: Any, target_chat: str, submission: Submission
             chat_id=target_chat,
             video=file_obj,
             filename=submission.output_filename,
-            caption=_author_caption(submission),
+            caption=_publication_caption(submission),
             parse_mode="HTML",
             supports_streaming=True,
             read_timeout=300,
@@ -900,6 +900,11 @@ def _moderation_caption(submission: Submission, *, transcript: str | None = None
         f"Карма на момент отправки: {visible_karma(submission.karma_before_milli)}",
         f"Статус: {status_labels.get(submission.status, html.escape(submission.status))}",
     ]
+    if submission.author_comment:
+        comment = submission.author_comment.strip()
+        if len(comment) > 600:
+            comment = comment[:599].rstrip() + "…"
+        lines.insert(3, f"Комментарий: {html.escape(comment)}")
     if submission.destination:
         lines.append(f"Решение: {destination_labels.get(submission.destination, html.escape(submission.destination))}")
         lines.append(f"Карма за работу: {format_karma_milli(submission.karma_milli, signed=True)}")
@@ -926,6 +931,14 @@ def _author_caption(submission: Submission) -> str:
     else:
         href = f"tg://user?id={submission.user_id}"
     return f'Прислал <a href="{href}">{name}</a>'
+
+
+def _publication_caption(submission: Submission) -> str:
+    author = _author_caption(submission)
+    comment = str(submission.author_comment or "").strip()
+    if not comment:
+        return author
+    return f"{html.escape(comment)}\n\n{author}"
 
 
 def _find_submission_subtitles(submission: Submission) -> Path | None:

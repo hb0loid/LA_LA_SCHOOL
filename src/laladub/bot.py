@@ -1522,7 +1522,7 @@ async def proposal_callback(update: Any, context: Any) -> None:
     if action == "submitted":
         await query.answer("Видео уже отправлено в предложку.")
         return
-    if action != "submit" or not value.isdigit():
+    if action not in {"submit", "comment"} or not value.isdigit():
         await query.answer("Некорректная кнопка.", show_alert=True)
         return
 
@@ -1538,6 +1538,21 @@ async def proposal_callback(update: Any, context: Any) -> None:
         return
     if str(job.get("status") or "") not in {"ready", "done"}:
         await query.answer("Работа ещё не завершена.", show_alert=True)
+        return
+
+    if action == "comment":
+        from telegram import ForceReply
+
+        context.user_data["proposal_comment"] = {
+            "job_number": value,
+            "chat_id": int(query.message.chat_id),
+            "message_id": int(query.message.message_id),
+        }
+        await query.answer()
+        await query.message.reply_text(
+            f"Напиши комментарий к работе №{value}. Он появится над строкой «Прислал …» при публикации.",
+            reply_markup=ForceReply(selective=True),
+        )
         return
 
     video_path = _find_proposal_video_path(job_dir, job)
@@ -1561,6 +1576,62 @@ async def proposal_callback(update: Any, context: Any) -> None:
     with contextlib.suppress(Exception):
         await query.edit_message_reply_markup(reply_markup=_proposal_submitted_keyboard(submission.id))
     await query.answer("Отправлено в предложку." if created else "Видео уже находится в предложке.")
+
+
+PROPOSAL_COMMENT_MAX_CHARS = 800
+
+
+async def _receive_proposal_comment(update: Any, context: Any, text: str) -> bool:
+    pending = context.user_data.get("proposal_comment")
+    if not isinstance(pending, dict):
+        return False
+
+    message = update.effective_message
+    user = update.effective_user
+    settings: BotSettings = context.application.bot_data["settings"]
+    job_number = str(pending.get("job_number") or "")
+    if message is None or user is None or not job_number.isdigit():
+        context.user_data.pop("proposal_comment", None)
+        return False
+
+    comment = str(text or "").strip()
+    if not comment:
+        await message.reply_text("Комментарий пустой. Напиши текст или нажми /cancel.")
+        return True
+    if len(comment) > PROPOSAL_COMMENT_MAX_CHARS:
+        await message.reply_text(
+            f"Комментарий слишком длинный: {len(comment)} символов. Максимум — {PROPOSAL_COMMENT_MAX_CHARS}."
+        )
+        return True
+
+    job_dir = settings.workdir / str(user.id) / job_number
+    job = _load_job_snapshot(job_dir)
+    if not isinstance(job, dict) or _coerce_int(job.get("user_id")) != user.id:
+        context.user_data.pop("proposal_comment", None)
+        await message.reply_text("Данные этой работы уже не найдены.")
+        return True
+    if str(job.get("status") or "") not in {"ready", "done"}:
+        context.user_data.pop("proposal_comment", None)
+        await message.reply_text("Работа ещё не завершена.")
+        return True
+
+    status = str(job.get("status") or "done")
+    _save_job_snapshot(job_dir, job, status=status, proposal_comment=comment)
+    context.user_data.pop("proposal_comment", None)
+
+    source_chat_id = _coerce_int(pending.get("chat_id"))
+    source_message_id = _coerce_int(pending.get("message_id"))
+    if source_chat_id is not None and source_message_id is not None:
+        with contextlib.suppress(Exception):
+            await context.bot.edit_message_reply_markup(
+                chat_id=source_chat_id,
+                message_id=source_message_id,
+                reply_markup=_proposal_keyboard(job_number, has_comment=True),
+            )
+    await message.reply_text(
+        f"Комментарий к работе №{job_number} сохранён. Теперь нажми «Отправить в предложку»."
+    )
+    return True
 
 
 def _find_proposal_video_path(job_dir: Path, job: dict[str, Any]) -> Path | None:
@@ -1615,6 +1686,7 @@ async def _create_proposal_submission(
         output_filename=output_filename,
         duration_ms=duration_ms,
         karma_before_milli=karma_before_milli,
+        author_comment=str(job.get("proposal_comment") or "").strip() or None,
     )
 
 
@@ -1710,6 +1782,8 @@ async def receive_link(update: Any, context: Any) -> None:
     message = update.effective_message
     settings: BotSettings = context.application.bot_data["settings"]
     text = message.text or ""
+    if await _receive_proposal_comment(update, context, text):
+        return
     url = extract_url(text)
     if not url:
         await message.reply_text(
@@ -2719,9 +2793,14 @@ async def _recover_interrupted_jobs(application: Any) -> None:
             user_id=user_id,
             job=job,
             status_message=status_message,
+            dispatch=False,
         )
         recovered += 1
 
+    # Enqueuing and dispatching one recovered job at a time lets the oldest
+    # ordinary item occupy the machine before a later premium item has even
+    # been loaded. Restore the complete heap first, then honour its priorities.
+    await scheduler.dispatch(context)
     print(f"Startup recovery: recovered={recovered}, skipped={skipped}", flush=True)
 
 
@@ -2751,10 +2830,10 @@ WORKER_UPDATE_QUIET_SECONDS = 300.0
 
 # How long every worker has to be silent before we believe the machine is gone.
 # Nothing a worker does internally stops it answering, so silence here is real.
-WORKER_SILENCE_SECONDS = 180.0
+WORKER_SILENCE_SECONDS = 660.0
 # And how stale one job's own bookkeeping must be before that job is reclaimed.
 # Only consulted once the machine has already gone quiet.
-LEASE_SILENCE_SECONDS = 180.0
+LEASE_SILENCE_SECONDS = 660.0
 
 
 async def _worker_presence_loop(application: object) -> None:
@@ -3046,6 +3125,7 @@ class _JobScheduler:
         user_id: int | None,
         job: dict[str, Any],
         status_message: Any,
+        dispatch: bool = True,
     ) -> bool:
         if job_duration_seconds(job) is None:
             input_path = Path(str(job.get("input_path") or ""))
@@ -3122,9 +3202,15 @@ class _JobScheduler:
             self._items_by_key[key] = item
             heapq.heappush(self._pending, (item.priority, item.sequence, item))
             _save_job_snapshot(Path(job["job_dir"]), job, status="queued")
+            if dispatch:
+                await self._dispatch_locked(context)
+                await self._refresh_pending_locked()
+            return True
+
+    async def dispatch(self, context: Any) -> None:
+        async with self._lock:
             await self._dispatch_locked(context)
             await self._refresh_pending_locked()
-            return True
 
     async def finish(self, context: Any, item: _QueuedJob) -> None:
         async with self._lock:
@@ -3272,14 +3358,57 @@ class _JobScheduler:
         async with self._lock:
             item = self._leased.get(job_id)
             if item is None:
-                # The job is gone - reclaimed after a heartbeat timeout, or
-                # already finished elsewhere - but the worker plainly is not.
-                # Dropping the whole post used to make a busy worker look
-                # offline until it finished and asked for its next lease.
+                # A coordinator restart forgets in-memory leases while the
+                # worker keeps computing. Startup recovery puts the same job
+                # back in _pending; reconnect it instead of calling the worker
+                # idle. Marking an unknown active job as idle made the local
+                # machine defer to a worker that could not take another job,
+                # leaving the whole queue at 0/2.
                 reported = str(payload.get("worker_id") or "").strip()
                 if reported:
-                    self._mark_remote_worker_locked(reported, active_job_id=None)
-                return
+                    self._mark_remote_worker_locked(reported, active_job_id=job_id)
+                    pending_index = next(
+                        (
+                            index
+                            for index, (_priority, _sequence, candidate) in enumerate(self._pending)
+                            if candidate.job_id == job_id
+                        ),
+                        None,
+                    )
+                    if pending_index is not None:
+                        _, _, item = self._pending.pop(pending_index)
+                        heapq.heapify(self._pending)
+                        self._active_total += 1
+                        if item.user_id is not None:
+                            self._active_by_user[item.user_id] = self._active_by_user.get(item.user_id, 0) + 1
+                        item.worker_id = reported
+                        remote_stage = _remote_stage_for_job(item.job)
+                        item.execution_kind = "remote_preprocess" if remote_stage == "preprocess" else "remote"
+                        item.remote_last_seen_at = time.time()
+                        item.remote_heartbeat_seen = bool(payload.get("heartbeat_only"))
+                        item.job["worker_id"] = reported
+                        item.job.setdefault("started_at", time.time())
+                        if remote_stage == "preprocess":
+                            item.job.setdefault("remote_preprocess_started_at", time.time())
+                        title = "Сырой Whisper" if item.job.get("mode") == "raw_text" else "Полноценный дубляж"
+                        item.progress = _ProgressState(
+                            title,
+                            _job_number(item.job),
+                            estimated_total_seconds=_coerce_float(item.job.get("initial_eta_seconds")),
+                        )
+                        self._leased[job_id] = item
+                        _save_job_snapshot(
+                            Path(item.job["job_dir"]),
+                            item.job,
+                            status="running",
+                            remote_reattached_at=time.time(),
+                        )
+                        print(
+                            f"Remote lease reattached after restart job={job_id} worker={reported}",
+                            flush=True,
+                        )
+                if item is None:
+                    return
             item.remote_last_seen_at = time.time()
             if item.worker_id:
                 self._mark_remote_worker_locked(item.worker_id, active_job_id=item.job_id)
@@ -5005,11 +5134,19 @@ def _resume_keyboard(job_dir: Path) -> Any:
     )
 
 
-def _proposal_keyboard(job_number: str) -> Any:
+def _proposal_keyboard(job_number: str, *, has_comment: bool = False) -> Any:
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Отправить в предложку", callback_data=f"proposal:submit:{job_number}")]]
+        [
+            [
+                InlineKeyboardButton(
+                    "✏️ Изменить комментарий" if has_comment else "Добавить комментарий",
+                    callback_data=f"proposal:comment:{job_number}",
+                )
+            ],
+            [InlineKeyboardButton("Отправить в предложку", callback_data=f"proposal:submit:{job_number}")],
+        ]
     )
 
 

@@ -18,17 +18,33 @@ $SupervisorLog = Join-Path $LogDir "worker-supervisor.log"
 Set-Location -LiteralPath $Root
 New-Item -ItemType Directory -Force -Path $WorkDir,$LogDir | Out-Null
 
+# PowerShell reads a script into memory once, at startup. An update that rewrites
+# this file therefore changes nothing about the supervisor already running, so it
+# has to notice and hand over to a fresh copy of itself.
+$SelfHashBefore = ""
+try { $SelfHashBefore = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash } catch {}
+$SupervisorReplaced = $false
+
 function Write-SupervisorLog([string]$Message) {
   $line = "$(Get-Date -Format s) $Message"
   Add-Content -LiteralPath $SupervisorLog -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
   Write-Host $line
 }
 
-try {
-  $WorkerLock = [IO.File]::Open($LockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-} catch [IO.IOException] {
-  exit 0
+# Retried, not attempted once: when a supervisor replaces itself after an update
+# it has to let go of the lock a moment before its successor takes it, and a
+# single attempt would lose that race and leave nothing running until the
+# scheduled task fired again a minute later.
+$WorkerLock = $null
+foreach ($attempt in 1..10) {
+  try {
+    $WorkerLock = [IO.File]::Open($LockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    break
+  } catch [IO.IOException] {
+    Start-Sleep -Seconds 1
+  }
 }
+if (-not $WorkerLock) { exit 0 }
 
 function Install-WorkerAutostart {
   $hiddenLauncher = Join-Path $Root "Start-Worker-Hidden.vbs"
@@ -210,6 +226,14 @@ function Invoke-WorkerUpdate {
   # updates again - the exact state this recovers from.
   $installed | Set-Content -LiteralPath $VersionPath -Encoding UTF8
   Write-Host "Worker updated to $remoteBuild"
+  if ($SelfHashBefore -and (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash -ne $SelfHashBefore) {
+    # PowerShell read this script into memory when it started, so rewriting the
+    # file changes nothing here. A watchdog shipped on 3 September never took
+    # effect for exactly this reason, and the freeze that night went unnoticed
+    # for thirty hours under a supervisor that predated it.
+    Write-SupervisorLog "Supervisor updated itself; handing over to a fresh copy."
+    $script:SupervisorReplaced = $true
+  }
 }
 
 function Repair-PortableVenv {
@@ -357,6 +381,20 @@ while ($true) {
   } catch {
     $updateFailed = $true
     Write-SupervisorLog "Update failed; starting the installed worker: $($_.Exception.Message)"
+  }
+
+  if ($SupervisorReplaced) {
+    Write-SupervisorLog "Restarting the supervisor to pick up its own update."
+    try { $WorkerLock.Close() } catch {}
+    $hiddenLauncher = Join-Path $Root "Start-Worker-Hidden.vbs"
+    if (Test-Path -LiteralPath $hiddenLauncher) {
+      Start-Process -FilePath "wscript.exe" -ArgumentList "`"$hiddenLauncher`"" -WorkingDirectory $Root
+    } else {
+      Start-Process -FilePath "powershell.exe" `
+        -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"" `
+        -WorkingDirectory $Root
+    }
+    exit 0
   }
 
   $workerArguments = @(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import http.client
 import json
@@ -315,6 +316,7 @@ def _run_lease(client: CoordinatorClient, lease: dict[str, Any], workdir: Path) 
         daemon=True,
     )
     heartbeat_thread.start()
+    heartbeat_process = _start_external_lease_heartbeat(client, job_id)
 
     try:
         client.download_input(job_id, input_path)
@@ -341,6 +343,7 @@ def _run_lease(client: CoordinatorClient, lease: dict[str, Any], workdir: Path) 
     finally:
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=2.0)
+        _stop_external_lease_heartbeat(heartbeat_process)
 
 
 def _settings_for_worker_job(settings: BotSettings, job: dict[str, Any]) -> BotSettings:
@@ -453,6 +456,50 @@ def _lease_heartbeat_loop(client: CoordinatorClient, job_id: str, stop: threadin
             client.heartbeat(job_id)
         except Exception as exc:
             print(f"Worker heartbeat failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+def _start_external_lease_heartbeat(client: CoordinatorClient, job_id: str) -> subprocess.Popen[bytes] | None:
+    """Keep the lease alive even when CUDA code holds the worker's Python GIL.
+
+    Some Whisper/model calls can prevent every thread in this interpreter from
+    running for several minutes.  A heartbeat thread therefore cannot prove the
+    machine disappeared.  A tiny sibling process is scheduled independently by
+    Windows and keeps network liveness separate from the heavy ML process.
+    """
+    env = os.environ.copy()
+    env.update(
+        {
+            "LALADUB_HEARTBEAT_SERVER": client.server,
+            "LALADUB_HEARTBEAT_TOKEN": client.token,
+            "LALADUB_HEARTBEAT_WORKER_ID": client.worker_id,
+            "LALADUB_HEARTBEAT_JOB_ID": job_id,
+        }
+    )
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        return subprocess.Popen(
+            [sys.executable, "-m", "laladub.worker_heartbeat"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            creationflags=creationflags,
+        )
+    except Exception as exc:
+        # The in-process thread remains as a compatibility fallback.
+        print(f"External heartbeat launch failed: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+def _stop_external_lease_heartbeat(process: subprocess.Popen[bytes] | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    with contextlib.suppress(Exception):
+        process.terminate()
+        process.wait(timeout=3.0)
+    if process.poll() is None:
+        with contextlib.suppress(Exception):
+            process.kill()
 
 
 def _cuda_available() -> bool:
