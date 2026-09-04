@@ -611,7 +611,15 @@ def _remote_update_available(client: CoordinatorClient) -> bool:
     if not remote_build:
         return False
     local_build = _local_build_id()
-    return bool(local_build and remote_build != local_build)
+    if not local_build:
+        # An unknown build used to mean "no update", which is backwards: a
+        # worker that cannot say what it is running is the one most in need of
+        # replacing. The launcher already installs in this case, but it only
+        # gets the chance once the worker asks to restart - so refusing here
+        # pinned the worker on old code with nothing able to move it.
+        print("Worker build id is unknown; treating the published build as newer.", flush=True)
+        return True
+    return remote_build != local_build
 
 
 def _local_version_candidates() -> list[Path]:

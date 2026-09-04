@@ -374,6 +374,11 @@ if (-not (Test-Path -LiteralPath $python)) {
 }
 
 Write-SupervisorLog "Supervisor started: worker=$workerId server=$server"
+# A worker that cannot read its own build id asks to restart every time. That is
+# the right answer once - it gets the launcher to reinstall - but if reinstalling
+# does not fix the build id, it would ask forever.
+$updateRestarts = 0
+$suppressWorkerAutoUpdate = $false
 while ($true) {
   $updateFailed = $false
   try {
@@ -407,7 +412,7 @@ while ($true) {
   # If installing an update failed, do not let the worker immediately request
   # that same update and enter a restart loop.  The supervisor will try again
   # after the worker's next genuine restart.
-  if ($updateFailed) {
+  if ($updateFailed -or $suppressWorkerAutoUpdate) {
     $workerArguments += "--no-auto-update"
   }
 
@@ -467,10 +472,18 @@ while ($true) {
   }
 
   if ($exitCode -eq 42) {
-    Write-SupervisorLog "Worker requested an update restart."
+    $updateRestarts++
+    if ($updateRestarts -gt 3) {
+      Write-SupervisorLog "Worker asked to update $updateRestarts times running; starting it without auto-update."
+      $suppressWorkerAutoUpdate = $true
+      $updateRestarts = 0
+    } else {
+      Write-SupervisorLog "Worker requested an update restart."
+    }
     Start-Sleep -Seconds 2
     continue
   }
+  $updateRestarts = 0
   Write-SupervisorLog "Worker exited with code $exitCode; restarting in 10 seconds."
   Start-Sleep -Seconds 10
 }
