@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-from laladub.bot import _ApplicationContext, _JobScheduler
+from laladub.bot import WORKER_SILENCE_SECONDS, _ApplicationContext, _JobScheduler
 from laladub.bot_config import load_bot_settings
 
 
@@ -107,9 +107,6 @@ class WorkerLivenessTests(unittest.TestCase):
         asyncio.run(run())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class WorkerTtlTests(unittest.TestCase):
     def test_a_worker_that_spoke_a_minute_ago_is_still_online(self) -> None:
@@ -188,3 +185,61 @@ class ReclaimTests(unittest.TestCase):
                 self.assertEqual(scheduler.remote_traffic_at, 0.0)
 
         asyncio.run(run())
+
+
+class AbandonedLeaseTests(unittest.TestCase):
+    """A worker that drops a job and goes straight back to asking for new work
+    is not silent, so requiring silence meant its old lease was never reclaimed.
+    It still counted against the limit of concurrent jobs, so one abandoned job
+    cost a slot forever - a queue of eleven standing still while /queue reported
+    both machines free."""
+
+    def _item(self, scheduler, job_id: str, worker_id: str):
+        item = SimpleNamespace(job_id=job_id, worker_id=worker_id)
+        return item
+
+    def test_a_worker_asking_for_other_work_has_moved_on(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                scheduler = _scheduler(Path(tempdir))
+                scheduler.note_worker_seen("worker-pc")
+                item = self._item(scheduler, "job-1", "worker-pc")
+                self.assertTrue(scheduler._worker_moved_on_locked(item))
+
+        asyncio.run(run())
+
+    def test_a_worker_still_on_the_job_has_not(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                scheduler = _scheduler(Path(tempdir))
+                scheduler.note_worker_seen("worker-pc")
+                scheduler._remote_workers["worker-pc"]["active_job_id"] = "job-1"
+                item = self._item(scheduler, "job-1", "worker-pc")
+                self.assertFalse(scheduler._worker_moved_on_locked(item))
+
+        asyncio.run(run())
+
+    def test_a_silent_worker_is_left_to_the_silence_rule(self) -> None:
+        """Not "moved on" - it may simply be deep inside the job."""
+
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                scheduler = _scheduler(Path(tempdir))
+                scheduler.note_worker_seen("worker-pc")
+                scheduler._remote_workers["worker-pc"]["last_seen"] -= WORKER_SILENCE_SECONDS + 60
+                item = self._item(scheduler, "job-1", "worker-pc")
+                self.assertFalse(scheduler._worker_moved_on_locked(item))
+
+        asyncio.run(run())
+
+    def test_an_unknown_worker_is_not_assumed_to_have_moved_on(self) -> None:
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                scheduler = _scheduler(Path(tempdir))
+                item = self._item(scheduler, "job-1", "worker-pc")
+                self.assertFalse(scheduler._worker_moved_on_locked(item))
+
+        asyncio.run(run())
+
+if __name__ == "__main__":
+    unittest.main()

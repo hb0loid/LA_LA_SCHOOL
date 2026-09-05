@@ -3268,22 +3268,20 @@ class _JobScheduler:
             # bookkeeping went stale while the machine kept talking to us.
             worker_quiet = now - self.remote_traffic_at > WORKER_SILENCE_SECONDS
             async with self._lock:
-                stale = (
-                    [
-                        item
-                        for item in self._leased.values()
-                        if item.execution_kind == "remote_preprocess"
-                        and now - float(item.remote_last_seen_at or 0.0) > LEASE_SILENCE_SECONDS
-                    ]
-                    if worker_quiet
-                    else []
-                )
+                stale = [
+                    item
+                    for item in self._leased.values()
+                    if item.execution_kind == "remote_preprocess"
+                    and now - float(item.remote_last_seen_at or 0.0) > LEASE_SILENCE_SECONDS
+                    and (worker_quiet or self._worker_moved_on_locked(item))
+                ]
                 await self._dispatch_locked(context)
             for item in stale:
                 silence = now - float(item.remote_last_seen_at or 0.0)
                 print(
-                    f"Remote preprocessing heartbeat timed out job={item.job_id} "
-                    f"worker={item.worker_id} silence={silence:.0f}s",
+                    f"Remote preprocessing lease reclaimed job={item.job_id} "
+                    f"worker={item.worker_id} silence={silence:.0f}s "
+                    f"reason={'worker silent' if worker_quiet else 'worker moved on'}",
                     flush=True,
                 )
                 await self._fallback_remote_preprocess(context, item, "worker heartbeat timed out")
@@ -3831,6 +3829,27 @@ class _JobScheduler:
         state["last_seen"] = time.time()
         state["active_job_id"] = active_job_id
         self._remote_workers[worker_id] = state
+
+    def _worker_moved_on_locked(self, item: _QueuedJob) -> bool:
+        """Whether the worker holding this lease is plainly on to something else.
+
+        Requiring the whole machine to fall silent was too strict. A worker that
+        abandons a job and goes straight back to asking for new work is not
+        quiet at all, so its old lease could never be reclaimed - and since it
+        still counted against the limit of concurrent jobs, one abandoned job
+        permanently cost a slot. That is a queue of eleven sitting still while
+        /queue reports both machines free.
+
+        Only consulted once the lease's own bookkeeping has already gone stale,
+        so a worker finishing one job and asking for the next is not caught by
+        the moment between the two.
+        """
+        state = self._remote_workers.get(str(item.worker_id or ""))
+        if not state:
+            return False
+        if time.time() - float(state.get("last_seen") or 0.0) > WORKER_SILENCE_SECONDS:
+            return False
+        return str(state.get("active_job_id") or "") != item.job_id
 
     def _remote_worker_counts_locked(self) -> dict[str, int]:
         now = time.time()
