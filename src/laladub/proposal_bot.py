@@ -146,7 +146,16 @@ async def _post_init(application: Any) -> None:
         ("karma", "Своя карма, /karma all — таблица лидеров"),
         ("clean", "Очистить чат от лишних сообщений"),
     ]
+    # The proposal bot answers moderators only, so its whole menu is theirs -
+    # but scoping it to them keeps it out of everyone else's command list.
     await application.bot.set_my_commands(commands)
+    for moderator_id in sorted(settings.moderator_ids):
+        with contextlib.suppress(Exception):
+            from telegram import BotCommandScopeChat
+
+            await application.bot.set_my_commands(
+                commands, scope=BotCommandScopeChat(chat_id=moderator_id)
+            )
     asyncio.create_task(_delivery_loop(application))
     asyncio.create_task(_sync_all_karma_tags(application))
     asyncio.create_task(_scheduled_post_loop(application))

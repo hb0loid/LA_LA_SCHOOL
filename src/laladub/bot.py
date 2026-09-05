@@ -512,12 +512,33 @@ async def _setup_bot_commands(application: Any) -> None:
         ("watermark", "Премиум: вкл/выкл водяной знак"),
         ("mycensor", "Премиум: свой уровень censor"),
     ]
+    # Everything that exists but never appeared in the menu, so it could only be
+    # used by someone who already knew it was there. Admin-only ones are listed
+    # to admins alone, in their own chat scope.
+    admin_only = [
+        ("status", "Подробное состояние машин и очереди"),
+        ("maintenance", "Режим обслуживания"),
+        ("censored", "Статистика цензуры"),
+        ("reviews", "Отчёт по проверке текста"),
+        ("starbalance", "Баланс Stars"),
+        ("prem_owners", "Кто с премиумом"),
+        ("grant_premium", "Выдать премиум"),
+        ("revoke_premium", "Отозвать премиум"),
+        ("refund_premium", "Вернуть оплату премиума"),
+    ]
     await application.bot.set_my_commands(commands)
     with contextlib.suppress(Exception):
         from telegram import BotCommandScopeAllPrivateChats, BotCommandScopeDefault
 
         await application.bot.set_my_commands(commands, scope=BotCommandScopeDefault())
         await application.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+    for admin_id in sorted(settings.admin_users):
+        with contextlib.suppress(Exception):
+            from telegram import BotCommandScopeChat
+
+            await application.bot.set_my_commands(
+                commands + admin_only, scope=BotCommandScopeChat(chat_id=admin_id)
+            )
     with contextlib.suppress(Exception):
         from telegram import MenuButtonCommands
 
