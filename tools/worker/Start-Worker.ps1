@@ -10,9 +10,12 @@ $LockPath = Join-Path $Root ".worker.lock"
 $LogDir = Join-Path $Root "logs"
 $WorkerLog = Join-Path $LogDir "worker.log"
 $HeartbeatPath = Join-Path $WorkDir "worker_heartbeat.txt"
-# Well above the longest silence a healthy worker has ever shown (four minutes),
-# and far below the two hours the freeze it is meant to catch actually lasted.
-$StallLimitSeconds = 600
+# The heartbeat stamps this file every ten seconds while a job runs, and the
+# upload stamps it per chunk, so a healthy worker is never quiet for anything
+# like this long. Ten minutes was a guess made when uploads were thought to go
+# unreported; the two freezes it caught cost ten minutes each, and five is the
+# same protection at half the price.
+$StallLimitSeconds = 300
 $SupervisorLog = Join-Path $LogDir "worker-supervisor.log"
 
 Set-Location -LiteralPath $Root

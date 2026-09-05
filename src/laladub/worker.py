@@ -274,6 +274,10 @@ class CoordinatorClient:
                     if not chunk:
                         break
                     connection.send(chunk)
+                    # Sending is talking. Without this the stamp would depend
+                    # entirely on the lease heartbeat thread, and the stall
+                    # limit had to be set wide enough to cover a whole upload.
+                    self.note_contact()
             response = connection.getresponse()
             body = response.read().decode("utf-8", errors="replace")
             if response.status >= 300:
