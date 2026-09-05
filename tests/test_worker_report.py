@@ -40,47 +40,44 @@ class WorkerReportTests(unittest.TestCase):
 
 
 
-class StallHeartbeatTests(unittest.TestCase):
-    """A worker that crashes was always restarted. A worker that froze was not:
-    the process stayed in Windows, so everything counted it as healthy, and one
-    freeze lasted two hours. The supervisor watches this file to tell the two
-    apart."""
+class ContactStampTests(unittest.TestCase):
+    """The supervisor kills a worker whose stamp goes stale, so the stamp has to
+    mean "we reached the coordinator" - not "this process is alive".
 
-    def test_the_heartbeat_file_is_written_and_kept_fresh(self) -> None:
-        import threading
-        import time
+    The worker addresses the main PC by name, and a name lookup has no timeout
+    and does not hold the interpreter. A lookup that never returned left every
+    thread running happily while the worker said nothing to anyone for thirty
+    hours, and a watchdog keyed on liveness saw a healthy process.
+    """
 
-        from laladub.worker import _stall_heartbeat_loop
+    def test_a_successful_request_stamps_the_file(self) -> None:
+        from laladub.worker import CoordinatorClient
 
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "worker_heartbeat.txt"
-            stop = threading.Event()
-            thread = threading.Thread(target=_stall_heartbeat_loop, args=(path, stop), daemon=True)
-            thread.start()
-            for _ in range(100):
-                if path.exists():
-                    break
-                time.sleep(0.01)
-            stop.set()
-            thread.join(timeout=2)
+            client = CoordinatorClient("http://127.0.0.1:8765", "token", "worker-pc")
+            client.contact_path = path
+            client.note_contact()
             self.assertTrue(path.exists())
             self.assertGreater(float(path.read_text(encoding="utf-8")), 0.0)
 
-    def test_a_failing_write_does_not_kill_the_thread(self) -> None:
-        import threading
-
-        from laladub.worker import _stall_heartbeat_loop
+    def test_stamping_is_throttled(self) -> None:
+        from laladub.worker import CoordinatorClient
 
         with tempfile.TemporaryDirectory() as tempdir:
-            # A directory where the file should be: every write raises.
             path = Path(tempdir) / "worker_heartbeat.txt"
-            path.mkdir()
-            stop = threading.Event()
-            thread = threading.Thread(target=_stall_heartbeat_loop, args=(path, stop), daemon=True)
-            thread.start()
-            stop.set()
-            thread.join(timeout=2)
-            self.assertFalse(thread.is_alive())
+            client = CoordinatorClient("http://127.0.0.1:8765", "token", "worker-pc")
+            client.contact_path = path
+            client.note_contact()
+            first = path.read_text(encoding="utf-8")
+            client.note_contact()
+            self.assertEqual(path.read_text(encoding="utf-8"), first)
+
+    def test_no_path_is_harmless(self) -> None:
+        from laladub.worker import CoordinatorClient
+
+        client = CoordinatorClient("http://127.0.0.1:8765", "token", "worker-pc")
+        client.note_contact()
 
 
 class LogEncodingTests(unittest.TestCase):

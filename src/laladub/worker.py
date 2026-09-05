@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> None:
         save_config=not args.no_save_config,
     )
     workdir.mkdir(parents=True, exist_ok=True)
-    _start_stall_heartbeat(workdir)
+    client.contact_path = _start_stall_heartbeat(workdir)
     _ensure_windows_autostart()
     print(f"LaLaDub worker started: id={worker_id} server={server} workdir={workdir}", flush=True)
     try:
@@ -108,6 +108,11 @@ class CoordinatorClient:
         # to tell a worker is alive even when the job it reports on is one the
         # coordinator has already taken back.
         self.worker_id = str(worker_id or "worker")
+        # Set once the workdir is known. Every successful request stamps it, and
+        # the supervisor kills a worker whose stamp goes stale - so a request
+        # wedged in a name lookup is caught, which mere process liveness missed.
+        self.contact_path: Path | None = None
+        self._contact_written = 0.0
         self._parsed = urllib.parse.urlparse(self.server)
         if self._parsed.scheme not in {"http", "https"}:
             raise ValueError("Worker server must be http:// or https:// URL.")
@@ -223,11 +228,13 @@ class CoordinatorClient:
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 if response.status == 204 and none_on_204:
+                    self.note_contact()
                     return None
                 body = response.read()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Coordinator HTTP {exc.code}: {body}") from exc
+        self.note_contact()
         if not body:
             return None
         return json.loads(body.decode("utf-8"))
@@ -258,6 +265,20 @@ class CoordinatorClient:
                 raise RuntimeError(f"Coordinator upload HTTP {response.status}: {body}")
         finally:
             connection.close()
+
+    def note_contact(self) -> None:
+        path = self.contact_path
+        if path is None:
+            return
+        now = time.time()
+        # Once every few seconds is plenty; the supervisor looks every twenty.
+        if now - self._contact_written < 5.0:
+            return
+        self._contact_written = now
+        try:
+            path.write_text(str(now), encoding="utf-8")
+        except Exception:
+            pass
 
     def _url(self, path: str) -> str:
         base_path = self._parsed.path.rstrip("/")
@@ -414,39 +435,25 @@ def _report_startup_logs(client: CoordinatorClient, workdir: Path) -> None:
     client.send_startup_report(sections)
 
 
-# The supervisor watches this file. Touching it is the cheapest thing a healthy
-# process can do, so failing to touch it says something real: not that the work
-# is slow, but that the interpreter itself has stopped running Python.
-STALL_HEARTBEAT_SECONDS = 15.0
-
-
-def _stall_heartbeat_loop(path: Path, stop: threading.Event) -> None:
-    while True:
-        try:
-            path.write_text(str(time.time()), encoding="utf-8")
-        except Exception:
-            pass
-        if stop.wait(STALL_HEARTBEAT_SECONDS):
-            return
-
-
 def _start_stall_heartbeat(workdir: Path) -> Path:
-    """Starts the thread the supervisor uses to tell a hang from a long job.
+    """The file the supervisor watches to tell a hang from a long job.
 
-    A worker that dies is restarted already. A worker that *hangs* was not: the
-    process stayed in Windows, so the scheduler saw it as alive, and one such
-    hang lasted two hours. The watchdog has to live outside this process,
-    because whatever freezes it freezes every thread in here as well - this
-    thread included, which is exactly what makes the silence detectable.
+    It marks the last time this worker *successfully reached the coordinator* -
+    not merely the last time the process was alive. That distinction is the
+    whole point: the worker talks to the main PC by name, and a name lookup has
+    no timeout and does not hold the interpreter, so a lookup that never returns
+    left every thread happily running while the worker said nothing to anyone
+    for thirty hours. A watchdog keyed on liveness saw a healthy process and let
+    it sit there.
+
+    Touched from a thread only until the first real request lands, so a worker
+    that never reaches the coordinator at all still gets replaced.
     """
     path = workdir / "worker_heartbeat.txt"
-    thread = threading.Thread(
-        target=_stall_heartbeat_loop,
-        args=(path, threading.Event()),
-        name="laladub-stall-heartbeat",
-        daemon=True,
-    )
-    thread.start()
+    try:
+        path.write_text(str(time.time()), encoding="utf-8")
+    except Exception:
+        pass
     return path
 
 
