@@ -57,8 +57,8 @@ class StatusCommandTests(unittest.TestCase):
         text = _run(_report())
         assert text is not None
         self.assertIn("свободен", text)
-        self.assertIn("ни один не подключался", text)
-        self.assertIn("В очереди: 0", text)
+        self.assertIn("Воркеров нет", text)
+        self.assertIn("Очередь пуста", text)
 
     def test_it_is_admin_only(self) -> None:
         """It exposes other people's jobs and the scheduler's internals."""
@@ -116,7 +116,9 @@ class StatusCommandTests(unittest.TestCase):
         self.assertIn("озвучка на основном ПК", text)
         self.assertIn("ждёт 1:30", text)
 
-    def test_a_long_queue_is_truncated(self) -> None:
+    def test_a_long_queue_is_folded_away(self) -> None:
+        """Eleven waiting jobs buried the machines, which is the part you open
+        /status to look at. They go in a quote that starts closed."""
         pending = [
             {
                 "number": str(n),
@@ -134,7 +136,9 @@ class StatusCommandTests(unittest.TestCase):
         text = _run(_report(pending=pending))
         assert text is not None
         self.assertIn("В очереди: 20", text)
-        self.assertIn("и ещё 5", text)
+        self.assertIn("<blockquote expandable>", text)
+        # Folded, not dropped: all twenty are in there.
+        self.assertIn("20. ", text)
 
 
 class StatusLineTests(unittest.TestCase):
@@ -146,6 +150,34 @@ class StatusLineTests(unittest.TestCase):
         entry = {"number": "", "source": None, "target": None, "premium": False}
         self.assertIn("#?", _status_job_line(entry))
 
+
+
+class StatusLengthTests(unittest.TestCase):
+    """Telegram refuses a message over 4096 characters outright, and the queue
+    is the part that grows without limit. Better a trimmed list than no report."""
+
+    def test_a_huge_queue_still_fits(self) -> None:
+        pending = [
+            {
+                "number": f"5{n:04d}",
+                "user_id": 1,
+                "source": "vi",
+                "target": "ru",
+                "premium": False,
+                "priority": 100,
+                "waiting": 3600.0,
+                "forced_local": False,
+                "preprocessed": False,
+            }
+            for n in range(200)
+        ]
+        text = _run(_report(pending=pending))
+        assert text is not None
+        self.assertLessEqual(len(text), 4096)
+        self.assertIn("В очереди: 200", text)
+        self.assertIn("и ещё", text)
+        self.assertTrue(text.count("<blockquote expandable>") == 1)
+        self.assertTrue(text.rstrip().endswith("</i>"))
 
 if __name__ == "__main__":
     unittest.main()

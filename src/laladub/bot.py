@@ -1314,12 +1314,15 @@ async def censored(update: Any, context: Any) -> None:
     await update.effective_message.reply_text(text, reply_markup=_remove_reply_keyboard())
 
 
+TELEGRAM_TEXT_LIMIT = 4096
+
+
 def _status_job_line(entry: dict[str, Any], *, index: int | None = None) -> str:
     mark = "⭐" if entry.get("premium") else "•"
     number = entry.get("number") or "?"
     head = f"{mark} #{number}" if index is None else f"{index}. {mark} #{number}"
     langs = f"{_source_lang_label(entry.get('source'))} → {_target_lang_label(entry.get('target'))}"
-    return f"{head} {langs}"
+    return html.escape(f"{head}  {langs}")
 
 
 async def status_command(update: Any, context: Any) -> None:
@@ -1336,73 +1339,91 @@ async def status_command(update: Any, context: Any) -> None:
     scheduler: _JobScheduler = context.application.bot_data["job_scheduler"]
     report = await scheduler.status_report()
 
-    lines: list[str] = ["📋 Подробное состояние", ""]
-
-    slots = f"{report['active_total']}/{report['max_active_jobs']}"
-    lines.append(f"⚙️ Режим: {report['executor_mode']}, занято ячеек: {slots}")
+    lines: list[str] = []
     if report["maintenance"]:
-        lines.append("⛔ Режим обслуживания — новые работы не стартуют")
-    lines.append("")
+        lines += ["⛔ <b>Режим обслуживания</b> — новые работы не стартуют", ""]
 
-    lines.append(f"💻 Основной ПК ({report['active_local']}/{report['max_local_jobs']})")
-    if report["local"]:
-        for entry in report["local"]:
-            lines.append("   " + _status_job_line(entry))
-            source = "после воркера" if entry["preprocessed"] else "целиком здесь"
-            lines.append(
-                f"      {entry['stage']} {entry['percent']}% • "
-                f"{_format_duration(entry['elapsed'])} • {source}"
-            )
-    else:
-        lines.append("   свободен")
-    lines.append("")
-
-    lines.append("📡 Воркеры")
+    lines.append("<b>Машины</b>")
+    local_state = "занят" if report["local"] else "свободен"
+    lines.append(f"💻 Основной ПК — {local_state}")
+    for entry in report["local"]:
+        lines.append("   " + _status_job_line(entry))
+        source = "после воркера" if entry["preprocessed"] else "целиком здесь"
+        lines.append(
+            f"   <i>{html.escape(str(entry['stage']))} {entry['percent']}% · "
+            f"идёт {_format_duration(entry['elapsed'])} · {source}</i>"
+        )
     if report["workers"]:
         for worker in report["workers"]:
-            busy = f"работа {worker['job']}" if worker["job"] else "свободен"
+            busy = "занят" if worker["job"] else "свободен"
             lines.append(
-                f"   {worker['id']} — {busy}, "
-                f"последний запрос {_format_duration(worker['last_seen'])} назад"
+                f"📡 {html.escape(str(worker['id']))} — {busy} · "
+                f"отметился {_format_duration(worker['last_seen'])} назад"
             )
     else:
-        lines.append("   ни один не подключался")
-    if report["traffic_quiet"] is not None:
-        lines.append(f"   тишина в эфире: {_format_duration(report['traffic_quiet'])}")
-    lines.append("")
+        lines.append("📡 Воркеров нет")
 
-    lines.append(f"🔧 Считается на воркерах: {len(report['running'])}")
-    for entry in report["running"]:
-        lines.append("   " + _status_job_line(entry))
-        lines.append(
-            f"      {entry['stage']} {entry['percent']}% • "
-            f"{_format_duration(entry['elapsed'])} • {entry['where']} ({entry['kind']})"
-        )
-        if entry["silence"] is None:
-            lines.append("      ⚠️ отчётов ещё не было")
-        else:
-            note = " — а воркер занят другим!" if entry["moved_on"] else ""
-            lines.append(f"      молчит {_format_duration(entry['silence'])}{note}")
-    lines.append("")
+    if report["running"]:
+        lines += ["", f"<b>Считается на воркерах: {len(report['running'])}</b>"]
+        for entry in report["running"]:
+            lines.append(_status_job_line(entry))
+            lines.append(
+                f"<i>{html.escape(str(entry['stage']))} {entry['percent']}% · "
+                f"идёт {_format_duration(entry['elapsed'])} · {html.escape(str(entry['where']))}</i>"
+            )
+            if entry["silence"] is None:
+                lines.append("<i>⚠️ отчётов ещё не было</i>")
+            elif entry["moved_on"]:
+                lines.append(
+                    f"<i>⚠️ молчит {_format_duration(entry['silence'])}, "
+                    "а воркер занят другим</i>"
+                )
+            else:
+                lines.append(f"<i>молчит {_format_duration(entry['silence'])}</i>")
 
     pending = report["pending"]
-    lines.append(f"⏳ В очереди: {len(pending)}")
-    for index, entry in enumerate(pending[:15], start=1):
-        lines.append("   " + _status_job_line(entry, index=index))
-        where = "только основной ПК" if entry["forced_local"] else "любая машина"
-        if entry["preprocessed"]:
-            where = "озвучка на основном ПК"
-        lines.append(
-            f"      ждёт {_format_duration(entry['waiting'])} • "
-            f"приоритет {entry['priority']} • {where}"
-        )
-    if len(pending) > 15:
-        lines.append(f"   … и ещё {len(pending) - 15}")
+    lines.append("")
+    if pending:
+        premium = sum(1 for entry in pending if entry.get("premium"))
+        head = f"<b>В очереди: {len(pending)}</b>"
+        if premium:
+            head += f" (премиум {premium})"
+        lines.append(head)
+        # Folded away by default: with eleven waiting it buried the machines,
+        # which is the part you open /status to look at.
+        queued: list[str] = []
+        for index, entry in enumerate(pending, start=1):
+            queued.append(_status_job_line(entry, index=index))
+            where = "любая машина" if not entry["forced_local"] else "только основной ПК"
+            if entry["preprocessed"]:
+                where = "озвучка на основном ПК"
+            queued.append(
+                f"     ждёт {_format_duration(entry['waiting'])} · "
+                f"приоритет {entry['priority']} · {where}"
+            )
+        # Telegram refuses a message over 4096 characters outright, and the
+        # queue is the part that grows without limit. Trim it to fit rather than
+        # lose the whole report to a failed send.
+        room = TELEGRAM_TEXT_LIMIT - len("\n".join(lines)) - 120
+        dropped = 0
+        while queued and len("\n".join(queued)) > room:
+            queued = queued[:-2]
+            dropped += 1
+        if dropped:
+            queued.append(f"… и ещё {dropped}")
+        lines.append("<blockquote expandable>" + "\n".join(queued) + "</blockquote>")
+    else:
+        lines.append("<b>Очередь пуста</b>")
+
+    lines += [
+        "",
+        f"<i>Ячеек занято {report['active_total']} из {report['max_active_jobs']} · "
+        f"режим {report['executor_mode']}</i>",
+    ]
 
     await update.effective_message.reply_text(
-        "\n".join(lines), reply_markup=_remove_reply_keyboard()
+        "\n".join(lines), parse_mode="HTML", reply_markup=_remove_reply_keyboard()
     )
-
 
 async def queue_status(update: Any, context: Any) -> None:
     settings: BotSettings = context.application.bot_data["settings"]
