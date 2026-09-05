@@ -3823,6 +3823,19 @@ class _JobScheduler:
         wait_range = self._queue_wait_range(item)
         if wait_range is not None:
             lines.append(f"До начала примерно: {_format_eta_range(*wait_range)}")
+        # What the person actually wants to know. The queue wait alone answers
+        # "when does it start", and the two parts are estimated separately
+        # because they are unrelated: the wait depends on how busy we are, the
+        # work on the video. Adding them back here is the whole point of having
+        # split them.
+        work = self._performance.estimate(item.job)
+        if work is not None:
+            waited_low = wait_range[0] if wait_range else 0.0
+            waited_high = wait_range[1] if wait_range else 0.0
+            lines.append(
+                "Готово примерно через: "
+                f"{_format_eta_range(waited_low + work.low_seconds, waited_high + work.high_seconds)}"
+            )
         if item.queue_limit is not None and item.user_id is not None:
             jobs_for_user = sum(
                 1 for existing in self._items_by_key.values() if existing.user_id == item.user_id

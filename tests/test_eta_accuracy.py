@@ -111,5 +111,24 @@ class EtaAccuracyTests(unittest.TestCase):
         self.assertLess(estimate.seconds, 1000.0)
 
 
+
+class QueuedTotalTests(unittest.TestCase):
+    """Showing the total was the point all along - a person wants to know when
+    the video arrives, not when it starts. Splitting queue wait from work was
+    about estimating them well, not about hiding the sum."""
+
+    def test_the_total_is_the_wait_plus_the_work(self) -> None:
+        from laladub.bot import _format_eta_range
+
+        wait_low, wait_high = 600.0, 900.0
+        work_low, work_high = 300.0, 600.0
+        total = _format_eta_range(wait_low + work_low, wait_high + work_high)
+        self.assertEqual(total, "15–25 мин")
+
+    def test_an_empty_queue_shows_the_work_alone(self) -> None:
+        from laladub.bot import _format_eta_range
+
+        self.assertEqual(_format_eta_range(0.0 + 300.0, 0.0 + 600.0), "5–10 мин")
+
 if __name__ == "__main__":
     unittest.main()
