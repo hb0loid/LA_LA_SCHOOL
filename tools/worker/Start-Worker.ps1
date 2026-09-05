@@ -82,7 +82,14 @@ function Install-WorkerAutostart {
   }
 }
 
-Install-WorkerAutostart
+# Under a Windows service the service itself is the autostart, and installing
+# the scheduled task alongside it means two supervisors racing for the same
+# lock. An update that quietly reinstalled the task is exactly what stopped the
+# first migration attempt.
+$ServiceMode = $env:LALADUB_WINDOWS_SERVICE -eq "1"
+if (-not $ServiceMode) {
+  Install-WorkerAutostart
+}
 
 function Read-WorkerConfig {
   if (-not (Test-Path -LiteralPath $ConfigPath)) {
@@ -373,7 +380,8 @@ if (-not (Test-Path -LiteralPath $python)) {
   $python = "python"
 }
 
-Write-SupervisorLog "Supervisor started: worker=$workerId server=$server"
+$startedAs = if ($ServiceMode) { "service" } else { "scheduled task" }
+Write-SupervisorLog "Supervisor started: worker=$workerId server=$server as=$startedAs"
 # A worker that cannot read its own build id asks to restart every time. That is
 # the right answer once - it gets the launcher to reinstall - but if reinstalling
 # does not fix the build id, it would ask forever.
@@ -391,6 +399,13 @@ while ($true) {
   if ($SupervisorReplaced) {
     Write-SupervisorLog "Restarting the supervisor to pick up its own update."
     try { $WorkerLock.Close() } catch {}
+    if ($ServiceMode) {
+      # Let the service wrapper start the fresh copy. Spawning it ourselves
+      # would leave two supervisors running. Exiting non-zero on purpose: a
+      # clean exit reads as "finished normally" and may not be restarted.
+      Write-SupervisorLog "Service mode: handing the restart back to the service."
+      exit 42
+    }
     $hiddenLauncher = Join-Path $Root "Start-Worker-Hidden.vbs"
     if (Test-Path -LiteralPath $hiddenLauncher) {
       Start-Process -FilePath "wscript.exe" -ArgumentList "`"$hiddenLauncher`"" -WorkingDirectory $Root
