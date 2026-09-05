@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from laladub.worker import REPORT_TAIL_BYTES, _log_tail, _worker_log_dir
@@ -106,6 +107,61 @@ class LogEncodingTests(unittest.TestCase):
             body = "﻿" + ("filler line\n" * 2000) + "the part that matters\n"
             path.write_bytes(body.encode("utf-16-le"))
             self.assertTrue(_log_tail(path).endswith("the part that matters"))
+
+
+
+class HostResolutionTests(unittest.TestCase):
+    """A name lookup has no timeout and is not covered by the socket timeout, so
+    doing one per request is what let a single wedged lookup silence the worker
+    for thirty hours. It happens once now, and only again after a failure."""
+
+    def test_an_address_is_used_as_is(self) -> None:
+        from laladub.worker import CoordinatorClient
+
+        client = CoordinatorClient("http://192.168.1.180:8765", "token", "worker-pc")
+        with unittest.mock.patch("socket.getaddrinfo", side_effect=AssertionError("looked up")):
+            self.assertEqual(client._connect_host(), "192.168.1.180")
+
+    def test_a_name_is_looked_up_once_and_reused(self) -> None:
+        from laladub.worker import CoordinatorClient
+
+        client = CoordinatorClient("http://HBoloid:8765", "token", "worker-pc")
+        lookups: list[str] = []
+
+        def fake(host, port, **kwargs):
+            lookups.append(host)
+            return [(0, 0, 0, "", ("192.168.1.180", port))]
+
+        with unittest.mock.patch("socket.getaddrinfo", side_effect=fake):
+            self.assertEqual(client._connect_host(), "192.168.1.180")
+            self.assertEqual(client._connect_host(), "192.168.1.180")
+        self.assertEqual(len(lookups), 1)
+
+    def test_a_failure_forces_a_fresh_lookup(self) -> None:
+        from laladub.worker import CoordinatorClient
+
+        client = CoordinatorClient("http://HBoloid:8765", "token", "worker-pc")
+        addresses = ["192.168.1.180", "192.168.1.181"]
+
+        def fake(host, port, **kwargs):
+            return [(0, 0, 0, "", (addresses.pop(0), port))]
+
+        with unittest.mock.patch("socket.getaddrinfo", side_effect=fake):
+            self.assertEqual(client._connect_host(), "192.168.1.180")
+            client.forget_host()
+            self.assertEqual(client._connect_host(), "192.168.1.181")
+
+    def test_a_lookup_that_fails_keeps_the_last_good_address(self) -> None:
+        from laladub.worker import CoordinatorClient
+
+        client = CoordinatorClient("http://HBoloid:8765", "token", "worker-pc")
+        with unittest.mock.patch(
+            "socket.getaddrinfo", return_value=[(0, 0, 0, "", ("192.168.1.180", 8765))]
+        ):
+            client._connect_host()
+        client.forget_host()
+        with unittest.mock.patch("socket.getaddrinfo", side_effect=OSError("no dns")):
+            self.assertEqual(client._connect_host(), "192.168.1.180")
 
 if __name__ == "__main__":
     unittest.main()

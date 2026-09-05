@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import getpass
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -98,6 +99,9 @@ def main(argv: list[str] | None = None) -> None:
 # Enough to ride out a router hiccup without keeping a dead link alive for long.
 UPLOAD_ATTEMPTS = 4
 UPLOAD_RETRY_SECONDS = 5.0
+# Long enough that the lookup leaves the hot path entirely, short enough that a
+# machine given a new address on the LAN is found again without a restart.
+HOST_CACHE_SECONDS = 600.0
 
 
 class CoordinatorClient:
@@ -113,6 +117,13 @@ class CoordinatorClient:
         # wedged in a name lookup is caught, which mere process liveness missed.
         self.contact_path: Path | None = None
         self._contact_written = 0.0
+        # The coordinator is configured by name, and a name lookup in Python has
+        # no timeout and is not covered by the socket timeout. Doing one per
+        # request is what let a single wedged lookup silence the worker for
+        # thirty hours. Resolve once, reuse, and re-resolve only when a request
+        # fails - which is also how a changed address recovers.
+        self._resolved_host: str | None = None
+        self._resolved_at = 0.0
         self._parsed = urllib.parse.urlparse(self.server)
         if self._parsed.scheme not in {"http", "https"}:
             raise ValueError("Worker server must be http:// or https:// URL.")
@@ -234,6 +245,10 @@ class CoordinatorClient:
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Coordinator HTTP {exc.code}: {body}") from exc
+        except OSError:
+            # Reaching the cached address failed; look it up again next time.
+            self.forget_host()
+            raise
         self.note_contact()
         if not body:
             return None
@@ -241,7 +256,7 @@ class CoordinatorClient:
 
     def _upload_file(self, path: str, file_path: Path) -> None:
         connection_cls = http.client.HTTPSConnection if self._parsed.scheme == "https" else http.client.HTTPConnection
-        host = self._parsed.hostname or "127.0.0.1"
+        host = self._connect_host()
         port = self._parsed.port
         connection = connection_cls(host, port, timeout=300)
         request_path = (self._parsed.path.rstrip("/") if self._parsed.path else "") + path
@@ -280,12 +295,44 @@ class CoordinatorClient:
         except Exception:
             pass
 
+    def _connect_host(self) -> str:
+        """The address to dial, preferring a cached one over a fresh lookup."""
+        host = self._parsed.hostname or "127.0.0.1"
+        try:
+            ipaddress.ip_address(host)
+            return host
+        except ValueError:
+            pass
+        now = time.time()
+        if self._resolved_host and now - self._resolved_at < HOST_CACHE_SECONDS:
+            return self._resolved_host
+        try:
+            info = socket.getaddrinfo(host, self._parsed.port, proto=socket.IPPROTO_TCP)
+        except OSError:
+            # Keep using whatever worked last; the name may come back.
+            return self._resolved_host or host
+        address = str(info[0][4][0])
+        if address != self._resolved_host:
+            print(f"Coordinator {host} resolved to {address}", flush=True)
+        self._resolved_host = address
+        self._resolved_at = now
+        return address
+
+    def forget_host(self) -> None:
+        """Drops the cached address so the next attempt looks it up again."""
+        self._resolved_at = 0.0
+
+    def _netloc(self) -> str:
+        host = self._connect_host()
+        port = self._parsed.port
+        return f"{host}:{port}" if port else host
+
     def _url(self, path: str) -> str:
         base_path = self._parsed.path.rstrip("/")
         return urllib.parse.urlunparse(
             (
                 self._parsed.scheme,
-                self._parsed.netloc,
+                self._netloc(),
                 f"{base_path}{path}",
                 "",
                 "",
