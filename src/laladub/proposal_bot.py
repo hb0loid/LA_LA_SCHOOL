@@ -229,7 +229,11 @@ async def timer_command(update: Any, context: Any) -> None:
     state = "включена" if enabled else "выключена"
     interval = await asyncio.to_thread(store.post_interval_seconds)
     quiet = await asyncio.to_thread(store.quiet_hours)
-    suffix = f" {_schedule_settings_line(interval, quiet)}" if enabled else ""
+    mode = await asyncio.to_thread(store.post_mode)
+    multiplier = await asyncio.to_thread(store.post_multiplier)
+    suffix = (
+        f" {_schedule_settings_line(interval, quiet, mode, multiplier)}" if enabled else ""
+    )
     sent = await update.effective_message.reply_text(f"Отложенная публикация теперь {state}.{suffix}")
     await _note(store, int(moderator_id), sent)
 
@@ -244,9 +248,12 @@ async def scheduled_command(update: Any, context: Any) -> None:
     items = await asyncio.to_thread(store.pending_scheduled_posts)
     interval = await asyncio.to_thread(store.post_interval_seconds)
     quiet = await asyncio.to_thread(store.quiet_hours)
+    mode = await asyncio.to_thread(store.post_mode)
+    multiplier = await asyncio.to_thread(store.post_multiplier)
+    settings_line = _schedule_settings_line(interval, quiet, mode, multiplier)
     if not items:
         sent = await update.effective_message.reply_text(
-            "Очередь отложенных постов пуста.\n" + _schedule_settings_line(interval, quiet)
+            "Очередь отложенных постов пуста.\n" + settings_line
         )
         await _note(store, int(moderator_id), sent)
         return
@@ -260,11 +267,13 @@ async def scheduled_command(update: Any, context: Any) -> None:
         channel = channel_names.get(item.destination, item.destination)
         rows.append(html.escape(f"{when}  {label} → {channel}"))
 
-    last = datetime.fromtimestamp(items[-1].scheduled_for).strftime("%d.%m %H:%M")
+    first = datetime.fromtimestamp(items[0].scheduled_for)
+    last = datetime.fromtimestamp(items[-1].scheduled_for)
     header = [
         f"<b>Отложено: {len(items)}</b>",
-        f"Последний выйдет {last}",
-        _schedule_settings_line(interval, quiet),
+        f"Ближайший: {first.strftime('%d.%m %H:%M')} ({_until_label(items[0].scheduled_for - time.time())})",
+        f"Последний: {last.strftime('%d.%m %H:%M')} ({_until_label(items[-1].scheduled_for - time.time())})",
+        settings_line,
         "",
     ]
     footer = ["", "Отправить сейчас: /post номер", "Отменить: /unpost номер"]
@@ -287,14 +296,39 @@ async def scheduled_command(update: Any, context: Any) -> None:
     await _note(store, int(moderator_id), sent)
 
 
-def _schedule_settings_line(interval_seconds: float, quiet: tuple[int, int] | None) -> str:
+def _spacing_label(
+    interval_seconds: float, mode: str = "fixed", multiplier: float = 1.0
+) -> str:
+    if mode == "dynamic":
+        return f"по длине видео ×{multiplier:g}"
     minutes = int(round(interval_seconds / 60))
     if minutes % 60 == 0 and minutes >= 60:
-        spacing = f"{minutes // 60} ч"
-    else:
-        spacing = f"{minutes} мин"
+        return f"{minutes // 60} ч"
+    return f"{minutes} мин"
+
+
+def _schedule_settings_line(
+    interval_seconds: float,
+    quiet: tuple[int, int] | None,
+    mode: str = "fixed",
+    multiplier: float = 1.0,
+) -> str:
     sleeping = "нет" if not quiet else f"{quiet[0]:02d}:00–{quiet[1]:02d}:00"
-    return f"Интервал: {spacing} · тихие часы: {sleeping}"
+    return (
+        f"Интервал: {_spacing_label(interval_seconds, mode, multiplier)}"
+        f" · тихие часы: {sleeping}"
+    )
+
+
+def _until_label(seconds: float) -> str:
+    """How far off something is, in the roughest terms that are still useful."""
+    seconds = max(0.0, seconds)
+    if seconds < 3600:
+        return f"через {max(1, int(seconds // 60))} мин"
+    hours = seconds / 3600
+    if hours < 24:
+        return f"через {hours:.0f} ч"
+    return f"через {hours / 24:.1f} дн".replace(".0", "")
 
 
 def _parse_interval(text: str) -> float | None:
@@ -323,25 +357,60 @@ async def interval_command(update: Any, context: Any) -> None:
     if not _is_moderator(settings, moderator_id):
         return
 
-    args = context.args or []
+    args = [str(arg) for arg in (context.args or [])]
+    usage = (
+        "\n\nИзменить: /interval 15 · /interval 1ч"
+        "\nПо длине видео: /interval dynamic · /interval dynamic 2"
+    )
     if not args:
         interval = await asyncio.to_thread(store.post_interval_seconds)
         quiet = await asyncio.to_thread(store.quiet_hours)
+        mode = await asyncio.to_thread(store.post_mode)
+        multiplier = await asyncio.to_thread(store.post_multiplier)
         sent = await update.effective_message.reply_text(
-            _schedule_settings_line(interval, quiet)
-            + "\n\nИзменить: /interval 15 · /interval 1ч"
+            _schedule_settings_line(interval, quiet, mode, multiplier) + usage
         )
         await _note(store, int(moderator_id), sent)
         return
 
-    seconds = _parse_interval(" ".join(str(arg) for arg in args))
+    first = args[0].strip().lower()
+    if first in {"dynamic", "дин", "динамический", "auto", "авто"}:
+        # Pause after each post scales with that post's own video, so a minute
+        # of footage does not hold the channel as long as ten minutes of it.
+        multiplier = 1.0
+        if len(args) > 1:
+            try:
+                multiplier = float(args[1].replace(",", "."))
+            except ValueError:
+                sent = await update.effective_message.reply_text(
+                    "Не понял множитель. Пример: /interval dynamic 2"
+                )
+                await _note(store, int(moderator_id), sent)
+                return
+        await asyncio.to_thread(store.set_post_mode, "dynamic")
+        applied_multiplier = await asyncio.to_thread(store.set_post_multiplier, multiplier)
+        interval = await asyncio.to_thread(store.post_interval_seconds)
+        quiet = await asyncio.to_thread(store.quiet_hours)
+        moved = await asyncio.to_thread(
+            store.reschedule_pending, interval_seconds=interval, quiet=quiet
+        )
+        lines = [_schedule_settings_line(interval, quiet, "dynamic", applied_multiplier)]
+        lines.append(f"Видео без известной длины — по {_spacing_label(interval)}.")
+        if moved:
+            lines.append(f"Переставлено уже отложенных: {moved}")
+        sent = await update.effective_message.reply_text("\n".join(lines))
+        await _note(store, int(moderator_id), sent)
+        return
+
+    seconds = _parse_interval(" ".join(args))
     if seconds is None:
         sent = await update.effective_message.reply_text(
-            "Не понял интервал. Примеры: /interval 15, /interval 30, /interval 1ч"
+            "Не понял интервал. Примеры: /interval 15, /interval 1ч, /interval dynamic 2"
         )
         await _note(store, int(moderator_id), sent)
         return
 
+    await asyncio.to_thread(store.set_post_mode, "fixed")
     applied = await asyncio.to_thread(store.set_post_interval_seconds, seconds)
     quiet = await asyncio.to_thread(store.quiet_hours)
     moved = await asyncio.to_thread(
@@ -367,8 +436,10 @@ async def quiet_command(update: Any, context: Any) -> None:
     if not joined:
         interval = await asyncio.to_thread(store.post_interval_seconds)
         quiet = await asyncio.to_thread(store.quiet_hours)
+        mode = await asyncio.to_thread(store.post_mode)
+        multiplier = await asyncio.to_thread(store.post_multiplier)
         sent = await update.effective_message.reply_text(
-            _schedule_settings_line(interval, quiet)
+            _schedule_settings_line(interval, quiet, mode, multiplier)
             + "\n\nЗадать: /quiet 00:00-08:00 · выключить: /quiet off"
         )
         await _note(store, int(moderator_id), sent)
@@ -388,10 +459,12 @@ async def quiet_command(update: Any, context: Any) -> None:
         await asyncio.to_thread(store.set_quiet_hours, window)
 
     interval = await asyncio.to_thread(store.post_interval_seconds)
+    mode = await asyncio.to_thread(store.post_mode)
+    multiplier = await asyncio.to_thread(store.post_multiplier)
     moved = await asyncio.to_thread(
         store.reschedule_pending, interval_seconds=interval, quiet=window
     )
-    lines = [_schedule_settings_line(interval, window)]
+    lines = [_schedule_settings_line(interval, window, mode, multiplier)]
     if moved:
         lines.append(f"Переставлено уже отложенных: {moved}")
     sent = await update.effective_message.reply_text("\n".join(lines))

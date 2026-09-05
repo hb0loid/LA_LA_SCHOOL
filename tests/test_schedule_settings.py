@@ -6,7 +6,13 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
-from laladub.proposal_bot import _parse_interval, _parse_quiet, _schedule_settings_line
+from laladub.proposal_bot import (
+    _parse_interval,
+    _parse_quiet,
+    _schedule_settings_line,
+    _spacing_label,
+    _until_label,
+)
 from laladub.proposal_store import ProposalStore, quiet_shift
 
 
@@ -66,6 +72,15 @@ class ParsingTests(unittest.TestCase):
         self.assertIsNone(_parse_quiet("ночью"))
         self.assertIsNone(_parse_quiet("25-30"))
 
+    def test_the_dynamic_mode_says_so(self) -> None:
+        self.assertEqual(_spacing_label(1800, "dynamic", 2), "по длине видео ×2")
+        self.assertIn("по длине видео ×1.5", _schedule_settings_line(1800, None, "dynamic", 1.5))
+
+    def test_how_far_off_reads_roughly(self) -> None:
+        self.assertEqual(_until_label(300), "через 5 мин")
+        self.assertEqual(_until_label(7200), "через 2 ч")
+        self.assertEqual(_until_label(2 * 86400), "через 2 дн")
+
     def test_the_summary_line_reads_plainly(self) -> None:
         self.assertIn("30 мин", _schedule_settings_line(1800, None))
         self.assertIn("1 ч", _schedule_settings_line(3600, None))
@@ -122,6 +137,85 @@ class StoreScheduleTests(unittest.TestCase):
         gaps = [round(b - a) for a, b in zip(times, times[1:])]
         self.assertEqual(gaps, [300, 300, 300])
 
+
+
+class DynamicSpacingTests(unittest.TestCase):
+    """The pause after a post is that post's own video length times a
+    multiplier: a one-minute clip should not hold the channel as long as a
+    ten-minute one."""
+
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = ProposalStore(Path(self._tempdir.name) / "proposals.sqlite3")
+
+    def _queue(self, durations_minutes: list[float], start: float) -> None:
+        for index, minutes in enumerate(durations_minutes):
+            self.store.create_submission(
+                job_number=str(6000 + index),
+                user_id=1,
+                chat_id=1,
+                author_name="кто-то",
+                author_username=None,
+                video_path=Path("video.mp4"),
+                output_filename="video.mp4",
+                duration_ms=int(minutes * 60_000),
+            )
+            self.store.schedule_post(
+                submission_id=index + 1,
+                destination="main",
+                target_chat="@channel",
+                moderator_id=1,
+                scheduled_for=start + index,
+            )
+
+    def _slots_minutes(self) -> list[float]:
+        times = [item.scheduled_for for item in self.store.pending_scheduled_posts()]
+        return [round((t - times[0]) / 60) for t in times]
+
+    def test_the_worked_example_with_multiplier_one(self) -> None:
+        """Videos of 1 and 10 minutes: 16:00, 16:01, 16:11."""
+        start = datetime(2026, 9, 5, 16, 0).timestamp()
+        self._queue([1, 10, 1], start)
+        self.store.set_post_mode("dynamic")
+        self.store.set_post_multiplier(1)
+        self.store.reschedule_pending(interval_seconds=1800, quiet=None, now=start)
+        self.assertEqual(self._slots_minutes(), [0, 1, 11])
+
+    def test_the_worked_example_with_multiplier_two(self) -> None:
+        """The same videos doubled: 16:00, 16:02, 16:22."""
+        start = datetime(2026, 9, 5, 16, 0).timestamp()
+        self._queue([1, 10, 1], start)
+        self.store.set_post_mode("dynamic")
+        self.store.set_post_multiplier(2)
+        self.store.reschedule_pending(interval_seconds=1800, quiet=None, now=start)
+        self.assertEqual(self._slots_minutes(), [0, 2, 22])
+
+    def test_an_unknown_duration_falls_back_to_the_fixed_interval(self) -> None:
+        """Better the old spacing than posting the next one immediately."""
+        start = datetime(2026, 9, 5, 16, 0).timestamp()
+        self._queue([0, 5], start)
+        self.store.set_post_mode("dynamic")
+        self.store.set_post_multiplier(1)
+        self.store.reschedule_pending(interval_seconds=900, quiet=None, now=start)
+        self.assertEqual(self._slots_minutes(), [0, 15])
+
+    def test_quiet_hours_still_win(self) -> None:
+        start = datetime(2026, 9, 5, 23, 30).timestamp()
+        self._queue([40, 5], start)
+        self.store.set_post_mode("dynamic")
+        self.store.set_post_multiplier(1)
+        self.store.reschedule_pending(interval_seconds=1800, quiet=(0, 8), now=start)
+        times = [item.scheduled_for for item in self.store.pending_scheduled_posts()]
+        self.assertEqual(datetime.fromtimestamp(times[0]).hour, 23)
+        # 23:30 plus forty minutes lands at 00:10, inside the window.
+        self.assertEqual(datetime.fromtimestamp(times[1]).hour, 8)
+
+    def test_fixed_mode_is_unaffected_by_duration(self) -> None:
+        start = datetime(2026, 9, 5, 16, 0).timestamp()
+        self._queue([1, 10, 1], start)
+        self.store.reschedule_pending(interval_seconds=600, quiet=None, now=start)
+        self.assertEqual(self._slots_minutes(), [0, 10, 20])
 
 if __name__ == "__main__":
     unittest.main()

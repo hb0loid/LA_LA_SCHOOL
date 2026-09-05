@@ -76,6 +76,29 @@ def quiet_shift(timestamp: float, quiet: tuple[int, int] | None) -> float:
 
 
 
+# In dynamic mode the pause after a post is that post's own video length times
+# a multiplier: a one-minute clip should not hold the channel for as long as a
+# ten-minute one. A video whose length we never recorded falls back to the fixed
+# interval rather than posting the next one immediately.
+DEFAULT_POST_MULTIPLIER = 1.0
+MIN_POST_MULTIPLIER = 0.1
+MAX_POST_MULTIPLIER = 20.0
+
+
+def dynamic_gap(
+    duration_ms: int | None,
+    multiplier: float,
+    *,
+    fallback_seconds: float,
+) -> float:
+    """The pause to leave after posting a video of this length."""
+    if not duration_ms or duration_ms <= 0:
+        return fallback_seconds
+    gap = (duration_ms / 1000.0) * multiplier
+    return min(MAX_POST_INTERVAL_SECONDS, max(MIN_POST_INTERVAL_SECONDS, gap))
+
+
+
 class ProposalStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -840,6 +863,48 @@ class ProposalStore:
                 (key, value),
             )
 
+
+    def post_mode(self) -> str:
+        return "dynamic" if self._setting("post_mode") == "dynamic" else "fixed"
+
+    def set_post_mode(self, mode: str) -> None:
+        self._set_setting("post_mode", "dynamic" if mode == "dynamic" else "fixed")
+
+    def post_multiplier(self) -> float:
+        raw = self._setting("post_multiplier")
+        try:
+            value = float(raw) if raw else DEFAULT_POST_MULTIPLIER
+        except ValueError:
+            return DEFAULT_POST_MULTIPLIER
+        return min(MAX_POST_MULTIPLIER, max(MIN_POST_MULTIPLIER, value))
+
+    def set_post_multiplier(self, multiplier: float) -> float:
+        value = min(MAX_POST_MULTIPLIER, max(MIN_POST_MULTIPLIER, float(multiplier)))
+        self._set_setting("post_multiplier", f"{value:g}")
+        return value
+
+    def _last_post_duration_ms(self, destination: str) -> int | None:
+        """How long the video was that occupies the latest slot for this
+        channel - published or merely queued, whichever is later."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT duration_ms FROM (
+                    SELECT s.duration_ms AS duration_ms, p.scheduled_for AS t
+                        FROM scheduled_posts p JOIN submissions s ON s.id = p.submission_id
+                        WHERE p.destination = ?
+                    UNION ALL
+                    SELECT duration_ms, updated_at AS t FROM submissions
+                        WHERE destination = ? AND publication_message_id IS NOT NULL
+                )
+                ORDER BY t DESC LIMIT 1
+                """,
+                (destination, destination),
+            ).fetchone()
+        if row is None or row["duration_ms"] is None:
+            return None
+        return int(row["duration_ms"])
+
     def post_interval_seconds(self) -> float:
         raw = self._setting("post_interval_seconds")
         try:
@@ -883,19 +948,32 @@ class ProposalStore:
         for a shorter interval wants.
         """
         now = now if now is not None else time.time()
+        dynamic = self.post_mode() == "dynamic"
+        multiplier = self.post_multiplier()
         moved = 0
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT id, destination, scheduled_for FROM scheduled_posts "
-                "WHERE status = 'pending' ORDER BY scheduled_for ASC, id ASC"
+                """
+                SELECT p.id AS id, p.destination AS destination,
+                       p.scheduled_for AS scheduled_for, s.duration_ms AS duration_ms
+                FROM scheduled_posts p JOIN submissions s ON s.id = p.submission_id
+                WHERE p.status = 'pending' ORDER BY p.scheduled_for ASC, p.id ASC
+                """
             ).fetchall()
-            previous: dict[str, float] = {}
+            previous: dict[str, tuple[float, float]] = {}
             for row in rows:
                 destination = str(row["destination"])
-                earliest = previous.get(destination)
-                slot = now if earliest is None else earliest + interval_seconds
+                seen = previous.get(destination)
+                slot = now if seen is None else seen[0] + seen[1]
                 slot = quiet_shift(max(slot, now), quiet)
-                previous[destination] = slot
+                # The pause belongs to this post, so it is measured from this
+                # video and applied before the next one.
+                gap = (
+                    dynamic_gap(row["duration_ms"], multiplier, fallback_seconds=interval_seconds)
+                    if dynamic
+                    else interval_seconds
+                )
+                previous[destination] = (slot, gap)
                 if abs(slot - float(row["scheduled_for"])) > 1.0:
                     connection.execute(
                         "UPDATE scheduled_posts SET scheduled_for = ? WHERE id = ?",
@@ -924,8 +1002,16 @@ class ProposalStore:
                 (destination, destination),
             ).fetchone()
         last_t = row["last_t"] if row is not None else None
-        candidate = now if last_t is None else max(now, float(last_t) + interval_seconds)
-        return quiet_shift(candidate, self.quiet_hours())
+        if last_t is None:
+            return quiet_shift(now, self.quiet_hours())
+        gap = interval_seconds
+        if self.post_mode() == "dynamic":
+            gap = dynamic_gap(
+                self._last_post_duration_ms(destination),
+                self.post_multiplier(),
+                fallback_seconds=interval_seconds,
+            )
+        return quiet_shift(max(now, float(last_t) + gap), self.quiet_hours())
 
     def find_pending_schedule_by_job_number(self, job_number: str) -> ScheduledPost | None:
         with self._connect() as connection:
