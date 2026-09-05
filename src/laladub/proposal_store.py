@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -41,6 +42,38 @@ class Submission:
     created_at: float
     updated_at: float
     author_comment: str | None = None
+
+
+# Half an hour was hard-coded, and with a hundred posts waiting that stretches
+# the queue over two days whether or not that is wanted.
+DEFAULT_POST_INTERVAL_SECONDS = 30 * 60
+MIN_POST_INTERVAL_SECONDS = 60
+MAX_POST_INTERVAL_SECONDS = 24 * 60 * 60
+
+
+def quiet_shift(timestamp: float, quiet: tuple[int, int] | None) -> float:
+    """Moves a slot out of the quiet window, to the moment it ends.
+
+    The window is given in whole local hours and may wrap past midnight, which
+    is the case worth having: nobody wants posts going out at four in the
+    morning. A window covering the whole day is meaningless and ignored.
+    """
+    if not quiet:
+        return timestamp
+    start_hour, end_hour = quiet
+    if start_hour == end_hour:
+        return timestamp
+    moment = datetime.fromtimestamp(timestamp)
+    hour = moment.hour
+    inside = start_hour < end_hour and start_hour <= hour < end_hour
+    wrapped = start_hour > end_hour and (hour >= start_hour or hour < end_hour)
+    if not (inside or wrapped):
+        return timestamp
+    end = moment.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+    if end <= moment:
+        end = end + timedelta(days=1)
+    return end.timestamp()
+
 
 
 class ProposalStore:
@@ -789,6 +822,88 @@ class ProposalStore:
                 ("1" if enabled else "0",),
             )
 
+
+    def _setting(self, key: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM store_metadata WHERE key = ?", (key,)
+            ).fetchone()
+        return None if row is None else str(row["value"])
+
+    def _set_setting(self, key: str, value: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO store_metadata(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
+
+    def post_interval_seconds(self) -> float:
+        raw = self._setting("post_interval_seconds")
+        try:
+            value = float(raw) if raw else DEFAULT_POST_INTERVAL_SECONDS
+        except ValueError:
+            return DEFAULT_POST_INTERVAL_SECONDS
+        return min(MAX_POST_INTERVAL_SECONDS, max(MIN_POST_INTERVAL_SECONDS, value))
+
+    def set_post_interval_seconds(self, seconds: float) -> float:
+        value = min(MAX_POST_INTERVAL_SECONDS, max(MIN_POST_INTERVAL_SECONDS, float(seconds)))
+        self._set_setting("post_interval_seconds", str(int(value)))
+        return value
+
+    def quiet_hours(self) -> tuple[int, int] | None:
+        raw = self._setting("quiet_hours")
+        if not raw:
+            return None
+        try:
+            start_text, end_text = raw.split("-", 1)
+            start_hour, end_hour = int(start_text), int(end_text)
+        except ValueError:
+            return None
+        if not (0 <= start_hour < 24 and 0 <= end_hour < 24) or start_hour == end_hour:
+            return None
+        return start_hour, end_hour
+
+    def set_quiet_hours(self, quiet: tuple[int, int] | None) -> None:
+        self._set_setting("quiet_hours", "" if quiet is None else f"{quiet[0]}-{quiet[1]}")
+
+    def reschedule_pending(
+        self,
+        *,
+        interval_seconds: float,
+        quiet: tuple[int, int] | None,
+        now: float | None = None,
+    ) -> int:
+        """Re-spaces everything still waiting, keeping the existing order.
+
+        Changing the interval only for new posts would leave a queue built at
+        the old spacing untouched, which is the opposite of what someone asking
+        for a shorter interval wants.
+        """
+        now = now if now is not None else time.time()
+        moved = 0
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, destination, scheduled_for FROM scheduled_posts "
+                "WHERE status = 'pending' ORDER BY scheduled_for ASC, id ASC"
+            ).fetchall()
+            previous: dict[str, float] = {}
+            for row in rows:
+                destination = str(row["destination"])
+                earliest = previous.get(destination)
+                slot = now if earliest is None else earliest + interval_seconds
+                slot = quiet_shift(max(slot, now), quiet)
+                previous[destination] = slot
+                if abs(slot - float(row["scheduled_for"])) > 1.0:
+                    connection.execute(
+                        "UPDATE scheduled_posts SET scheduled_for = ? WHERE id = ?",
+                        (slot, row["id"]),
+                    )
+                    moved += 1
+        return moved
+
     def next_available_slot(self, destination: str, *, interval_seconds: float, now: float | None = None) -> float:
         """The earliest time a new post to this destination may go out: `now`
         if enough time has passed since the last one, otherwise last + interval.
@@ -809,9 +924,8 @@ class ProposalStore:
                 (destination, destination),
             ).fetchone()
         last_t = row["last_t"] if row is not None else None
-        if last_t is None:
-            return now
-        return max(now, float(last_t) + interval_seconds)
+        candidate = now if last_t is None else max(now, float(last_t) + interval_seconds)
+        return quiet_shift(candidate, self.quiet_hours())
 
     def find_pending_schedule_by_job_number(self, job_number: str) -> ScheduledPost | None:
         with self._connect() as connection:

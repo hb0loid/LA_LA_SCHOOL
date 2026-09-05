@@ -24,9 +24,9 @@ from .update_dedupe import (
 )
 from .proposal_store import ProposalStore, ScheduledPost, Submission
 
-# How far apart consecutive posts to the same channel are spaced when /timer
-# delayed posting is on.
-DELAYED_POST_INTERVAL_SECONDS = 30 * 60
+# Spacing and quiet hours live in the store now, set with /interval and /quiet:
+# with a hundred posts queued, a fixed half hour stretches the queue over two
+# days whether or not that is wanted.
 TELEGRAM_TEXT_LIMIT = 4000
 
 
@@ -108,6 +108,8 @@ def main() -> None:
     application.add_handler(CommandHandler("cancel", cancel, filters=private_chat))
     application.add_handler(CommandHandler("timer", timer_command, filters=private_chat))
     application.add_handler(CommandHandler("scheduled", scheduled_command, filters=private_chat))
+    application.add_handler(CommandHandler("interval", interval_command, filters=private_chat))
+    application.add_handler(CommandHandler("quiet", quiet_command, filters=private_chat))
     application.add_handler(CommandHandler("post", post_command, filters=private_chat))
     application.add_handler(CommandHandler("unpost", unpost_command, filters=private_chat))
     application.add_handler(CommandHandler("show", show_command))
@@ -135,6 +137,8 @@ async def _post_init(application: Any) -> None:
         ("pending", "Проверить новые видео"),
         ("cancel", "Отменить ввод сообщения"),
         ("timer", "Вкл/выкл отложенную публикацию"),
+        ("interval", "Интервал между постами"),
+        ("quiet", "Часы, когда не публикуем"),
         ("scheduled", "Очередь отложенных постов"),
         ("post", "Отправить отложенный пост сейчас"),
         ("unpost", "Снять пост с отложенной публикации"),
@@ -223,11 +227,9 @@ async def timer_command(update: Any, context: Any) -> None:
     if enabled != current:
         await asyncio.to_thread(store.set_delayed_posting_enabled, enabled)
     state = "включена" if enabled else "выключена"
-    suffix = (
-        f" Посты в один канал теперь выходят не чаще раза в {DELAYED_POST_INTERVAL_SECONDS // 60} мин."
-        if enabled
-        else ""
-    )
+    interval = await asyncio.to_thread(store.post_interval_seconds)
+    quiet = await asyncio.to_thread(store.quiet_hours)
+    suffix = f" {_schedule_settings_line(interval, quiet)}" if enabled else ""
     sent = await update.effective_message.reply_text(f"Отложенная публикация теперь {state}.{suffix}")
     await _note(store, int(moderator_id), sent)
 
@@ -240,24 +242,181 @@ async def scheduled_command(update: Any, context: Any) -> None:
         return
 
     items = await asyncio.to_thread(store.pending_scheduled_posts)
+    interval = await asyncio.to_thread(store.post_interval_seconds)
+    quiet = await asyncio.to_thread(store.quiet_hours)
     if not items:
-        sent = await update.effective_message.reply_text("Очередь отложенных постов пуста.")
+        sent = await update.effective_message.reply_text(
+            "Очередь отложенных постов пуста.\n" + _schedule_settings_line(interval, quiet)
+        )
         await _note(store, int(moderator_id), sent)
         return
 
     channel_names = {"main": "La La School", "shame": "Ghien Mi Go"}
-    lines = ["Очередь отложенных постов:", ""]
+    rows: list[str] = []
     for item in items:
         submission = await asyncio.to_thread(store.get_submission, item.submission_id)
         label = f"№{submission.job_number}" if submission is not None else f"id{item.submission_id}"
         when = datetime.fromtimestamp(item.scheduled_for).strftime("%d.%m %H:%M")
         channel = channel_names.get(item.destination, item.destination)
-        lines.append(f"Работа {label} → {channel}, отправка в {when}")
-    lines.append("")
-    lines.append("Отправить сейчас: /post номер\nОтменить: /unpost номер")
+        rows.append(html.escape(f"{when}  {label} → {channel}"))
+
+    last = datetime.fromtimestamp(items[-1].scheduled_for).strftime("%d.%m %H:%M")
+    header = [
+        f"<b>Отложено: {len(items)}</b>",
+        f"Последний выйдет {last}",
+        _schedule_settings_line(interval, quiet),
+        "",
+    ]
+    footer = ["", "Отправить сейчас: /post номер", "Отменить: /unpost номер"]
+
+    # A hundred lines does not fit in one message, and the send simply failed -
+    # /scheduled answered with nothing at all. Folded into a quote, and trimmed
+    # from the end if even that is too much.
+    room = TELEGRAM_TEXT_LIMIT - len("\n".join(header + footer)) - 120
+    dropped = 0
+    while rows and len("\n".join(rows)) > room:
+        rows.pop()
+        dropped += 1
+    if dropped:
+        rows.append(f"… и ещё {dropped}")
+
+    text = "\n".join(
+        header + ["<blockquote expandable>" + "\n".join(rows) + "</blockquote>"] + footer
+    )
+    sent = await update.effective_message.reply_text(text, parse_mode="HTML")
+    await _note(store, int(moderator_id), sent)
+
+
+def _schedule_settings_line(interval_seconds: float, quiet: tuple[int, int] | None) -> str:
+    minutes = int(round(interval_seconds / 60))
+    if minutes % 60 == 0 and minutes >= 60:
+        spacing = f"{minutes // 60} ч"
+    else:
+        spacing = f"{minutes} мин"
+    sleeping = "нет" if not quiet else f"{quiet[0]:02d}:00–{quiet[1]:02d}:00"
+    return f"Интервал: {spacing} · тихие часы: {sleeping}"
+
+
+def _parse_interval(text: str) -> float | None:
+    """Accepts 15, 15м, 15m, 1ч, 1h, 90мин - minutes unless hours are named."""
+    cleaned = text.strip().lower().replace(" ", "")
+    if not cleaned:
+        return None
+    hours = cleaned.endswith(("ч", "h", "час", "часа", "часов"))
+    digits = "".join(character for character in cleaned if character.isdigit() or character == ".")
+    if not digits:
+        return None
+    try:
+        value = float(digits)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return value * (3600.0 if hours else 60.0)
+
+
+async def interval_command(update: Any, context: Any) -> None:
+    """Sets how far apart posts go out, and re-spaces what is already queued."""
+    settings: ProposalBotSettings = context.application.bot_data["settings"]
+    store: ProposalStore = context.application.bot_data["store"]
+    moderator_id = getattr(update.effective_user, "id", None)
+    if not _is_moderator(settings, moderator_id):
+        return
+
+    args = context.args or []
+    if not args:
+        interval = await asyncio.to_thread(store.post_interval_seconds)
+        quiet = await asyncio.to_thread(store.quiet_hours)
+        sent = await update.effective_message.reply_text(
+            _schedule_settings_line(interval, quiet)
+            + "\n\nИзменить: /interval 15 · /interval 1ч"
+        )
+        await _note(store, int(moderator_id), sent)
+        return
+
+    seconds = _parse_interval(" ".join(str(arg) for arg in args))
+    if seconds is None:
+        sent = await update.effective_message.reply_text(
+            "Не понял интервал. Примеры: /interval 15, /interval 30, /interval 1ч"
+        )
+        await _note(store, int(moderator_id), sent)
+        return
+
+    applied = await asyncio.to_thread(store.set_post_interval_seconds, seconds)
+    quiet = await asyncio.to_thread(store.quiet_hours)
+    moved = await asyncio.to_thread(
+        store.reschedule_pending, interval_seconds=applied, quiet=quiet
+    )
+    lines = [_schedule_settings_line(applied, quiet)]
+    if moved:
+        lines.append(f"Переставлено уже отложенных: {moved}")
     sent = await update.effective_message.reply_text("\n".join(lines))
     await _note(store, int(moderator_id), sent)
 
+
+async def quiet_command(update: Any, context: Any) -> None:
+    """Sets the hours when nothing is posted, and moves queued posts out of it."""
+    settings: ProposalBotSettings = context.application.bot_data["settings"]
+    store: ProposalStore = context.application.bot_data["store"]
+    moderator_id = getattr(update.effective_user, "id", None)
+    if not _is_moderator(settings, moderator_id):
+        return
+
+    args = [str(arg) for arg in (context.args or [])]
+    joined = "".join(args).strip().lower()
+    if not joined:
+        interval = await asyncio.to_thread(store.post_interval_seconds)
+        quiet = await asyncio.to_thread(store.quiet_hours)
+        sent = await update.effective_message.reply_text(
+            _schedule_settings_line(interval, quiet)
+            + "\n\nЗадать: /quiet 00:00-08:00 · выключить: /quiet off"
+        )
+        await _note(store, int(moderator_id), sent)
+        return
+
+    if joined in {"off", "выкл", "нет", "0"}:
+        await asyncio.to_thread(store.set_quiet_hours, None)
+        window = None
+    else:
+        window = _parse_quiet(joined)
+        if window is None:
+            sent = await update.effective_message.reply_text(
+                "Не понял. Примеры: /quiet 00:00-08:00, /quiet 23-7, /quiet off"
+            )
+            await _note(store, int(moderator_id), sent)
+            return
+        await asyncio.to_thread(store.set_quiet_hours, window)
+
+    interval = await asyncio.to_thread(store.post_interval_seconds)
+    moved = await asyncio.to_thread(
+        store.reschedule_pending, interval_seconds=interval, quiet=window
+    )
+    lines = [_schedule_settings_line(interval, window)]
+    if moved:
+        lines.append(f"Переставлено уже отложенных: {moved}")
+    sent = await update.effective_message.reply_text("\n".join(lines))
+    await _note(store, int(moderator_id), sent)
+
+
+def _parse_quiet(text: str) -> tuple[int, int] | None:
+    """Accepts 00:00-08:00, 0-8, 23-7. Only whole hours: minute precision on a
+    sleep window buys nothing and doubles the ways to get it wrong."""
+    separator = "-" if "-" in text else "–" if "–" in text else None
+    if separator is None:
+        return None
+    start_text, end_text = text.split(separator, 1)
+
+    def hour_of(value: str) -> int | None:
+        value = value.strip().split(":")[0]
+        if not value.isdigit():
+            return None
+        hour = int(value)
+        return hour if 0 <= hour < 24 else None
+
+    start_hour, end_hour = hour_of(start_text), hour_of(end_text)
+    if start_hour is None or end_hour is None or start_hour == end_hour:
+        return None
+    return start_hour, end_hour
 
 async def post_command(update: Any, context: Any) -> None:
     settings: ProposalBotSettings = context.application.bot_data["settings"]
@@ -388,8 +547,9 @@ async def send_due_scheduled_posts(context: Any) -> int:
         # Publishing that backlog back to back is the very thing the delay
         # exists to prevent, so keep honouring the spacing and let the rest
         # wait for their turn.
+        spacing = await asyncio.to_thread(store.post_interval_seconds)
         last_sent = await asyncio.to_thread(store.last_published_at, item.destination)
-        if last_sent is not None and time.time() - last_sent < DELAYED_POST_INTERVAL_SECONDS:
+        if last_sent is not None and time.time() - last_sent < spacing:
             continue
         if await _process_scheduled_post(context, item):
             sent += 1
@@ -566,7 +726,9 @@ async def moderation_callback(update: Any, context: Any) -> None:
         # window expires.
         await asyncio.to_thread(store.release_claim, submission_id, int(moderator_id))
         slot = await asyncio.to_thread(
-            store.next_available_slot, destination, interval_seconds=DELAYED_POST_INTERVAL_SECONDS
+            store.next_available_slot,
+            destination,
+            interval_seconds=store.post_interval_seconds(),
         )
         await asyncio.to_thread(
             store.schedule_post,
