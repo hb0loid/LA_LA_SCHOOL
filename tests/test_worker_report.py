@@ -163,5 +163,39 @@ class HostResolutionTests(unittest.TestCase):
         with unittest.mock.patch("socket.getaddrinfo", side_effect=OSError("no dns")):
             self.assertEqual(client._connect_host(), "192.168.1.180")
 
+
+
+class ServiceModeTests(unittest.TestCase):
+    """Under a Windows service the service is the autostart. Reinstalling the
+    scheduled task alongside it puts two supervisors on one lock, and this was
+    the third place doing so - after the launcher and its standalone installer -
+    which is why the guard sits inside the function, not at the call sites."""
+
+    def test_the_scheduled_task_is_not_installed_in_service_mode(self) -> None:
+        import subprocess as sp
+
+        from laladub.worker import _ensure_windows_autostart
+
+        with unittest.mock.patch.dict("os.environ", {"LALADUB_WINDOWS_SERVICE": "1"}):
+            with unittest.mock.patch.object(sp, "run", side_effect=AssertionError("ran")):
+                _ensure_windows_autostart()
+
+    def test_it_is_installed_without_the_variable(self) -> None:
+        import os
+        import subprocess as sp
+
+        from laladub.worker import _ensure_windows_autostart
+
+        if os.name != "nt":
+            self.skipTest("Windows only")
+        calls: list[object] = []
+        environment = dict(os.environ)
+        environment.pop("LALADUB_WINDOWS_SERVICE", None)
+        with unittest.mock.patch.dict("os.environ", environment, clear=True):
+            with unittest.mock.patch.object(Path, "is_file", return_value=True):
+                with unittest.mock.patch.object(sp, "run", side_effect=lambda *a, **k: calls.append(a)):
+                    _ensure_windows_autostart()
+        self.assertEqual(len(calls), 1)
+
 if __name__ == "__main__":
     unittest.main()

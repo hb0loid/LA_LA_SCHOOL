@@ -728,6 +728,13 @@ def _default_worker_id() -> str:
 def _ensure_windows_autostart() -> None:
     if os.name != "nt":
         return
+    if os.environ.get("LALADUB_WINDOWS_SERVICE") == "1":
+        # Under a service the service is the autostart. Reinstalling the
+        # scheduled task alongside it puts two supervisors on the same lock -
+        # and this is the third place that did so, after the launcher and its
+        # standalone installer, which is why the guard lives in here rather
+        # than at each call site.
+        return
     installer = Path.cwd() / "Install-Worker-Autostart.ps1"
     if not installer.is_file():
         return

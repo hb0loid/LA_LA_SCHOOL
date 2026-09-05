@@ -1,5 +1,10 @@
 $ErrorActionPreference = "Stop"
 
+if ($env:LALADUB_WINDOWS_SERVICE -eq "1") {
+  Write-Host "Service mode: the LaLaDubWorker service is the autostart; not installing the scheduled task."
+  exit 0
+}
+
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $HiddenLauncher = Join-Path $Root "Start-Worker-Hidden.vbs"
 if (-not (Test-Path -LiteralPath $HiddenLauncher)) { exit 0 }
