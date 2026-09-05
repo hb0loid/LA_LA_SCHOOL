@@ -14,7 +14,6 @@ from laladub.karma import (
     visible_karma,
 )
 from laladub.proposal_bot import (
-    DELAYED_POST_INTERVAL_SECONDS,
     ProposalBotSettings,
     _author_caption,
     _find_submission_original_video,
@@ -1028,8 +1027,8 @@ class ModerationCallbackDelayedPostingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_second_and_third_click_chain_into_consecutive_slots(self) -> None:
         # Three quick clicks with nothing sent yet still land on three
-        # different slots, each `DELAYED_POST_INTERVAL_SECONDS` apart - the
-        # not-yet-sent rows already reserve their place in the chain.
+        # different slots, one configured interval apart - the not-yet-sent
+        # rows already reserve their place in the chain.
         first = self._submission("1")
         second = self._submission("2")
         third = self._submission("3")
@@ -1044,8 +1043,9 @@ class ModerationCallbackDelayedPostingTests(unittest.IsolatedAsyncioTestCase):
         first_slot = self.store.pending_schedule_for_submission(first.id).scheduled_for
         second_slot = self.store.pending_schedule_for_submission(second.id).scheduled_for
         third_slot = self.store.pending_schedule_for_submission(third.id).scheduled_for
-        self.assertAlmostEqual(second_slot - first_slot, DELAYED_POST_INTERVAL_SECONDS, delta=2)
-        self.assertAlmostEqual(third_slot - second_slot, DELAYED_POST_INTERVAL_SECONDS, delta=2)
+        spacing = self.store.post_interval_seconds()
+        self.assertAlmostEqual(second_slot - first_slot, spacing, delta=2)
+        self.assertAlmostEqual(third_slot - second_slot, spacing, delta=2)
 
     async def test_reject_bypasses_the_delay_queue(self) -> None:
         submission = self._submission("1")
