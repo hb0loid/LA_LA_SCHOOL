@@ -236,6 +236,7 @@ def main() -> None:
     application.add_handler(CommandHandler("me", me, filters=private_chat))
     application.add_handler(CommandHandler("karma", karma_command))
     application.add_handler(CommandHandler("queue", queue_status, filters=private_chat))
+    application.add_handler(CommandHandler("status", status_command, filters=private_chat))
     application.add_handler(CommandHandler("resume", resume, filters=private_chat))
     application.add_handler(CommandHandler("send", send_to_proposal, filters=private_chat))
     application.add_handler(CommandHandler("censored", censored, filters=private_chat))
@@ -1311,6 +1312,96 @@ async def censored(update: Any, context: Any) -> None:
             "Если в переводе найдутся запрещённые слова/маты/slurs, они с этой вероятностью будут заменяться на предупреждения/censored-фразы."
         )
     await update.effective_message.reply_text(text, reply_markup=_remove_reply_keyboard())
+
+
+def _status_job_line(entry: dict[str, Any], *, index: int | None = None) -> str:
+    mark = "⭐" if entry.get("premium") else "•"
+    number = entry.get("number") or "?"
+    head = f"{mark} #{number}" if index is None else f"{index}. {mark} #{number}"
+    langs = f"{_source_lang_label(entry.get('source'))} → {_target_lang_label(entry.get('target'))}"
+    return f"{head} {langs}"
+
+
+async def status_command(update: Any, context: Any) -> None:
+    """The detailed view: not "is the queue moving" but "why is it not".
+
+    Every stall this month was diagnosable only by reading the coordinator's log
+    - a lease held by a worker that had walked away, a phantom worker that read
+    as idle forever, a job nobody would take. Each of those is a line here.
+    """
+    settings: BotSettings = context.application.bot_data["settings"]
+    user = update.effective_user
+    if user is None or not settings.is_admin(user.id):
+        return
+    scheduler: _JobScheduler = context.application.bot_data["job_scheduler"]
+    report = await scheduler.status_report()
+
+    lines: list[str] = ["📋 Подробное состояние", ""]
+
+    slots = f"{report['active_total']}/{report['max_active_jobs']}"
+    lines.append(f"⚙️ Режим: {report['executor_mode']}, занято ячеек: {slots}")
+    if report["maintenance"]:
+        lines.append("⛔ Режим обслуживания — новые работы не стартуют")
+    lines.append("")
+
+    lines.append(f"💻 Основной ПК ({report['active_local']}/{report['max_local_jobs']})")
+    if report["local"]:
+        for entry in report["local"]:
+            lines.append("   " + _status_job_line(entry))
+            source = "после воркера" if entry["preprocessed"] else "целиком здесь"
+            lines.append(
+                f"      {entry['stage']} {entry['percent']}% • "
+                f"{_format_duration(entry['elapsed'])} • {source}"
+            )
+    else:
+        lines.append("   свободен")
+    lines.append("")
+
+    lines.append("📡 Воркеры")
+    if report["workers"]:
+        for worker in report["workers"]:
+            busy = f"работа {worker['job']}" if worker["job"] else "свободен"
+            lines.append(
+                f"   {worker['id']} — {busy}, "
+                f"последний запрос {_format_duration(worker['last_seen'])} назад"
+            )
+    else:
+        lines.append("   ни один не подключался")
+    if report["traffic_quiet"] is not None:
+        lines.append(f"   тишина в эфире: {_format_duration(report['traffic_quiet'])}")
+    lines.append("")
+
+    lines.append(f"🔧 Считается на воркерах: {len(report['running'])}")
+    for entry in report["running"]:
+        lines.append("   " + _status_job_line(entry))
+        lines.append(
+            f"      {entry['stage']} {entry['percent']}% • "
+            f"{_format_duration(entry['elapsed'])} • {entry['where']} ({entry['kind']})"
+        )
+        if entry["silence"] is None:
+            lines.append("      ⚠️ отчётов ещё не было")
+        else:
+            note = " — а воркер занят другим!" if entry["moved_on"] else ""
+            lines.append(f"      молчит {_format_duration(entry['silence'])}{note}")
+    lines.append("")
+
+    pending = report["pending"]
+    lines.append(f"⏳ В очереди: {len(pending)}")
+    for index, entry in enumerate(pending[:15], start=1):
+        lines.append("   " + _status_job_line(entry, index=index))
+        where = "только основной ПК" if entry["forced_local"] else "любая машина"
+        if entry["preprocessed"]:
+            where = "озвучка на основном ПК"
+        lines.append(
+            f"      ждёт {_format_duration(entry['waiting'])} • "
+            f"приоритет {entry['priority']} • {where}"
+        )
+    if len(pending) > 15:
+        lines.append(f"   … и ещё {len(pending) - 15}")
+
+    await update.effective_message.reply_text(
+        "\n".join(lines), reply_markup=_remove_reply_keyboard()
+    )
 
 
 async def queue_status(update: Any, context: Any) -> None:
@@ -3874,6 +3965,96 @@ class _JobScheduler:
             "stale": stale,
         }
 
+    async def status_report(self) -> dict[str, Any]:
+        """Everything the scheduler knows, for /status.
+
+        Deliberately raw: /queue answers "is it moving", this answers "why is it
+        not". Several of today's stalls were only diagnosable by reading the log
+        - a lease held by a worker that had walked away, a phantom worker that
+        read as permanently idle - and every one of them is a field here.
+        """
+        now = time.time()
+        async with self._lock:
+            running = []
+            for item in sorted(self._leased.values(), key=lambda entry: entry.sequence):
+                progress = item.progress.describe() if item.progress else {}
+                silence = now - float(item.remote_last_seen_at or 0.0)
+                running.append(
+                    {
+                        "number": _job_number(item.job),
+                        "user_id": item.user_id,
+                        "where": item.worker_id or "?",
+                        "kind": item.execution_kind or "?",
+                        "source": item.job.get("source_lang"),
+                        "target": item.job.get("target_lang"),
+                        "premium": item.premium,
+                        "stage": str(progress.get("stage") or "-"),
+                        "percent": int(progress.get("percent") or 0),
+                        "elapsed": float(progress.get("elapsed") or 0.0),
+                        "silence": silence if item.remote_last_seen_at else None,
+                        "moved_on": self._worker_moved_on_locked(item),
+                    }
+                )
+
+            local = []
+            leased_keys = set(self._leased)
+            for key, item in self._items_by_key.items():
+                if key in leased_keys or item.runner_task is None:
+                    continue
+                progress = item.progress.describe() if item.progress else {}
+                local.append(
+                    {
+                        "number": _job_number(item.job),
+                        "user_id": item.user_id,
+                        "source": item.job.get("source_lang"),
+                        "target": item.job.get("target_lang"),
+                        "premium": item.premium,
+                        "stage": str(progress.get("stage") or "-"),
+                        "percent": int(progress.get("percent") or 0),
+                        "elapsed": float(progress.get("elapsed") or 0.0),
+                        "preprocessed": bool(item.job.get("remote_preprocess_completed_at")),
+                    }
+                )
+
+            pending = [
+                {
+                    "number": _job_number(item.job),
+                    "user_id": item.user_id,
+                    "source": item.job.get("source_lang"),
+                    "target": item.job.get("target_lang"),
+                    "premium": item.premium,
+                    "priority": priority,
+                    "waiting": now - item.enqueued_at,
+                    "forced_local": bool(item.job.get("force_local")),
+                    "preprocessed": bool(item.job.get("remote_preprocess_completed_at")),
+                }
+                for priority, _sequence, item in sorted(self._pending)
+            ]
+
+            workers = [
+                {
+                    "id": name,
+                    "last_seen": now - float(state.get("last_seen") or 0.0),
+                    "job": state.get("active_job_id") or None,
+                }
+                for name, state in sorted(self._remote_workers.items())
+            ]
+
+            return {
+                "now": now,
+                "running": running,
+                "local": local,
+                "pending": pending,
+                "workers": workers,
+                "traffic_quiet": now - self.remote_traffic_at if self.remote_traffic_at else None,
+                "active_total": self._active_total,
+                "active_local": self._active_local,
+                "max_active_jobs": self._settings.max_active_jobs,
+                "max_local_jobs": self._settings.max_local_jobs,
+                "executor_mode": self._settings.executor_mode,
+                "maintenance": _maintenance_enabled(self._settings),
+            }
+
     async def snapshot(self) -> dict[str, int]:
         async with self._lock:
             pending_premium = sum(1 for _priority, _sequence, item in self._pending if item.premium)
@@ -4073,6 +4254,19 @@ class _ProgressState:
                     min(pace_remaining, self._estimated_total_seconds * 3.0),
                 )
             return remaining if remaining >= 15 else None
+
+    def describe(self) -> dict[str, Any]:
+        """A plain snapshot for /status, without the user-facing formatting."""
+        with self._lock:
+            return {
+                "stage": self._stage,
+                "detail": self._detail,
+                "percent": int(round(100 * self._current / max(1, self._total))),
+                "elapsed": max(0.0, time.monotonic() - self._started_at),
+                "stage_elapsed": max(0.0, time.monotonic() - self._stage_started_at),
+                "done": self._done,
+                "failed": self._failed,
+            }
 
     def stage_seconds(self) -> dict[str, float]:
         with self._lock:
