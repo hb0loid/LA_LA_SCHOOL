@@ -3404,7 +3404,7 @@ class _JobScheduler:
             item.progress = _ProgressState(
                 "Raw Whisper" if item.job.get("mode") == "raw_text" else "Full dubbing",
                 _job_number(item.job),
-                estimated_total_seconds=_coerce_float(item.job.get("initial_eta_seconds")),
+                estimated_total_seconds=self._running_eta_seconds(item, remote=True),
             )
             item.progress.update("Remote worker leased", 1, 100, worker_id)
             item.progress_task = context.application.create_task(_progress_updater(item.status_message, item.progress))
@@ -3483,7 +3483,7 @@ class _JobScheduler:
                         item.progress = _ProgressState(
                             title,
                             _job_number(item.job),
-                            estimated_total_seconds=_coerce_float(item.job.get("initial_eta_seconds")),
+                            estimated_total_seconds=self._running_eta_seconds(item, remote=True),
                         )
                         self._leased[job_id] = item
                         _save_job_snapshot(
@@ -3671,7 +3671,9 @@ class _JobScheduler:
             item.progress = _ProgressState(
                 title,
                 _job_number(item.job),
-                estimated_total_seconds=_coerce_float(item.job.get("initial_eta_seconds")),
+                estimated_total_seconds=self._running_eta_seconds(
+                    item, remote=bool(item.job.get("remote_preprocess_completed_at"))
+                ),
             )
             item.runner_task = context.application.create_task(self._run_item(context, item))
 
@@ -3840,6 +3842,19 @@ class _JobScheduler:
             ]
         )
         return "\n".join(lines)
+
+    def _running_eta_seconds(self, item: _QueuedJob, *, remote: bool) -> float | None:
+        """The estimate to show while the job runs, now that we know where.
+
+        initial_eta_seconds was worked out at enqueue time, before anyone knew
+        which machine would take it - and the same video takes about three times
+        longer when the laptop preprocesses it. Re-asking with that settled is
+        the difference between a bar that lands and one that does not.
+        """
+        estimate = self._performance.estimate(item.job, remote=remote)
+        if estimate is not None:
+            return estimate.seconds
+        return _coerce_float(item.job.get("initial_eta_seconds"))
 
     def _queue_wait_range(self, target: _QueuedJob) -> tuple[float, float] | None:
         pending = sorted((priority, sequence, item) for priority, sequence, item in self._pending)
@@ -5243,6 +5258,12 @@ def _install_preprocess_bundle(archive_path: Path, job_dir: Path) -> None:
             workdir.replace(backup)
         incoming.replace(workdir)
         shutil.rmtree(backup, ignore_errors=True)
+        # The archive has been unpacked and is now a duplicate of work/. Keeping
+        # it until the job's own retention expired left a thousand of them on
+        # disk, tens of gigabytes, all redundant the moment this line is
+        # reached. Deleted only after the swap, so a failure above still leaves
+        # the package to retry from.
+        archive_path.unlink(missing_ok=True)
     except Exception:
         if not workdir.exists() and backup.exists():
             backup.replace(workdir)

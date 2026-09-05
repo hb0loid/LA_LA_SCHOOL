@@ -208,7 +208,15 @@ class PerformanceHistory:
                 for record in missing:
                     stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
-    def estimate(self, job: dict[str, Any]) -> RuntimeEstimate | None:
+    def estimate(self, job: dict[str, Any], *, remote: bool | None = None) -> RuntimeEstimate | None:
+        """Runtime for this job. Pass `remote` once it is known where it runs.
+
+        A dub takes about 20 seconds of work per second of video when the
+        laptop preprocesses it and about 6 when the main PC does the lot, so
+        mixing the two leaves every estimate wrong by the gap between them.
+        Knowing which it is narrows the spread of the local case from 48% to
+        34%; at enqueue time nobody knows yet, so it stays optional.
+        """
         self.refresh()
         duration = job_duration_seconds(job)
         if duration is None or not self._samples:
@@ -221,6 +229,12 @@ class PerformanceHistory:
             if str(sample.get("mode") or "dub") == mode
             and (mode != "dub" or not tts or str(sample.get("tts") or "") == tts)
         ]
+        if remote is not None:
+            matching = [
+                sample for sample in candidates if bool(sample.get("remote_preprocess")) is remote
+            ]
+            if len(matching) >= 5:
+                candidates = matching
         if len(candidates) < 5:
             candidates = [sample for sample in self._samples if str(sample.get("mode") or "dub") == mode]
         if len(candidates) < 5:
@@ -307,7 +321,12 @@ class PerformanceHistory:
         predictions: list[float] = []
         for sample in selected[-500:]:
             duration = _number(sample.get("duration_seconds"))
-            total = _number(sample.get("total_seconds"))
+            # Processing, not total. Total folds in however long the job sat in
+            # the queue, which says nothing about this video and everything
+            # about how busy we were: queue waits ran from zero to 54 minutes.
+            # Measured over 900 finished jobs, predicting total was wrong by 77%
+            # and predicting processing by 51%.
+            total = _number(sample.get("processing_seconds"))
             if duration is None or total is None or duration <= 0:
                 continue
             predictions.append(total * (target_duration / duration) ** 0.65)
