@@ -5,6 +5,7 @@ import contextlib
 import html
 import os
 import re
+import sqlite3
 import time
 import traceback
 from dataclasses import dataclass
@@ -38,6 +39,9 @@ class ProposalBotSettings:
     main_channel: str
     shame_channel: str
     karma_chat: str
+    # Read-only, and only to tell whether an author had premium when their video
+    # went out; the main bot owns this database.
+    premium_db: Path = Path("runs/premium/subscriptions.sqlite3")
     library_db: Path = Path("runs/library/library.sqlite3")
     library_dir: Path = Path("runs/library/videos")
 
@@ -58,6 +62,7 @@ def load_settings() -> ProposalBotSettings:
     return ProposalBotSettings(
         token=token,
         database=Path(os.environ.get("LALADUB_PROPOSAL_DB", "runs/proposal/proposals.sqlite3")),
+        premium_db=Path(os.environ.get("LALADUB_PREMIUM_DB", "runs/premium/subscriptions.sqlite3")),
         moderator_ids=moderator_ids,
         main_channel=os.environ.get("LALADUB_PROPOSAL_MAIN_CHANNEL", "@elevenlabss").strip() or "@elevenlabss",
         shame_channel=os.environ.get("LALADUB_PROPOSAL_SHAME_CHANNEL", "@ghienmigo").strip() or "@ghienmigo",
@@ -126,6 +131,34 @@ def main() -> None:
         group=1000,
     )
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+
+
+def _has_premium(context: Any, user_id: int) -> bool:
+    """Read straight from the main bot's subscription database.
+
+    The proposal bot is a separate process with no other view of premium, and
+    the file is opened read-only per call - the amount of traffic here is a
+    handful of lookups a day.
+    """
+    settings: ProposalBotSettings = context.application.bot_data["settings"]
+    path = settings.premium_db
+    if not path.is_file():
+        return False
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+        try:
+            row = connection.execute(
+                "SELECT 1 FROM subscriptions "
+                "WHERE user_id = ? AND status = 'active' AND expires_at > ? LIMIT 1",
+                (int(user_id), time.time()),
+            ).fetchone()
+        finally:
+            connection.close()
+    except Exception as exc:
+        # Never let this block a publication; the worst case is full karma.
+        print(f"Premium lookup failed for {user_id}: {type(exc).__name__}: {exc}", flush=True)
+        return False
+    return row is not None
 
 
 async def _post_init(application: Any) -> None:
@@ -875,7 +908,10 @@ async def _finish_and_publish(
     if duration_ms <= 0 and Path(claimed.video_path).is_file():
         duration_ms = max(0, round(await asyncio.to_thread(probe_duration, Path(claimed.video_path)) * 1000))
         claimed = await asyncio.to_thread(store.set_submission_duration, claimed.id, duration_ms)
-    award_milli = karma_milli_for_duration(duration_ms, destination)
+    # Whether the author had premium at the moment the video actually goes out,
+    # not when it was submitted: a post can sit in the queue for days.
+    premium = await asyncio.to_thread(_has_premium, context, claimed.user_id)
+    award_milli = karma_milli_for_duration(duration_ms, destination, premium=premium)
     new_message = None
     try:
         if target_chat is not None:

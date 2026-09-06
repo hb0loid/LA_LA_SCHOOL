@@ -32,7 +32,17 @@ KARMA_LEVELS = (
 PREMIUM_LEVEL = KarmaLevel(0, "Премиум подписка", 60, 10, 5)
 
 
-def karma_milli_for_duration(duration_ms: int, destination: str) -> int:
+# Premium already grants more than the top of the karma ladder - 60 minutes a
+# day against 20 - so karma earned while it is active does nothing until the
+# subscription lapses, and then locks in a rank bought rather than climbed. The
+# videos are real, so the karma is not withheld, only counted at the reduced
+# rate the shame channel already uses.
+PREMIUM_KARMA_SHARE = 0.2
+
+
+def karma_milli_for_duration(
+    duration_ms: int, destination: str, *, premium: bool = False
+) -> int:
     """Return thousandths of karma for a published video.
 
     Main channel awards one point per 10 seconds; the shame channel awards
@@ -42,7 +52,10 @@ def karma_milli_for_duration(duration_ms: int, destination: str) -> int:
     divisor = 10 if destination == "main" else 50 if destination == "shame" else 0
     if not divisor:
         return 0
-    return max(0, (duration_ms + divisor // 2) // divisor)
+    award = max(0, (duration_ms + divisor // 2) // divisor)
+    if premium:
+        award = int(round(award * PREMIUM_KARMA_SHARE))
+    return award
 
 
 def visible_karma(karma_milli: int) -> int:

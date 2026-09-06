@@ -77,6 +77,8 @@ try {
 
   $env:LALADUB_PROPOSAL_BOT_TOKEN = $ProposalBotToken
   $env:LALADUB_PROPOSAL_DB = (Join-Path $Root "runs\proposal\proposals.sqlite3")
+  # Read-only, to tell whether an author had premium when their video went out.
+  $env:LALADUB_PREMIUM_DB = (Join-Path $Root "runs\premium\subscriptions.sqlite3")
   $env:LALADUB_PROPOSAL_MODERATORS = "631551040"
   $env:LALADUB_PROPOSAL_MAIN_CHANNEL = "@elevenlabss"
   $env:LALADUB_PROPOSAL_SHAME_CHANNEL = "@ghienmigo"
