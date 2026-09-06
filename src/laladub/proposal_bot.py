@@ -331,6 +331,10 @@ def _schedule_settings_line(
 
 def _until_label(seconds: float) -> str:
     """How far off something is, in the roughest terms that are still useful."""
+    if seconds < -60:
+        # A slot in the past read as "через 1 мин", which is how a queue 46
+        # posts behind looked perfectly healthy.
+        return f"просрочен на {_until_label(-seconds).removeprefix('через ')}"
     seconds = max(0.0, seconds)
     if seconds < 3600:
         return f"через {max(1, int(seconds // 60))} мин"
@@ -629,7 +633,7 @@ async def send_due_scheduled_posts(context: Any) -> int:
         # Publishing that backlog back to back is the very thing the delay
         # exists to prevent, so keep honouring the spacing and let the rest
         # wait for their turn.
-        spacing = await asyncio.to_thread(store.post_interval_seconds)
+        spacing = await asyncio.to_thread(store.spacing_after_last_post, item.destination)
         last_sent = await asyncio.to_thread(store.last_published_at, item.destination)
         if last_sent is not None and time.time() - last_sent < spacing:
             continue

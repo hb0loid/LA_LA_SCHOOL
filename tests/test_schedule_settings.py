@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
+from contextlib import closing
 import time
 import unittest
 from datetime import datetime
@@ -216,6 +218,63 @@ class DynamicSpacingTests(unittest.TestCase):
         self._queue([1, 10, 1], start)
         self.store.reschedule_pending(interval_seconds=600, quiet=None, now=start)
         self.assertEqual(self._slots_minutes(), [0, 10, 20])
+
+
+class DeliveryPacingTests(unittest.TestCase):
+    """The delivery loop paces itself by this. It read the fixed interval even
+    in dynamic mode, so posts left every thirty minutes whatever the schedule
+    said, and the queue fell 46 posts behind while looking healthy."""
+
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.store = ProposalStore(Path(self._tempdir.name) / "proposals.sqlite3")
+
+    def _publish(self, duration_minutes: float) -> None:
+        self.store.create_submission(
+            job_number="7000",
+            user_id=1,
+            chat_id=1,
+            author_name="кто-то",
+            author_username=None,
+            video_path=Path("video.mp4"),
+            output_filename="video.mp4",
+            duration_ms=int(duration_minutes * 60_000),
+        )
+        # Marked published directly: the moderation handshake is not what is
+        # under test here, the pacing that follows a published post is.
+        # closing() as well as the transaction: on Windows an open handle
+        # blocks the temporary directory from being removed.
+        with closing(sqlite3.connect(self.store.path)) as connection, connection:
+            connection.execute(
+                "UPDATE submissions SET status='published', destination='main', "
+                "publication_message_id=5, updated_at=? WHERE id=1",
+                (time.time(),),
+            )
+
+    def test_fixed_mode_uses_the_interval(self) -> None:
+        self.store.set_post_interval_seconds(900)
+        self._publish(4)
+        self.assertEqual(self.store.spacing_after_last_post("main"), 900)
+
+    def test_dynamic_mode_uses_the_published_video(self) -> None:
+        self.store.set_post_mode("dynamic")
+        self.store.set_post_multiplier(7)
+        self._publish(4)
+        self.assertEqual(self.store.spacing_after_last_post("main"), 4 * 60 * 7)
+
+    def test_nothing_published_yet_falls_back(self) -> None:
+        self.store.set_post_mode("dynamic")
+        self.store.set_post_interval_seconds(600)
+        self.assertEqual(self.store.spacing_after_last_post("main"), 600)
+
+
+class OverdueLabelTests(unittest.TestCase):
+    def test_a_slot_in_the_past_says_so(self) -> None:
+        self.assertEqual(_until_label(-7200), "просрочен на 2 ч")
+
+    def test_a_slot_just_reached_is_not_called_overdue(self) -> None:
+        self.assertEqual(_until_label(-5), "через 1 мин")
 
 if __name__ == "__main__":
     unittest.main()

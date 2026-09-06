@@ -883,6 +883,36 @@ class ProposalStore:
         self._set_setting("post_multiplier", f"{value:g}")
         return value
 
+    def spacing_after_last_post(self, destination: str) -> float:
+        """How long to leave after the post that actually went out last.
+
+        The delivery loop paces itself by this, and it used to read the fixed
+        interval even in dynamic mode - so posts left every thirty minutes no
+        matter what the schedule said, and the queue fell 46 posts behind.
+        """
+        fixed = self.post_interval_seconds()
+        if self.post_mode() != "dynamic":
+            return fixed
+        return dynamic_gap(
+            self._last_published_duration_ms(destination),
+            self.post_multiplier(),
+            fallback_seconds=fixed,
+        )
+
+    def _last_published_duration_ms(self, destination: str) -> int | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT duration_ms FROM submissions
+                WHERE destination = ? AND publication_message_id IS NOT NULL
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (destination,),
+            ).fetchone()
+        if row is None or row["duration_ms"] is None:
+            return None
+        return int(row["duration_ms"])
+
     def _last_post_duration_ms(self, destination: str) -> int | None:
         """How long the video was that occupies the latest slot for this
         channel - published or merely queued, whichever is later."""
