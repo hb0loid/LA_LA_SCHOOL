@@ -238,6 +238,7 @@ def main() -> None:
     application.add_handler(CommandHandler("karma", karma_command))
     application.add_handler(CommandHandler("queue", queue_status, filters=private_chat))
     application.add_handler(CommandHandler("status", status_command, filters=private_chat))
+    application.add_handler(CommandHandler("break", break_command, filters=private_chat))
     application.add_handler(CommandHandler("resume", resume, filters=private_chat))
     application.add_handler(CommandHandler("send", send_to_proposal, filters=private_chat))
     application.add_handler(CommandHandler("censored", censored, filters=private_chat))
@@ -401,6 +402,39 @@ async def _telegram_error_handler(update: Any, context: Any) -> None:
         print("".join(traceback.format_exception(type(error), error, error.__traceback__)), flush=True)
 
 
+def _break_flag_path(settings: BotSettings) -> Path:
+    return settings.workdir / "break.flag"
+
+
+def break_until(settings: BotSettings) -> float | None:
+    """When the main PC's break ends, or None when it is not on one.
+
+    A break that has run out removes itself, so forgetting to end one costs an
+    hour rather than a night. `inf` is an open-ended break.
+    """
+    path = _break_flag_path(settings)
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    until = float("inf") if raw in {"", "0"} else _coerce_float(raw) or float("inf")
+    if until <= time.time():
+        path.unlink(missing_ok=True)
+        return None
+    return until
+
+
+def set_break(settings: BotSettings, until: float | None) -> None:
+    path = _break_flag_path(settings)
+    if until is None:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text("0" if until == float("inf") else f"{until:.0f}", encoding="utf-8")
+    temporary.replace(path)
+
+
 def _maintenance_flag_path(settings: BotSettings) -> Path:
     return settings.workdir / "maintenance.flag"
 
@@ -518,6 +552,7 @@ async def _setup_bot_commands(application: Any) -> None:
     # to admins alone, in their own chat scope.
     admin_only = [
         ("status", "Подробное состояние машин и очереди"),
+        ("break", "Перерыв: основной ПК не берёт работу"),
         ("maintenance", "Режим обслуживания"),
         ("censored", "Статистика цензуры"),
         ("reviews", "Отчёт по проверке текста"),
@@ -1365,6 +1400,10 @@ async def status_command(update: Any, context: Any) -> None:
     if report["maintenance"]:
         lines += ["⛔ <b>Режим обслуживания</b> — новые работы не стартуют", ""]
 
+    resting = break_until(settings)
+    if resting is not None:
+        lines += [f"⏸ <b>Перерыв</b> — основной ПК не берёт работу ({_break_label(resting)})", ""]
+
     lines.append("<b>Машины</b>")
     local_state = "занят" if report["local"] else "свободен"
     lines.append(f"💻 Основной ПК — {local_state}")
@@ -1447,6 +1486,68 @@ async def status_command(update: Any, context: Any) -> None:
         "\n".join(lines), parse_mode="HTML", reply_markup=_remove_reply_keyboard()
     )
 
+def _break_label(until: float) -> str:
+    if until == float("inf"):
+        return "без срока"
+    left = max(0.0, until - time.time())
+    if left < 3600:
+        return f"ещё {max(1, int(left // 60))} мин"
+    return f"ещё {left / 3600:.1f} ч".replace(".0", "")
+
+
+async def break_command(update: Any, context: Any) -> None:
+    """Frees the main PC while its owner is using it for something else.
+
+    Only this machine stops: the laptop goes on preparing jobs, so the queue
+    keeps moving and the work waiting for a voice simply piles up until the
+    break ends. A job already running is left to finish - killing it would throw
+    away the minutes already spent and it would have to be done again anyway.
+    """
+    settings: BotSettings = context.application.bot_data["settings"]
+    scheduler: _JobScheduler = context.application.bot_data["job_scheduler"]
+    user = update.effective_user
+    if user is None or not settings.is_admin(user.id):
+        return
+
+    args = [str(arg) for arg in (context.args or [])]
+    current = break_until(settings)
+    word = args[0].strip().lower() if args else ""
+
+    if word in {"off", "стоп", "выкл", "хватит"} or (not args and current is not None):
+        set_break(settings, None)
+        await scheduler.wake(_ApplicationContext(context.application))
+        await update.effective_message.reply_text(
+            "▶️ Перерыв окончен — основной ПК снова берёт работу.",
+            reply_markup=_remove_reply_keyboard(),
+        )
+        return
+
+    minutes = _coerce_float(word.rstrip("мmминh")) if word else None
+    if word and minutes is None:
+        await update.effective_message.reply_text(
+            "Не понял. /break — перерыв без срока, /break 30 — на 30 минут, "
+            "/break off — закончить.",
+            reply_markup=_remove_reply_keyboard(),
+        )
+        return
+
+    until = float("inf") if minutes is None else time.time() + max(1.0, minutes) * 60
+    set_break(settings, until)
+
+    live = await scheduler.snapshot()
+    lines = [f"⏸ Перерыв: основной ПК не берёт новых работ ({_break_label(until)})."]
+    if live["active_local"]:
+        lines.append("Начатая работа доделается — обрывать её значило бы считать её заново.")
+    if live["remote_workers_online"]:
+        lines.append("Ноутбук продолжает готовить работы, очередь не встанет.")
+    else:
+        lines.append("Ноутбук сейчас не на связи, так что очередь остановится совсем.")
+    lines.append("Закончить: /break off")
+    await update.effective_message.reply_text(
+        "\n".join(lines), reply_markup=_remove_reply_keyboard()
+    )
+
+
 async def queue_status(update: Any, context: Any) -> None:
     settings: BotSettings = context.application.bot_data["settings"]
     scheduler: _JobScheduler = context.application.bot_data["job_scheduler"]
@@ -1464,7 +1565,10 @@ async def queue_status(update: Any, context: Any) -> None:
 
     lines = [f"🎬 Сейчас в работе: {live['active_total']} из {live['max_active_jobs']}", ""]
 
+    resting = break_until(settings)
     local_state = "занят" if live["local_machine_busy"] else "свободен"
+    if resting is not None:
+        local_state += f", перерыв ({_break_label(resting)})"
     lines.append(f"💻 Основной ПК — {local_state} ({live['active_local']}/{live['max_local_jobs']})")
 
     if live["remote_workers_online"]:
@@ -3372,6 +3476,11 @@ class _JobScheduler:
             await self._dispatch_locked(context)
             await self._refresh_pending_locked()
 
+    async def wake(self, context: Any) -> None:
+        """Look for work to start again, after something stopped blocking it."""
+        async with self._lock:
+            await self._dispatch_locked(context)
+
     async def maintenance_changed(self, context: Any) -> None:
         interrupted = 0
         async with self._lock:
@@ -3767,6 +3876,10 @@ class _JobScheduler:
         if self._active_total >= self._settings.max_active_jobs:
             return False
         if _maintenance_enabled(self._settings) and not self._settings.is_admin(item.user_id):
+            return False
+        if execution_kind == "local" and break_until(self._settings) is not None:
+            # The person is using this machine for something else. The laptop
+            # keeps preparing, so the queue moves on rather than stopping dead.
             return False
         if execution_kind == "remote" and not self._worker_may_take(item, engines):
             return False

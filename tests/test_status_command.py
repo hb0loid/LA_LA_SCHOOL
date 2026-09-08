@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from laladub.bot import _status_job_line, status_command
@@ -17,7 +19,9 @@ class _Message:
 
 def _run(report: dict[str, object], *, admin: bool = True) -> str | None:
     message = _Message()
-    settings = SimpleNamespace(is_admin=lambda user_id: admin)
+    # A real workdir: /status now reports whether the main PC is on a break,
+    # which is read from a flag file there.
+    settings = SimpleNamespace(is_admin=lambda user_id: admin, workdir=Path(tempfile.gettempdir()))
     scheduler = SimpleNamespace(status_report=lambda: _as_coro(report))
     context = SimpleNamespace(
         application=SimpleNamespace(
