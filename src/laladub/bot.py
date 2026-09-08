@@ -3421,12 +3421,14 @@ class _JobScheduler:
                 )
                 await self._fallback_remote_preprocess(context, item, "worker heartbeat timed out")
 
-    async def lease_remote(self, context: Any, worker_id: str) -> dict[str, Any] | None:
+    async def lease_remote(
+        self, context: Any, worker_id: str, engines: frozenset[str] | None = None
+    ) -> dict[str, Any] | None:
         async with self._lock:
             if self._settings.executor_mode not in {"remote", "hybrid"}:
                 raise RuntimeError("Remote workers are disabled. Set LALADUB_EXECUTOR_MODE=remote or hybrid.")
-            self._mark_remote_worker_locked(worker_id, active_job_id=None)
-            index = self._next_startable_index(execution_kind="remote")
+            self._mark_remote_worker_locked(worker_id, active_job_id=None, engines=engines)
+            index = self._next_startable_index(execution_kind="remote", engines=engines)
             if index is None:
                 return None
             _, _, item = self._pending.pop(index)
@@ -3434,7 +3436,7 @@ class _JobScheduler:
             self._active_total += 1
             if item.user_id is not None:
                 self._active_by_user[item.user_id] = self._active_by_user.get(item.user_id, 0) + 1
-            remote_stage = _remote_stage_for_job(item.job)
+            remote_stage = _remote_stage_for_job(item.job, engines)
             item.worker_id = worker_id
             item.execution_kind = "remote_preprocess" if remote_stage == "preprocess" else "remote"
             item.remote_last_seen_at = time.time()
@@ -3731,11 +3733,13 @@ class _JobScheduler:
             return False
         return self._active_total < self._settings.max_active_jobs
 
-    def _next_startable_index(self, *, execution_kind: str) -> int | None:
+    def _next_startable_index(
+        self, *, execution_kind: str, engines: frozenset[str] | None = None
+    ) -> int | None:
         best_index: int | None = None
         best_key: tuple[int, int] | None = None
         for index, (priority, sequence, item) in enumerate(self._pending):
-            if not self._can_start(item, execution_kind=execution_kind):
+            if not self._can_start(item, execution_kind=execution_kind, engines=engines):
                 continue
             key = (priority, sequence)
             if best_key is None or key < best_key:
@@ -3743,12 +3747,18 @@ class _JobScheduler:
                 best_key = key
         return best_index
 
-    def _can_start(self, item: _QueuedJob, *, execution_kind: str) -> bool:
+    def _can_start(
+        self,
+        item: _QueuedJob,
+        *,
+        execution_kind: str,
+        engines: frozenset[str] | None = None,
+    ) -> bool:
         if self._active_total >= self._settings.max_active_jobs:
             return False
         if _maintenance_enabled(self._settings) and not self._settings.is_admin(item.user_id):
             return False
-        if execution_kind == "remote" and _target_lang_value(item.job.get("target_lang")) != "ru":
+        if execution_kind == "remote" and not self._worker_may_take(item, engines):
             return False
         if execution_kind == "remote" and (
             item.job.get("force_local") or item.job.get("remote_preprocess_completed_at")
@@ -3759,13 +3769,45 @@ class _JobScheduler:
             and self._settings.executor_mode == "hybrid"
             and not item.job.get("force_local")
             and not item.job.get("remote_preprocess_completed_at")
-            and _remote_stage_for_job(item.job) == "preprocess"
+            and _remote_stage_for_job(item.job, self._idle_worker_engines_locked()) == "preprocess"
             and self._remote_worker_counts_locked()["idle"] > 0
         ):
             return False
         if item.user_id is None:
             return True
         return self._active_by_user.get(item.user_id, 0) < self._settings.max_active_jobs_per_user
+
+    def _worker_may_take(self, item: _QueuedJob, engines: frozenset[str] | None) -> bool:
+        """Whether a remote worker is allowed this job at all.
+
+        This used to be "Russian only" - a blunt stand-in for "the worker cannot
+        voice it", written when the worker had no engines. It refused exactly the
+        Ukrainian jobs the worker could have finished by itself, and English ones
+        it could at least have prepared. What matters is whether it can do the
+        preparation, which is language-independent, or the whole job.
+        """
+        stage = _remote_stage_for_job(item.job, engines)
+        if stage == "preprocess":
+            return True
+        return engines is not None and effective_tts_provider(item.job) in engines
+
+    def _idle_worker_engines_locked(self) -> frozenset[str] | None:
+        """What the idle workers between them can voice, for the local guard.
+
+        The main PC defers a job to an idle worker; it should only defer one the
+        worker can actually move forward.
+        """
+        found: set[str] = set()
+        seen = False
+        now = time.time()
+        for state in self._remote_workers.values():
+            if state.get("active_job_id"):
+                continue
+            if now - float(state.get("last_seen") or 0.0) > self._remote_worker_ttl:
+                continue
+            seen = True
+            found.update(state.get("engines") or ())
+        return frozenset(found) if seen else None
 
     async def _run_item(self, context: Any, item: _QueuedJob) -> None:
         interrupted = False
@@ -3986,11 +4028,21 @@ class _JobScheduler:
         state.setdefault("active_job_id", None)
         self._remote_workers[name] = state
 
-    def _mark_remote_worker_locked(self, worker_id: str, *, active_job_id: str | None) -> None:
+    def _mark_remote_worker_locked(
+        self,
+        worker_id: str,
+        *,
+        active_job_id: str | None,
+        engines: frozenset[str] | None = None,
+    ) -> None:
         worker_id = str(worker_id or "worker").strip() or "worker"
         state = self._remote_workers.get(worker_id, {})
         state["last_seen"] = time.time()
         state["active_job_id"] = active_job_id
+        if engines is not None:
+            # Only a lease request carries this; a progress post must not erase
+            # what the worker told us when it asked for the job.
+            state["engines"] = frozenset(engines)
         self._remote_workers[worker_id] = state
 
     def _worker_moved_on_locked(self, item: _QueuedJob) -> bool:
@@ -4187,11 +4239,43 @@ def _remote_job_payload(job: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _remote_stage_for_job(job: dict[str, Any]) -> str:
+# The heavy engines are the ones that were only ever installed on the main PC.
+# A worker that has one can finish the job itself; one that has not can still do
+# everything up to the voice.
+PREPROCESS_ENGINES = frozenset({"qwen3", "cosyvoice", "moss"})
+
+
+def effective_tts_provider(job: dict[str, Any], default: str = "moss") -> str:
+    """Which engine will really voice this job.
+
+    MOSS speaks Russian and English but not Ukrainian, so a Ukrainian job asking
+    for a heavy engine is voiced by F5 instead. Deciding that in one place means
+    the scheduler and the pipeline cannot disagree about it.
+    """
+    provider = _tts_provider_value(job.get("tts_provider")) or default
+    if _target_lang_value(job.get("target_lang")) == "uk" and provider in PREPROCESS_ENGINES:
+        return "f5"
+    return provider
+
+
+def _remote_stage_for_job(job: dict[str, Any], engines: frozenset[str] | None = None) -> str:
+    """Whether a worker can finish this job or only prepare it.
+
+    `engines` is what the worker reported it has installed. Without it the old
+    assumption holds - the heavy engines live on the main PC alone - which is
+    what a worker that has not told us anything gets.
+    """
     if str(job.get("mode") or "dub") == "raw_text":
         return "complete"
-    provider = _tts_provider_value(job.get("tts_provider")) or "moss"
-    return "preprocess" if provider in {"qwen3", "cosyvoice", "moss"} else "complete"
+    provider = effective_tts_provider(job)
+    if engines is None:
+        # An older worker tells us nothing, so fall back to where the engines
+        # were known to live: the heavy ones on the main PC.
+        return "preprocess" if provider in PREPROCESS_ENGINES else "complete"
+    # Knowing what it has, the question is simply whether it has this one. A
+    # worker missing the engine can still do everything up to the voice - which
+    # is more useful than handing it a job it would fail at the last step.
+    return "complete" if provider in engines else "preprocess"
 
 
 def _safe_upload_name(value: str) -> str:

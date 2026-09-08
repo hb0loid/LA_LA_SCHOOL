@@ -82,7 +82,15 @@ class _WorkerRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/v1/jobs/lease":
                 query = urllib.parse.parse_qs(parsed.query)
                 worker_id = (query.get("worker_id") or ["worker"])[0]
-                result = self._run_coro(self._scheduler().lease_remote(self.server.context, worker_id))
+                raw_engines = (query.get("engines") or [""])[0]
+                engines = (
+                    frozenset(part.strip().lower() for part in raw_engines.split(",") if part.strip())
+                    if raw_engines
+                    else None
+                )
+                result = self._run_coro(
+                    self._scheduler().lease_remote(self.server.context, worker_id, engines)
+                )
                 if result is None:
                     self.send_response(204)
                     self.end_headers()

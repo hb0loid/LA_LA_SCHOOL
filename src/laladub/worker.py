@@ -63,7 +63,12 @@ def main(argv: list[str] | None = None) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     client.contact_path = _start_stall_heartbeat(workdir)
     _ensure_windows_autostart()
-    print(f"LaLaDub worker started: id={worker_id} server={server} workdir={workdir}", flush=True)
+    engines = ",".join(installed_engines(load_bot_settings(require_token=False)))
+    print(
+        f"LaLaDub worker started: id={worker_id} server={server} workdir={workdir} "
+        f"engines={engines or 'нет'}",
+        flush=True,
+    )
     try:
         _report_startup_logs(client, workdir)
     except Exception as exc:
@@ -75,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
 
     while True:
         try:
-            lease = client.lease(worker_id)
+            lease = client.lease(worker_id, engines)
             if lease is None:
                 if args.auto_update and _remote_update_available(client):
                     print("Worker update is available. Restarting through launcher.", flush=True)
@@ -128,8 +133,13 @@ class CoordinatorClient:
         if self._parsed.scheme not in {"http", "https"}:
             raise ValueError("Worker server must be http:// or https:// URL.")
 
-    def lease(self, worker_id: str) -> dict[str, Any] | None:
+    def lease(self, worker_id: str, engines: str = "") -> dict[str, Any] | None:
         path = f"/api/v1/jobs/lease?worker_id={urllib.parse.quote(worker_id)}"
+        if engines:
+            # What this machine can actually voice with. Without it the
+            # coordinator has to guess, and a guess is wrong the moment an
+            # engine is installed on one machine and not the other.
+            path += f"&engines={urllib.parse.quote(engines)}"
         response = self._request_json("GET", path, none_on_204=True)
         if response is None:
             return None
@@ -506,6 +516,34 @@ def _start_stall_heartbeat(workdir: Path) -> Path:
     except Exception:
         pass
     return path
+
+
+def installed_engines(settings: BotSettings) -> list[str]:
+    """Which voicing engines this machine can really run.
+
+    Checked by looking for the interpreter and the model directory rather than
+    trusting configuration: every engine here is an external environment that
+    may simply not have been installed on this machine.
+    """
+    found: list[str] = []
+    if _usable(settings.moss_python) and _usable(settings.moss_model_dir):
+        found.append("moss")
+    if _usable(settings.f5_python):
+        found.append("f5")
+    if _usable(settings.cosyvoice_python) and _usable(settings.cosyvoice_model_dir):
+        found.append("cosyvoice")
+    if _usable(settings.qwen3_python):
+        found.append("qwen3")
+    return found
+
+
+def _usable(path: Any) -> bool:
+    if not path:
+        return False
+    try:
+        return Path(str(path)).exists()
+    except Exception:
+        return False
 
 
 def _lease_heartbeat_loop(client: CoordinatorClient, job_id: str, stop: threading.Event) -> None:
