@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import tempfile
+from contextlib import closing
+import time
+import sqlite3
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +11,7 @@ from unittest.mock import patch
 
 from laladub.bot import _reserve_daily_allowance
 from laladub.premium_store import PremiumStore
+from laladub.karma import WELCOME_ALLOWANCE_MINUTES
 from laladub.proposal_store import ProposalStore
 
 
@@ -32,6 +36,20 @@ class DailyQuotaTrimTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             store = ProposalStore(root / "proposal.sqlite3")
+            # A newcomer who spent the one-off welcome allowance yesterday: it
+            # counts against their lifetime, so it is gone, but it has aged out
+            # of the rolling day and no longer occupies the daily limit.
+            store.reserve_daily_usage(
+                user_id=123,
+                job_number="welcome",
+                duration_ms=WELCOME_ALLOWANCE_MINUTES * 60_000,
+                limit_ms=WELCOME_ALLOWANCE_MINUTES * 60_000,
+            )
+            with closing(sqlite3.connect(store.path)) as connection, connection:
+                connection.execute(
+                    "UPDATE daily_usage SET created_at = ? WHERE job_number = 'welcome'",
+                    (time.time() - 2 * 86400,),
+                )
             store.reserve_daily_usage(
                 user_id=123,
                 job_number="previous",

@@ -702,6 +702,19 @@ class ProposalStore:
             ).fetchone()
         return int(row["used"] or 0) if row is not None else 0
 
+    def lifetime_usage_ms(self, user_id: int) -> int:
+        """Everything this person has ever spent, for the one-off allowance.
+
+        Deliberately not the rolling window: the allowance is spent once and
+        never comes back, so it has to be measured against all of history.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(SUM(duration_ms), 0) AS used FROM daily_usage WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        return int(row["used"] or 0) if row is not None else 0
+
     def next_usage_free_at(self, user_id: int, now: float | None = None) -> float | None:
         """When the oldest usage still counted against the rolling window will age out
         (freeing up whatever it was holding). None if the user has no usage in-window."""

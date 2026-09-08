@@ -30,7 +30,7 @@ from .ffmpeg import (
     probe_video_dimensions,
     trim_video,
 )
-from .karma import KARMA_SCALE, PREMIUM_LEVEL, KarmaLevel, level_for_karma, next_level_for_karma, visible_karma
+from .karma import WELCOME_ALLOWANCE_MINUTES, KARMA_SCALE, PREMIUM_LEVEL, KarmaLevel, level_for_karma, next_level_for_karma, visible_karma
 from .karma_command import karma_command
 from .asr import clear_openai_whisper_cache
 from .library import LibraryStore, show_command
@@ -435,6 +435,15 @@ def set_break(settings: BotSettings, until: float | None) -> None:
     temporary.replace(path)
 
 
+def daily_limit_ms(level: KarmaLevel, lifetime_used_ms: int) -> int:
+    """The person's daily allowance, including whatever is left of the one-off
+    welcome allowance. Spent once, against all of their history, never renewed.
+    """
+    welcome_ms = WELCOME_ALLOWANCE_MINUTES * 60_000
+    remaining_welcome = max(0, welcome_ms - max(0, int(lifetime_used_ms)))
+    return level.daily_minutes * 60_000 + remaining_welcome
+
+
 def _maintenance_flag_path(settings: BotSettings) -> Path:
     return settings.workdir / "maintenance.flag"
 
@@ -627,7 +636,8 @@ async def _daily_quota_reminder_loop(application: Any) -> None:
                     continue
                 karma_milli = await asyncio.to_thread(store.karma_total, user_id)
                 level, _subscription = await asyncio.to_thread(_effective_level, premium_store, user_id, karma_milli)
-                limit_ms = level.daily_minutes * 60_000
+                lifetime_ms = await asyncio.to_thread(store.lifetime_usage_ms, user_id)
+                limit_ms = daily_limit_ms(level, lifetime_ms)
                 used_ms = await asyncio.to_thread(store.daily_usage_ms, user_id, now)
                 if used_ms >= limit_ms:
                     still_capped.add(user_id)
@@ -1304,7 +1314,9 @@ async def me(update: Any, context: Any) -> None:
         lines.extend(["", "Лимит перевода: без ограничений", "Приоритет: премиум"])
     else:
         used_ms = await asyncio.to_thread(store.daily_usage_ms, user.id) if store is not None else 0
-        limit_ms = level.daily_minutes * 60_000
+        lifetime_ms = await asyncio.to_thread(store.lifetime_usage_ms, user.id) if store is not None else 0
+        limit_ms = daily_limit_ms(level, lifetime_ms)
+        welcome_left = max(0, limit_ms - level.daily_minutes * 60_000)
         lines.extend(
             [
                 "",
@@ -1314,6 +1326,12 @@ async def me(update: Any, context: Any) -> None:
                 f"Лимит задач в очереди: {level.queue_limit}",
             ]
         )
+        if welcome_left:
+            # Say it plainly, or the extra minutes look like a bug in the limit.
+            lines.append(
+                f"Из них стартовый запас новичка: {_format_duration_ms(welcome_left)} "
+                "(разово, не восстанавливается)"
+            )
         free_at = await asyncio.to_thread(store.next_usage_free_at, user.id) if store is not None else None
         if free_at is not None:
             lines.append(f"Начнёт освобождаться: {datetime.fromtimestamp(free_at).strftime('%H:%M %d.%m')}")
@@ -2868,7 +2886,8 @@ async def _reserve_daily_allowance(
     karma_milli = await asyncio.to_thread(store.karma_total, user_id)
     premium_store: PremiumStore | None = context.application.bot_data.get("premium_store")
     level, _subscription = await asyncio.to_thread(_effective_level, premium_store, user_id, karma_milli)
-    limit_ms = level.daily_minutes * 60_000
+    lifetime_ms = await asyncio.to_thread(store.lifetime_usage_ms, user_id)
+    limit_ms = daily_limit_ms(level, lifetime_ms)
     accepted, used_ms = await asyncio.to_thread(
         store.reserve_daily_usage,
         user_id=user_id,

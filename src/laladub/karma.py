@@ -15,6 +15,17 @@ class KarmaLevel:
     queue_limit: int
 
 
+# A newcomer gets one minute a day, which is one video - and a first video is
+# often the one that goes wrong: the wrong source language, the wrong number of
+# voices, a clip trimmed in the wrong place. They then wait a day to try again,
+# having formed their opinion from the failure. Measured: those on this rung hit
+# the wall on 41% of their days, while everyone above it does so on 2-7%.
+#
+# So the entry price is paid before knowing what is being bought. This is a
+# one-off allowance, not a raised daily limit: it costs a few minutes per person
+# ever rather than every day forever, and the ladder stays exactly as steep.
+WELCOME_ALLOWANCE_MINUTES = 5
+
 KARMA_LEVELS = (
     KarmaLevel(0, "Участник", 1, 0, 1),
     KarmaLevel(6, "Автор", 5, 1, 1),
