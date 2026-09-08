@@ -88,6 +88,16 @@ def performance_record(job_dir: Path, job: dict[str, Any]) -> dict[str, Any] | N
         queued_at = started_at
     total_seconds = finished_at - queued_at if queued_at is not None else None
     processing_seconds = finished_at - started_at if started_at is not None else None
+    # A split job waits again between the laptop finishing preparation and this
+    # machine reaching the voice, and that wait is queueing, not work. Counting
+    # it as work made one 13-second video look like 1503 seconds of computation
+    # when 1288 of them were spent waiting - and the runtime estimate is built
+    # from this number.
+    # It stays inside total_seconds either way: the person really did wait for
+    # it. It simply belongs on the queue side of the split, not the work side.
+    handover = _handover_seconds(job)
+    if processing_seconds is not None and handover:
+        processing_seconds = max(0.0, processing_seconds - handover)
     if total_seconds is not None and total_seconds < 0:
         total_seconds = None
     if processing_seconds is not None and processing_seconds < 0:
@@ -102,10 +112,11 @@ def performance_record(job_dir: Path, job: dict[str, Any]) -> dict[str, Any] | N
         "mode": str(job.get("mode") or "dub"),
         "duration_seconds": job_duration_seconds(job),
         "queue_seconds": (
-            max(0.0, started_at - queued_at)
+            max(0.0, started_at - queued_at) + handover
             if queued_at is not None and started_at is not None
             else None
         ),
+        "handover_seconds": round(handover, 3) if handover else None,
         "processing_seconds": processing_seconds,
         "total_seconds": total_seconds,
         "tts": str(job.get("tts_provider") or ""),
@@ -123,6 +134,19 @@ def performance_record(job_dir: Path, job: dict[str, Any]) -> dict[str, Any] | N
         "initial_eta_samples": int(_number(job.get("initial_eta_samples")) or 0),
         "error_type": error_text.split(":", 1)[0][:120] if error_text else "",
     }
+
+
+def _handover_seconds(job: dict[str, Any]) -> float:
+    """How long a split job sat between preparation and voicing.
+
+    The worker hands the package back and the job returns to the queue until
+    this machine has a free slot. Real waiting for the person, but not work.
+    """
+    finished = _number(job.get("remote_preprocess_completed_at"))
+    resumed = _number(job.get("local_continuation_started_at"))
+    if finished is None or resumed is None:
+        return 0.0
+    return max(0.0, resumed - finished)
 
 
 def record_terminal_job(job_dir: Path, job: dict[str, Any]) -> None:
