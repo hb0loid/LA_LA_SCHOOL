@@ -1492,8 +1492,10 @@ async def queue_status(update: Any, context: Any) -> None:
         lines.append(waiting)
     else:
         lines.append("⏳ Очередь пуста")
+    # Counted across waiting and running both, so it can exceed the waiting
+    # count on the line above - which read as an error until it said so.
     busy_users = live.get("busy_users", live["active_users"])
-    lines.append(f"👤 Пользователей с задачами: {busy_users}")
+    lines.append(f"👤 Авторов в очереди и в работе: {busy_users}")
 
     # Anything on disk that the live scheduler does not know about is a job left
     # behind by a restart - that is the only part of the file scan worth showing.
