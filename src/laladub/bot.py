@@ -6,6 +6,7 @@ import hashlib
 import heapq
 import html
 import json
+import os
 import math
 import multiprocessing
 import re
@@ -3737,11 +3738,20 @@ class _JobScheduler:
         self, *, execution_kind: str, engines: frozenset[str] | None = None
     ) -> int | None:
         best_index: int | None = None
-        best_key: tuple[int, int] | None = None
+        best_key: tuple[int, int, int] | None = None
         for index, (priority, sequence, item) in enumerate(self._pending):
             if not self._can_start(item, execution_kind=execution_kind, engines=engines):
                 continue
-            key = (priority, sequence)
+            # The main PC is the only machine that voices, and voicing is what
+            # the queue waits on. A job it picks up from scratch is a job the
+            # laptop could have prepared meanwhile, so finished preparation
+            # comes first here and fresh work only when there is none.
+            waiting_for_voice = (
+                0
+                if execution_kind == "local" and item.job.get("remote_preprocess_completed_at")
+                else 1
+            )
+            key = (waiting_for_voice, priority, sequence)
             if best_key is None or key < best_key:
                 best_index = index
                 best_key = key
@@ -4244,6 +4254,13 @@ def _remote_job_payload(job: dict[str, Any]) -> dict[str, Any]:
 # everything up to the voice.
 PREPROCESS_ENGINES = frozenset({"qwen3", "cosyvoice", "moss"})
 
+# Measured over 495 short jobs: the main PC voices at about 7 seconds of work
+# per second of video, the laptop at 60. It is a fine machine for everything
+# before the voice and a poor one for the voice itself, so by default it is
+# given everything else and the voicing stays here. Set to 1 to let workers
+# voice too, once one exists that is good at it.
+WORKER_MAY_VOICE = os.environ.get("LALADUB_WORKER_VOICING", "0") == "1"
+
 
 def effective_tts_provider(job: dict[str, Any], default: str = "moss") -> str:
     """Which engine will really voice this job.
@@ -4267,14 +4284,14 @@ def _remote_stage_for_job(job: dict[str, Any], engines: frozenset[str] | None = 
     """
     if str(job.get("mode") or "dub") == "raw_text":
         return "complete"
+    if not WORKER_MAY_VOICE:
+        # Everything but the voice. Applies whatever engine the job wants, so a
+        # Ukrainian job on F5 is prepared remotely as well - which the old
+        # "Russian only" rule refused outright.
+        return "preprocess"
     provider = effective_tts_provider(job)
     if engines is None:
-        # An older worker tells us nothing, so fall back to where the engines
-        # were known to live: the heavy ones on the main PC.
         return "preprocess" if provider in PREPROCESS_ENGINES else "complete"
-    # Knowing what it has, the question is simply whether it has this one. A
-    # worker missing the engine can still do everything up to the voice - which
-    # is more useful than handing it a job it would fail at the last step.
     return "complete" if provider in engines else "preprocess"
 
 

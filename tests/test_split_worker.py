@@ -23,10 +23,13 @@ class SplitWorkerTests(unittest.TestCase):
         self.assertEqual(accelerated.artifact_whisper_device, "cuda")
         self.assertEqual(settings.artifact_whisper_device, "cpu")
 
-    def test_moss_job_uses_remote_preprocessing(self) -> None:
+    def test_a_dub_is_prepared_remotely_and_voiced_here(self) -> None:
+        """F5 used to be voiced remotely as well. It is not any more: the laptop
+        voices at about 60 seconds of work per second of video against the main
+        PC's 7, so the voice stays here whatever engine the job asks for."""
         self.assertEqual(_remote_stage_for_job({"mode": "dub", "tts_provider": "moss"}), "preprocess")
         self.assertEqual(_remote_stage_for_job({"mode": "dub"}), "preprocess")
-        self.assertEqual(_remote_stage_for_job({"mode": "dub", "tts_provider": "f5"}), "complete")
+        self.assertEqual(_remote_stage_for_job({"mode": "dub", "tts_provider": "f5"}), "preprocess")
         self.assertEqual(_remote_stage_for_job({"mode": "raw_text", "tts_provider": "moss"}), "complete")
 
     def test_preprocess_manifest_names_bundle(self) -> None:

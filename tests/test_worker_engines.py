@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 
+import unittest.mock
+
 from laladub.bot import PREPROCESS_ENGINES, _remote_stage_for_job, effective_tts_provider
 
 
@@ -24,9 +26,29 @@ class EffectiveEngineTests(unittest.TestCase):
         self.assertEqual(effective_tts_provider(job), "f5")
 
 
+class VoicingStaysHomeTests(unittest.TestCase):
+    """Measured over 495 short jobs: the main PC voices at about 7 seconds of
+    work per second of video, the laptop at 60. So by default the laptop gets
+    everything except the voice, whatever engine the job asks for."""
+
+    def test_a_dub_is_only_ever_prepared_remotely(self) -> None:
+        for target, engines in (("ru", frozenset({"moss"})), ("uk", frozenset({"f5"}))):
+            job = {"tts_provider": "moss", "target_lang": target}
+            self.assertEqual(_remote_stage_for_job(job, engines), "preprocess")
+
+    def test_raw_text_needs_no_voice_and_goes_whole(self) -> None:
+        job = {"mode": "raw_text", "tts_provider": "moss", "target_lang": "ru"}
+        self.assertEqual(_remote_stage_for_job(job, frozenset()), "complete")
+
+
 class RemoteStageTests(unittest.TestCase):
-    """A worker that has the engine can finish the job; one that has not can
-    still do everything up to the voice."""
+    """With voicing allowed on workers: one that has the engine finishes the
+    job, one that has not still does everything up to the voice."""
+
+    def setUp(self) -> None:
+        patcher = unittest.mock.patch("laladub.bot.WORKER_MAY_VOICE", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_a_worker_without_the_engine_only_prepares(self) -> None:
         job = {"tts_provider": "moss", "target_lang": "ru"}
@@ -54,6 +76,40 @@ class RemoteStageTests(unittest.TestCase):
     def test_the_heavy_engines_are_the_ones_split(self) -> None:
         self.assertEqual(PREPROCESS_ENGINES, frozenset({"moss", "cosyvoice", "qwen3"}))
 
+
+
+class VoicingFirstTests(unittest.TestCase):
+    """The main PC is the only machine that voices, and voicing is what the
+    queue waits on. A job it starts from scratch is a job the laptop could have
+    prepared meanwhile, so finished preparation goes first."""
+
+    def _key(self, *, local: bool, preprocessed: bool, priority: int, sequence: int):
+        from types import SimpleNamespace
+
+        item = SimpleNamespace(
+            job={"remote_preprocess_completed_at": 123.0 if preprocessed else None}
+        )
+        waiting_for_voice = (
+            0 if local and item.job.get("remote_preprocess_completed_at") else 1
+        )
+        return (waiting_for_voice, priority, sequence)
+
+    def test_a_prepared_job_beats_a_fresh_one_locally(self) -> None:
+        prepared = self._key(local=True, preprocessed=True, priority=100, sequence=99)
+        fresh = self._key(local=True, preprocessed=False, priority=100, sequence=1)
+        self.assertLess(prepared, fresh)
+
+    def test_premium_still_wins_among_jobs_needing_a_voice(self) -> None:
+        """Paying users go first; this reorders machines, not people."""
+        premium = self._key(local=True, preprocessed=True, priority=0, sequence=50)
+        ordinary = self._key(local=True, preprocessed=True, priority=100, sequence=1)
+        self.assertLess(premium, ordinary)
+
+    def test_the_worker_is_unaffected_by_it(self) -> None:
+        """It never voices, so preparation state must not reorder its queue."""
+        prepared = self._key(local=False, preprocessed=True, priority=100, sequence=99)
+        fresh = self._key(local=False, preprocessed=False, priority=100, sequence=1)
+        self.assertLess(fresh, prepared)
 
 if __name__ == "__main__":
     unittest.main()
