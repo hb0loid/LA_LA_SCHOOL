@@ -1177,9 +1177,12 @@ def _moderation_caption(submission: Submission, *, transcript: str | None = None
         "shame": "Ghien Mi Go",
         "rejected": "Не публиковать",
     }
+    # One number, not two. The other was the submissions table's row id, which
+    # counts something a person never refers to - every command here takes the
+    # job number, and the two could never line up anyway since not every job is
+    # submitted.
     lines = [
-        f"<b>Предложка №{submission.id}</b>",
-        f"Работа №{html.escape(submission.job_number)}",
+        f"🎬 <b>Работа №{html.escape(submission.job_number)}</b>",
         _author_caption(submission),
         f"Карма на момент отправки: {visible_karma(submission.karma_before_milli)}",
         f"Статус: {status_labels.get(submission.status, html.escape(submission.status))}",
@@ -1214,7 +1217,10 @@ def _author_caption(submission: Submission) -> str:
         href = f"https://t.me/{html.escape(submission.author_username.lstrip('@'), quote=True)}"
     else:
         href = f"tg://user?id={submission.user_id}"
-    return f'Прислал <a href="{href}">{name}</a>'
+    # Bold and on its own icon: the name used to sit in the middle of four
+    # similar-looking lines, which is no use when the cards arrive in a stream
+    # and the author is the first thing a moderator looks for.
+    return f'👤 <b><a href="{href}">{name}</a></b>'
 
 
 def _publication_caption(submission: Submission) -> str:

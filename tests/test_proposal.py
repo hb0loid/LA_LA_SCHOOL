@@ -274,7 +274,11 @@ class ProposalUiTests(unittest.TestCase):
             updated_at=0,
         )
         caption = _author_caption(submission)
-        self.assertEqual(caption, 'Прислал <a href="https://t.me/hboloid">макщ &lt;3</a>')
+        # Bold and iconned: in a stream of cards the author is the first thing
+        # a moderator looks for, and it used to sit among four similar lines.
+        self.assertEqual(
+            caption, '👤 <b><a href="https://t.me/hboloid">макщ &lt;3</a></b>'
+        )
 
     def test_moderation_buttons_have_expected_order(self) -> None:
         keyboard = _moderation_keyboard(7).inline_keyboard

@@ -31,7 +31,7 @@ class ProposalCommentTests(unittest.TestCase):
             self.assertEqual(submission.author_comment, "Смешной <момент> & финал")
             caption = _publication_caption(submission)
             self.assertTrue(caption.startswith("Смешной &lt;момент&gt; &amp; финал\n\n"))
-            self.assertIn("Прислал", caption)
+            self.assertIn("👤", caption)
 
     def test_finished_job_keyboard_has_comment_then_submit(self) -> None:
         keyboard = _proposal_keyboard("42").inline_keyboard
