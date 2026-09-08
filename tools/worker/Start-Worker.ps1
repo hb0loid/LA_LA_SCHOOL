@@ -315,7 +315,20 @@ function Configure-ModelCaches {
 }
 
 if (-not $env:LALADUB_TRANSLATOR) { $env:LALADUB_TRANSLATOR = "hybrid" }
-if (-not $env:LALADUB_TTS) { $env:LALADUB_TTS = "cosyvoice" }
+# Matches the coordinator: a job must not come out differently depending on
+# which machine voiced it. The job carries its own engine anyway; this is only
+# the fallback when it does not.
+if (-not $env:LALADUB_TTS) { $env:LALADUB_TTS = "moss" }
+
+# Where MOSS lives on a worker, if it is installed at all. Set as defaults so an
+# update cannot overwrite them, and overridable by a user environment variable
+# when the models already sit somewhere else on that machine. The worker reports
+# the engine as available only when these paths actually exist.
+if (-not $env:LALADUB_MOSS_PYTHON) { $env:LALADUB_MOSS_PYTHON = (Join-Path $Root ".venv-moss\Scripts\python.exe") }
+if (-not $env:LALADUB_MOSS_MODEL_DIR) { $env:LALADUB_MOSS_MODEL_DIR = (Join-Path $Root "models\moss\MOSS-TTS-Local-Transformer-v1.5") }
+if (-not $env:LALADUB_MOSS_CODEC_DIR) { $env:LALADUB_MOSS_CODEC_DIR = (Join-Path $Root "models\moss\MOSS-Audio-Tokenizer-v2") }
+if (-not $env:LALADUB_MOSS_DEVICE) { $env:LALADUB_MOSS_DEVICE = "auto" }
+if (-not $env:LALADUB_MOSS_TIMEOUT_SECONDS) { $env:LALADUB_MOSS_TIMEOUT_SECONDS = "1800" }
 if (-not $env:LALADUB_F5_PYTHON) { $env:LALADUB_F5_PYTHON = (Join-Path $Root ".venv-f5tts\Scripts\python.exe") }
 if (-not $env:LALADUB_F5_MODEL) { $env:LALADUB_F5_MODEL = "F5TTS_v1_Base" }
 if (-not $env:LALADUB_F5_HF_REPO) { $env:LALADUB_F5_HF_REPO = "Misha24-10/F5-TTS_RUSSIAN" }
