@@ -16,9 +16,11 @@ SOURCE_LANGS = [
     # survived, so the languages that collapse a dub into one repeated
     # phrase sink rather than win: destroying a dub is not distorting it.
     #
-    # Russian sits last for a reason that is not about Russian: the test
-    # video was Russian, so choosing it changed nothing at all. On any other
-    # video it would land somewhere in the middle.
+    # Russian is pinned rather than ranked. It scored zero only because the
+    # test video was Russian, so choosing it changed nothing - the number says
+    # nothing about the language, and it is far too commonly wanted to sit at
+    # the bottom of forty-five buttons.
+    ("ru", "Русский"),
     ("sl", "Словенский"),  # 0.87
     ("cs", "Чешский"),  # 0.80
     ("uk", "Украинский"),  # 0.71
@@ -62,7 +64,6 @@ SOURCE_LANGS = [
     ("pl", "Польский"),  # 0.01
     ("el", "Греческий"),  # 0.01
     ("vi", "Вьетнамский"),  # 0.00
-    ("ru", "Русский"),  # 0.00
     ("et", "Эстонский"),  # 0.00
 ]
 

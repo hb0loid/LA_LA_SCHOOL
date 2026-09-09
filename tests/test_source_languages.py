@@ -11,11 +11,17 @@ class SourceLanguageTests(unittest.TestCase):
         self.assertEqual(SOURCE_LANGS[0][0], "auto")
 
     def test_the_list_leads_with_the_languages_that_break_meaning_best(self) -> None:
-        """Ordered by a measured score rather than by familiarity now: one video
-        was forced through all 45 of them, and the ones that moved the meaning
+        """Ordered by a measured score rather than by familiarity: one video was
+        forced through all 45 of them, and the ones that moved the meaning
         furthest while leaving the text intact came out on top. Slovenian and
-        Czech scored 0.87 and 0.80; the collapse cases scored zero."""
-        self.assertEqual([code for code, _label in SOURCE_LANGS[:3]], ["auto", "sl", "cs"])
+        Czech scored 0.87 and 0.80; the collapse cases scored zero.
+
+        Russian is pinned rather than ranked - it scored zero only because the
+        test video was Russian, so choosing it changed nothing.
+        """
+        self.assertEqual(
+            [code for code, _label in SOURCE_LANGS[:4]], ["auto", "ru", "sl", "cs"]
+        )
 
     def test_codes_are_unique(self) -> None:
         codes = [code for code, _label in SOURCE_LANGS]
