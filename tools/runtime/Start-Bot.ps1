@@ -295,11 +295,11 @@ $env:LALADUB_INJECT_ARTIFACTS = "1"
 # bring the hunt back.
 $env:LALADUB_ARTIFACT_SOURCE = "catalog"
 # How often a phrase is pulled from a language other than the decoy one.
-$env:LALADUB_ARTIFACT_CROSS_LANGUAGE_SHARE = "0.15"
+$env:LALADUB_ARTIFACT_CROSS_LANGUAGE_SHARE = "0.50"
 $env:LALADUB_ARTIFACT_MAX_SEGMENTS = "14"
 # Keep the repaired density setting, but return to the less intrusive 20%
 # profile. Short videos still qualify from three source segments below.
-$env:LALADUB_ARTIFACT_RATIO = "0.20"
+$env:LALADUB_ARTIFACT_RATIO = "0.30"
 # At 5 a third of all jobs (1011 of 3085) got no artifacts at all - the
 # median job has only 8 lines. At 3 that falls to 17%.
 $env:LALADUB_ARTIFACT_MIN_SOURCE_SEGMENTS = "3"
