@@ -1557,7 +1557,9 @@ async def break_command(update: Any, context: Any) -> None:
     if live["active_local"]:
         lines.append("Начатая работа доделается — обрывать её значило бы считать её заново.")
     if live["remote_workers_online"]:
-        lines.append("Ноутбук продолжает готовить работы, очередь не встанет.")
+        # During a break he is the only machine there is, so he voices too -
+        # slowly, but a queue that waits for the evening to end is slower still.
+        lines.append("Ноутбук берёт работы целиком, включая озвучку. Медленнее, но очередь идёт.")
     else:
         lines.append("Ноутбук сейчас не на связи, так что очередь остановится совсем.")
     lines.append("Закончить: /break off")
@@ -3565,7 +3567,9 @@ class _JobScheduler:
             self._active_total += 1
             if item.user_id is not None:
                 self._active_by_user[item.user_id] = self._active_by_user.get(item.user_id, 0) + 1
-            remote_stage = _remote_stage_for_job(item.job, engines)
+            remote_stage = _remote_stage_for_job(
+                item.job, engines, allow_voice=self._worker_may_voice()
+            )
             item.worker_id = worker_id
             item.execution_kind = "remote_preprocess" if remote_stage == "preprocess" else "remote"
             item.remote_last_seen_at = time.time()
@@ -3943,6 +3947,15 @@ class _JobScheduler:
             return True
         return self._active_by_user.get(item.user_id, 0) < self._settings.max_active_jobs_per_user
 
+    def _worker_may_voice(self) -> bool:
+        """Whether a worker is allowed to finish a job, voice and all.
+
+        Only while this machine is on a break. Then nobody else can voice at
+        all, and slow voicing beats a queue that simply waits for the evening
+        to end. In normal running the laptop is worth far more preparing.
+        """
+        return WORKER_MAY_VOICE or break_until(self._settings) is not None
+
     def _worker_may_take(self, item: _QueuedJob, engines: frozenset[str] | None) -> bool:
         """Whether a remote worker is allowed this job at all.
 
@@ -3952,7 +3965,7 @@ class _JobScheduler:
         it could at least have prepared. What matters is whether it can do the
         preparation, which is language-independent, or the whole job.
         """
-        stage = _remote_stage_for_job(item.job, engines)
+        stage = _remote_stage_for_job(item.job, engines, allow_voice=self._worker_may_voice())
         if stage == "preprocess":
             return True
         return engines is not None and effective_tts_provider(item.job) in engines
@@ -4431,7 +4444,12 @@ def effective_tts_provider(job: dict[str, Any], default: str = "moss") -> str:
     return provider
 
 
-def _remote_stage_for_job(job: dict[str, Any], engines: frozenset[str] | None = None) -> str:
+def _remote_stage_for_job(
+    job: dict[str, Any],
+    engines: frozenset[str] | None = None,
+    *,
+    allow_voice: bool = False,
+) -> str:
     """Whether a worker can finish this job or only prepare it.
 
     `engines` is what the worker reported it has installed. Without it the old
@@ -4440,10 +4458,12 @@ def _remote_stage_for_job(job: dict[str, Any], engines: frozenset[str] | None = 
     """
     if str(job.get("mode") or "dub") == "raw_text":
         return "complete"
-    if not WORKER_MAY_VOICE:
-        # Everything but the voice. Applies whatever engine the job wants, so a
-        # Ukrainian job on F5 is prepared remotely as well - which the old
-        # "Russian only" rule refused outright.
+    if not allow_voice:
+        # Everything but the voice, whatever engine the job wants - MOSS for
+        # Russian and English, F5 for Ukrainian alike. Measured: the laptop
+        # voices at about 60 seconds of work per second of video against the
+        # main PC's 4, and every second it spends on that is a second not spent
+        # preparing, which is the slower half of the pipeline to begin with.
         return "preprocess"
     provider = effective_tts_provider(job)
     if engines is None:

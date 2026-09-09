@@ -42,36 +42,36 @@ class VoicingStaysHomeTests(unittest.TestCase):
 
 
 class RemoteStageTests(unittest.TestCase):
-    """With voicing allowed on workers: one that has the engine finishes the
-    job, one that has not still does everything up to the voice."""
+    """With voicing allowed - which happens only while the main PC is on a
+    break - a worker that has the engine finishes the job, and one that has not
+    still does everything up to the voice."""
 
-    def setUp(self) -> None:
-        patcher = unittest.mock.patch("laladub.bot.WORKER_MAY_VOICE", True)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+    @staticmethod
+    def _stage(job: dict, engines: frozenset[str] | None = None) -> str:
+        return _remote_stage_for_job(job, engines, allow_voice=True)
 
     def test_a_worker_without_the_engine_only_prepares(self) -> None:
         job = {"tts_provider": "moss", "target_lang": "ru"}
-        self.assertEqual(_remote_stage_for_job(job, frozenset({"f5"})), "preprocess")
+        self.assertEqual(self._stage(job, frozenset({"f5"})), "preprocess")
 
     def test_a_worker_with_the_engine_finishes_it(self) -> None:
         job = {"tts_provider": "moss", "target_lang": "ru"}
-        self.assertEqual(_remote_stage_for_job(job, frozenset({"moss"})), "complete")
+        self.assertEqual(self._stage(job, frozenset({"moss"})), "complete")
 
     def test_a_ukrainian_job_needs_f5_not_moss(self) -> None:
         """The engine that matters is the one that will really voice it."""
         job = {"tts_provider": "moss", "target_lang": "uk"}
-        self.assertEqual(_remote_stage_for_job(job, frozenset({"moss"})), "preprocess")
-        self.assertEqual(_remote_stage_for_job(job, frozenset({"f5"})), "complete")
+        self.assertEqual(self._stage(job, frozenset({"moss"})), "preprocess")
+        self.assertEqual(self._stage(job, frozenset({"f5"})), "complete")
 
     def test_saying_nothing_keeps_the_old_assumption(self) -> None:
         """A worker on an older build reports no engines at all."""
         job = {"tts_provider": "moss", "target_lang": "ru"}
-        self.assertEqual(_remote_stage_for_job(job), "preprocess")
+        self.assertEqual(self._stage(job), "preprocess")
 
     def test_raw_text_never_needs_a_voice(self) -> None:
         job = {"mode": "raw_text", "tts_provider": "moss", "target_lang": "ru"}
-        self.assertEqual(_remote_stage_for_job(job, frozenset()), "complete")
+        self.assertEqual(self._stage(job, frozenset()), "complete")
 
     def test_the_heavy_engines_are_the_ones_split(self) -> None:
         self.assertEqual(PREPROCESS_ENGINES, frozenset({"moss", "cosyvoice", "qwen3"}))
@@ -110,6 +110,39 @@ class VoicingFirstTests(unittest.TestCase):
         prepared = self._key(local=False, preprocessed=True, priority=100, sequence=99)
         fresh = self._key(local=False, preprocessed=False, priority=100, sequence=1)
         self.assertLess(fresh, prepared)
+
+
+class BreakVoicingTests(unittest.TestCase):
+    """During a break the main PC voices nothing, so the laptop does - slowly,
+    but a queue that waits for the evening to end is slower still. In normal
+    running it is worth far more preparing."""
+
+    def test_no_voicing_without_a_break(self) -> None:
+        job = {"tts_provider": "moss", "target_lang": "ru"}
+        self.assertEqual(
+            _remote_stage_for_job(job, frozenset({"moss"}), allow_voice=False), "preprocess"
+        )
+
+    def test_ukrainian_is_not_an_exception(self) -> None:
+        """F5 is lighter than MOSS, but it is still the laptop doing the voice."""
+        job = {"tts_provider": "moss", "target_lang": "uk"}
+        self.assertEqual(
+            _remote_stage_for_job(job, frozenset({"f5"}), allow_voice=False), "preprocess"
+        )
+
+    def test_a_break_hands_over_the_whole_job(self) -> None:
+        for target, engine in (("ru", "moss"), ("uk", "f5")):
+            job = {"tts_provider": "moss", "target_lang": target}
+            self.assertEqual(
+                _remote_stage_for_job(job, frozenset({engine}), allow_voice=True), "complete"
+            )
+
+    def test_a_break_cannot_conjure_an_engine(self) -> None:
+        """Handing over a job it would fail at the last step helps nobody."""
+        job = {"tts_provider": "moss", "target_lang": "ru"}
+        self.assertEqual(
+            _remote_stage_for_job(job, frozenset({"f5"}), allow_voice=True), "preprocess"
+        )
 
 if __name__ == "__main__":
     unittest.main()

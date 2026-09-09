@@ -55,5 +55,38 @@ class BreakLabelTests(unittest.TestCase):
         self.assertIn("ч", _break_label(time.time() + 7200))
 
 
+
+class BreakHandsOverVoicingTests(unittest.TestCase):
+    """While the main PC rests it voices nothing, so the laptop does. Slowly -
+    60 seconds of work per second of video against 4 - but a queue that waits
+    for the evening to end is slower still."""
+
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tempdir.cleanup)
+        self.settings = SimpleNamespace(workdir=Path(self._tempdir.name))
+
+    def _may_voice(self) -> bool:
+        from laladub.bot import WORKER_MAY_VOICE
+
+        return WORKER_MAY_VOICE or break_until(self.settings) is not None
+
+    def test_normally_the_laptop_does_not_voice(self) -> None:
+        self.assertFalse(self._may_voice())
+
+    def test_a_break_hands_voicing_over(self) -> None:
+        set_break(self.settings, float("inf"))
+        self.assertTrue(self._may_voice())
+
+    def test_ending_the_break_takes_it_back(self) -> None:
+        set_break(self.settings, float("inf"))
+        set_break(self.settings, None)
+        self.assertFalse(self._may_voice())
+
+    def test_an_expired_break_takes_it_back_too(self) -> None:
+        """Otherwise a forgotten break would leave the slow path on all night."""
+        set_break(self.settings, time.time() - 1)
+        self.assertFalse(self._may_voice())
+
 if __name__ == "__main__":
     unittest.main()
