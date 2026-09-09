@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ConfigPath = Join-Path $Root "worker_config.json"
@@ -423,14 +423,52 @@ while ($true) {
       exit 42
     }
     $hiddenLauncher = Join-Path $Root "Start-Worker-Hidden.vbs"
-    if (Test-Path -LiteralPath $hiddenLauncher) {
-      Start-Process -FilePath "wscript.exe" -ArgumentList "`"$hiddenLauncher`"" -WorkingDirectory $Root
-    } else {
-      Start-Process -FilePath "powershell.exe" `
-        -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"" `
-        -WorkingDirectory $Root
+    try {
+      if (Test-Path -LiteralPath $hiddenLauncher) {
+        Start-Process -FilePath "wscript.exe" -ArgumentList "`"$hiddenLauncher`"" -WorkingDirectory $Root
+      } else {
+        Start-Process -FilePath "powershell.exe" `
+          -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"" `
+          -WorkingDirectory $Root
+      }
+    } catch {
+      Write-SupervisorLog "Could not start the fresh supervisor: $($_.Exception.Message)"
     }
-    exit 0
+
+    # Leaving before the successor is up is how a laptop goes silent with the
+    # machine plainly switched on: this process exits, the replacement never
+    # takes the lock, and the scheduled task cannot help while it still counts
+    # the old instance as running. So the handover is confirmed rather than
+    # assumed - the successor proves it arrived by holding the lock this one
+    # just released. If it does not, the update is abandoned and the worker
+    # keeps running here on the code that already works.
+    $handedOver = $false
+    foreach ($attempt in 1..30) {
+      Start-Sleep -Seconds 1
+      try {
+        $probe = [IO.File]::Open($LockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        $probe.Close()
+      } catch [IO.IOException] {
+        $handedOver = $true
+        break
+      }
+    }
+    if ($handedOver) {
+      Write-SupervisorLog "Fresh supervisor is up; this one is done."
+      exit 0
+    }
+
+    Write-SupervisorLog "Fresh supervisor never started; carrying on with auto-update off."
+    $SupervisorReplaced = $false
+    $suppressWorkerAutoUpdate = $true
+    foreach ($attempt in 1..10) {
+      try {
+        $WorkerLock = [IO.File]::Open($LockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        break
+      } catch [IO.IOException] {
+        Start-Sleep -Seconds 1
+      }
+    }
   }
 
   $workerArguments = @(
