@@ -3865,10 +3865,33 @@ class _JobScheduler:
     def _next_startable_index(
         self, *, execution_kind: str, engines: frozenset[str] | None = None
     ) -> int | None:
+        found = self._best_startable(execution_kind=execution_kind, engines=engines)
+        if found is not None:
+            return found
+        # Nothing else could be started. The one-job-per-person rule exists so
+        # that one author cannot hold both machines while others wait - it was
+        # never meant to leave a machine idle when there is work sitting right
+        # there, which is what it did whenever the queue was one person deep.
+        return self._best_startable(
+            execution_kind=execution_kind, engines=engines, ignore_user_limit=True
+        )
+
+    def _best_startable(
+        self,
+        *,
+        execution_kind: str,
+        engines: frozenset[str] | None = None,
+        ignore_user_limit: bool = False,
+    ) -> int | None:
         best_index: int | None = None
         best_key: tuple[int, int, int] | None = None
         for index, (priority, sequence, item) in enumerate(self._pending):
-            if not self._can_start(item, execution_kind=execution_kind, engines=engines):
+            if not self._can_start(
+                item,
+                execution_kind=execution_kind,
+                engines=engines,
+                ignore_user_limit=ignore_user_limit,
+            ):
                 continue
             # The main PC is the only machine that voices, and voicing is what
             # the queue waits on. A job it picks up from scratch is a job the
@@ -3891,6 +3914,7 @@ class _JobScheduler:
         *,
         execution_kind: str,
         engines: frozenset[str] | None = None,
+        ignore_user_limit: bool = False,
     ) -> bool:
         if self._active_total >= self._settings.max_active_jobs:
             return False
@@ -3915,7 +3939,7 @@ class _JobScheduler:
             and self._remote_worker_counts_locked()["idle"] > 0
         ):
             return False
-        if item.user_id is None:
+        if item.user_id is None or ignore_user_limit:
             return True
         return self._active_by_user.get(item.user_id, 0) < self._settings.max_active_jobs_per_user
 
