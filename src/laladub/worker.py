@@ -495,6 +495,9 @@ def _directory_size(path: Path) -> int:
 
 
 def _settings_for_worker_job(settings: BotSettings, job: dict[str, Any]) -> BotSettings:
+    profile = job.get("text_profile")
+    if isinstance(profile, dict):
+        settings = settings.with_text_profile(profile)
     if str(job.get("remote_stage") or "").strip().lower() != "preprocess" or not _cuda_available():
         return settings
     return replace(settings, artifact_whisper_device="cuda")

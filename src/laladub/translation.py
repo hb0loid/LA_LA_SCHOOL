@@ -119,6 +119,9 @@ def translate_segments(segments: list[Segment], config: DubConfig) -> list[Segme
     if provider == "hybrid":
         return _translate_hybrid(segments, config)
 
+    if provider == "sandwich":
+        return _translate_sandwich(segments, config)
+
     if provider == "googleweb":
         return _translate_googleweb(segments, config)
 
@@ -149,6 +152,9 @@ def translate_text(text: str, source_lang: str, target_lang: str, config: DubCon
     if provider == "hybrid":
         return _translate_hybrid_text(text, source_lang, target_lang, config)
 
+    if provider == "sandwich":
+        return _translate_sandwich_text(text, source_lang, target_lang, config)
+
     if provider == "googleweb":
         return _translate_googleweb_text(text, source_lang, target_lang)
 
@@ -177,28 +183,116 @@ def translate_text_chain(text: str, languages: list[str], config: DubConfig) -> 
 def _translate_hybrid(segments: list[Segment], config: DubConfig) -> list[Segment]:
     if not config.source_lang:
         raise TranslationError("Hybrid translator needs --source-lang, for example: --source-lang vi")
+    return _translate_in_parallel(
+        segments,
+        lambda text: _translate_hybrid_text(text, config.source_lang or "auto", config.target_lang, config),
+        config,
+    )
 
+
+def _translate_in_parallel(segments: list[Segment], translate_one, config: DubConfig) -> list[Segment]:
     texts = [segment.text.strip() for segment in segments]
 
-    def translate_one(text: str) -> str:
-        return _postprocess_translated_text(
-            _translate_hybrid_text(text, config.source_lang or "auto", config.target_lang, config),
-            config.target_lang,
-        )
+    def one(text: str) -> str:
+        return _postprocess_translated_text(translate_one(text), config.target_lang)
 
     # Subtitle lines are independent, while the free web translator spends
     # most of its time waiting on the network. A small pool removes that idle
     # wait without firing enough simultaneous requests to invite throttling.
     workers = max(1, min(6, int(os.environ.get("LALADUB_TRANSLATION_WORKERS", "3"))))
     if workers == 1 or len(texts) <= 1:
-        translated = [translate_one(text) for text in texts]
+        translated = [one(text) for text in texts]
     else:
         with ThreadPoolExecutor(max_workers=min(workers, len(texts)), thread_name_prefix="laladub-translate") as pool:
-            translated = list(pool.map(translate_one, texts))
+            translated = list(pool.map(one, texts))
 
     for segment, text in zip(segments, translated):
         segment.translated_text = text
     return segments
+
+
+# Languages the sandwich may pass through: each has a local Argos route both
+# ways via English, so the hop out of it never has to go online.
+SANDWICH_DEFAULT_LANGS = "de,fr,es,ja,ko,tr,ar,he,th,ms,vi"
+
+
+def sandwich_middle_lang(config: DubConfig) -> str:
+    """The one foreign language this job's text passes through.
+
+    Chosen once per job from the configured list, seeded the way the rest of
+    the job's randomness is, so a retry walks the same road.
+    """
+    raw = (config.sandwich_langs or SANDWICH_DEFAULT_LANGS).replace(";", ",")
+    excluded = {"en", (config.target_lang or "").casefold(), (config.source_lang or "").casefold()}
+    langs = [code.strip().casefold() for code in raw.split(",") if code.strip()]
+    langs = [code for code in langs if code not in excluded]
+    if not langs:
+        return "de"
+    seed = f"{config.translation_seed or config.workdir}|sandwich"
+    digest = hashlib.sha256(seed.encode("utf-8", errors="ignore")).digest()
+    return langs[int.from_bytes(digest[:8], "big") % len(langs)]
+
+
+def _translate_sandwich(segments: list[Segment], config: DubConfig) -> list[Segment]:
+    """Local -> one online hop -> local.
+
+    The honest translator went online for every line and a 66-second video
+    took 165 seconds to translate; the chains went online a dozen times per
+    line. This keeps exactly one online hop and puts it where it does the
+    most: into a foreign language and back, so the meaning bends once, the
+    way one wrong-eared listener would bend it, while the text stays fluent.
+    Everything else runs on the local models and costs nothing.
+    """
+    if not config.source_lang:
+        raise TranslationError("Sandwich translator needs --source-lang, for example: --source-lang vi")
+    middle = sandwich_middle_lang(config)
+    print(
+        f"      Sandwich translation: {config.source_lang} -> en (local) -> {middle} (online)"
+        f" -> {config.target_lang} (local)"
+    )
+    return _translate_in_parallel(
+        segments,
+        lambda text: _translate_sandwich_text(
+            text, config.source_lang or "auto", config.target_lang, config, middle=middle
+        ),
+        config,
+    )
+
+
+def _translate_sandwich_text(
+    text: str, source_lang: str, target_lang: str, config: DubConfig, *, middle: str | None = None
+) -> str:
+    if not text.strip() or source_lang == target_lang:
+        return text
+    known = _translate_known_meta_text(text, source_lang, target_lang)
+    if known is not None:
+        return known
+    middle = middle or sandwich_middle_lang(config)
+    cache_source = f"sandwich[{middle}]:{source_lang}"
+    cached = _translation_cache_get(text, cache_source, target_lang, config)
+    if cached is not None:
+        return cached
+
+    english = text if source_lang == "en" else _local_or_online(text, source_lang, "en", config)
+    foreign = _translate_hybrid_text(english, "en", middle, config) if middle != "en" else english
+    result = _local_or_online(foreign, middle, target_lang, config)
+    result = _postprocess_translated_text(result, target_lang)
+    _translation_cache_put(text, cache_source, target_lang, result, config)
+    return result
+
+
+def _local_or_online(text: str, source_lang: str, target_lang: str, config: DubConfig) -> str:
+    """Argos first; the web only when there is no local road."""
+    if source_lang == target_lang or not text.strip():
+        return text
+    try:
+        return _translate_argos_provider_text(text, source_lang, target_lang)
+    except Exception as exc:
+        print(
+            f"      Local {source_lang}->{target_lang} unavailable ({type(exc).__name__});"
+            " going online for this hop"
+        )
+        return _translate_hybrid_text(text, source_lang, target_lang, config)
 
 
 def _translate_hybrid_text(text: str, source_lang: str, target_lang: str, config: DubConfig) -> str:

@@ -369,6 +369,7 @@ def _build_dub_config(job: dict[str, Any], settings: BotSettings, output_path: P
         translation_seed=ensure_translation_seed(job),
         translation_pivots=settings.translation_pivots,
         translation_second_pass_ratio=settings.translation_second_pass_ratio,
+        sandwich_langs=settings.sandwich_langs,
         collapse_repetitions=settings.collapse_repetitions,
         max_phrase_repeats=settings.max_phrase_repeats,
         max_word_repeats=settings.max_word_repeats,

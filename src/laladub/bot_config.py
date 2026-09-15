@@ -5,6 +5,30 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# Everything that decides what the translated text looks like. Sent to a
+# worker with each lease so a job comes out the same on either machine.
+TEXT_PROFILE_FIELDS = (
+    "translator",
+    "sandwich_langs",
+    "distort_translation",
+    "translation_pivots",
+    "max_translation_hops",
+    "translation_second_pass_ratio",
+    "inject_artifacts",
+    "artifact_source",
+    "artifact_ratio",
+    "artifact_max_segments",
+    "artifact_min_source_segments",
+    "artifact_min_gap_seconds",
+    "artifact_cross_language_share",
+    "channel_rebrand_share",
+    "max_line_repeats",
+    "collapse_repetitions",
+    "max_phrase_repeats",
+    "max_word_repeats",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class BotSettings:
     token: str
@@ -137,6 +161,35 @@ class BotSettings:
     artifact_source: str
     artifact_cross_language_share: float
     translation_second_pass_ratio: float
+    sandwich_langs: str = ""
+
+    def text_profile(self) -> dict[str, object]:
+        """The settings that shape the text, as they leave this machine.
+
+        A worker used to read these from its own launcher, so the two scripts
+        had to be kept in step by hand - and were not: the main PC had already
+        turned the pivot chains off while the laptop, which prepares most
+        jobs, still ran all thirteen. The coordinator now sends its profile
+        with every lease, and the worker applies it over its own defaults.
+        """
+        return {name: getattr(self, name) for name in TEXT_PROFILE_FIELDS}
+
+    def with_text_profile(self, profile: dict[str, object] | None) -> "BotSettings":
+        if not profile:
+            return self
+        from dataclasses import replace
+
+        fields = {}
+        for name in TEXT_PROFILE_FIELDS:
+            if name not in profile:
+                continue
+            current = getattr(self, name)
+            value = profile[name]
+            try:
+                fields[name] = type(current)(value) if current is not None else value
+            except (TypeError, ValueError):
+                continue
+        return replace(self, **fields) if fields else self
 
     def is_paid(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.paid_users
@@ -199,6 +252,7 @@ def load_bot_settings(*, require_token: bool = True) -> BotSettings:
         # 0 means no limit. Premium users and admins are trusted with the disk.
         max_file_mb_premium=int(os.environ.get("LALADUB_MAX_FILE_MB_PREMIUM", "0")),
         translator=os.environ.get("LALADUB_TRANSLATOR", "hybrid"),
+        sandwich_langs=os.environ.get("LALADUB_SANDWICH_LANGS", "").strip(),
         tts=os.environ.get("LALADUB_TTS", "moss"),
         voice=_empty_to_none(os.environ.get("LALADUB_VOICE", "Microsoft Irina Desktop")),
         speaker_wav=_optional_path(os.environ.get("LALADUB_SPEAKER_WAV")),

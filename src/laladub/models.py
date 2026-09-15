@@ -96,6 +96,9 @@ class DubConfig:
     diarization_token_file: Path | None = None
     diarization_timeout_seconds: int = 1800
     translator: str = "identity"
+    # The "sandwich" translator: local -> one online hop into one of these ->
+    # local. One is chosen per job. Empty means the built-in list.
+    sandwich_langs: str = ""
     libretranslate_url: str = "http://127.0.0.1:5000/translate"
     libretranslate_api_key: str | None = None
     llm_base_url: str = "http://127.0.0.1:1234/v1"

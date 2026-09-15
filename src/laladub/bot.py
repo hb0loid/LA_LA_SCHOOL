@@ -3988,6 +3988,9 @@ class _JobScheduler:
             payload = _remote_job_payload(item.job)
             if remote_stage == "preprocess":
                 payload["remote_stage"] = "preprocess"
+            text_profile = getattr(self._settings, "text_profile", None)
+            if callable(text_profile):
+                payload["text_profile"] = text_profile()
             return {
                 "job_id": item.job_id,
                 "job": payload,
@@ -5584,6 +5587,7 @@ async def _process_job(
         artifact_source=settings.artifact_source,
         artifact_cross_language_share=settings.artifact_cross_language_share,
         translation_second_pass_ratio=settings.translation_second_pass_ratio,
+        sandwich_langs=settings.sandwich_langs,
         collapse_repetitions=settings.collapse_repetitions,
         max_phrase_repeats=settings.max_phrase_repeats,
         max_word_repeats=settings.max_word_repeats,

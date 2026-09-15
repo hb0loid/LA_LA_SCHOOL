@@ -1,4 +1,4 @@
-param(
+﻿param(
   [ValidateRange(0, 300)]
   [int]$StartupDelaySeconds = 0
 )
@@ -213,7 +213,12 @@ $env:LALADUB_MEDIA_CACHE_DIR = (Join-Path $Root "runs\cache\media")
 $env:LALADUB_JOB_RETENTION_SECONDS = "2592000"
 $env:LALADUB_CLEANUP_INTERVAL_SECONDS = "3600"
 $env:LALADUB_TTS = "moss"
-$env:LALADUB_TRANSLATOR = "hybrid"
+# "sandwich": source -> English on the local models, one online hop into a
+# foreign language, back to Russian on the local models. One web call per line
+# instead of one per hop, and the meaning bends exactly once. Which language it
+# passes through is picked per job from LALADUB_SANDWICH_LANGS.
+$env:LALADUB_TRANSLATOR = "sandwich"
+$env:LALADUB_SANDWICH_LANGS = "de,fr,es,ja,ko,tr,ar,he,th,ms,vi"
 # Argos language models live on F: they are several gigabytes and C: is the
 # small SSD that gets cleaned out regularly. Only the first read of a model
 # after a reboot touches the disk at all - after that Windows keeps it cached -
