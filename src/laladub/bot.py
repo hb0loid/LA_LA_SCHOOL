@@ -20,9 +20,11 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from .bot_config import BotSettings, load_bot_settings
 from .download import download_video_url, extract_url, has_video_and_audio
+from .error_store import ErrorGroup, ErrorStore
 from .ffmpeg import (
     compress_video_for_telegram,
     make_audio_visual_video,
@@ -112,6 +114,12 @@ TTS_METHODS = [
 # bring it back; the engine itself is untouched and still works.
 TTS_METHOD_CHOICES = [("moss", "MOSS — лучше качество, дольше ждать")]
 _HIDDEN_TTS_CHOICES = [("cosyvoice", "CosyVoice — быстрее, но попроще")]
+ADMIN_TTS_METHOD_CHOICES = [
+    ("moss", "MOSS — основной"),
+    ("cosyvoice", "CosyVoice — запасной"),
+    ("qwen3", "Qwen3 — экспериментальный"),
+    ("f5", "F5 — устаревший / для украинского"),
+]
 
 # The last step of the setup wizard: озвучка занимает больше всего времени, so
 # the text can be shown first and voiced only if it is worth voicing.
@@ -149,6 +157,7 @@ class _ApplicationContext:
 def main() -> None:
     try:
         from telegram import Update
+        from telegram.request import HTTPXRequest
         from telegram.ext import (
             Application,
             CallbackQueryHandler,
@@ -214,7 +223,24 @@ def main() -> None:
         flush=True,
     )
 
-    application = Application.builder().token(settings.token).post_init(_setup_bot_commands).build()
+    # Telegram occasionally stalls for longer than PTB's five-second default
+    # even though the connection recovers moments later.  A simple command
+    # must wait through that short hiccup instead of being reported as failed.
+    telegram_request = HTTPXRequest(
+        connection_pool_size=256,
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=30.0,
+        media_write_timeout=300.0,
+    )
+    application = (
+        Application.builder()
+        .token(settings.token)
+        .request(telegram_request)
+        .post_init(_setup_bot_commands)
+        .build()
+    )
     application.bot_data["settings"] = settings
     application.bot_data["job_scheduler"] = _JobScheduler(settings)
     application.bot_data["proposal_store"] = ProposalStore(settings.proposal_db)
@@ -222,6 +248,7 @@ def main() -> None:
     application.bot_data["preset_store"] = PresetStore(settings.preset_db)
     application.bot_data["library_store"] = LibraryStore(settings.library_db)
     application.bot_data["review_store"] = TextReviewStore(settings.review_db)
+    application.bot_data["error_store"] = ErrorStore(settings.workdir / "errors.sqlite3")
     private_chat = filters.ChatType.PRIVATE
     application.add_error_handler(_telegram_error_handler)
     # Before every other handler: an update Telegram redelivered after a hard
@@ -251,6 +278,7 @@ def main() -> None:
     application.add_handler(CommandHandler("refund_premium", admin_refund_premium, filters=private_chat))
     application.add_handler(CommandHandler("prem_owners", admin_prem_owners, filters=private_chat))
     application.add_handler(CommandHandler("reviews", admin_reviews, filters=private_chat))
+    application.add_handler(CommandHandler("errors", errors_command, filters=private_chat))
     application.add_handler(CommandHandler("starbalance", admin_star_balance, filters=private_chat))
     application.add_handler(CommandHandler("watermark", watermark_command, filters=private_chat))
     application.add_handler(CommandHandler("mycensor", mycensor_command, filters=private_chat))
@@ -397,9 +425,206 @@ async def _telegram_error_handler(update: Any, context: Any) -> None:
         user_id = getattr(getattr(update, "effective_user", None), "id", None) if update is not None else None
         print(f"Telegram send skipped: bot blocked by user {user_id or '?'}", flush=True)
         return
+    if "Message is not modified" in str(error or ""):
+        # A double tap on a button: the second press redraws a screen the
+        # first one already drew, and Telegram refuses an edit that changes
+        # nothing. The person sees exactly what they should, so this is not
+        # an error worth waking anyone for.
+        return
     print("Unhandled Telegram update error:", flush=True)
     if error is not None:
-        print("".join(traceback.format_exception(type(error), error, error.__traceback__)), flush=True)
+        traceback_text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        print(traceback_text, flush=True)
+        user = getattr(update, "effective_user", None) if update is not None else None
+        chat = getattr(update, "effective_chat", None) if update is not None else None
+        message = getattr(update, "effective_message", None) if update is not None else None
+        stage = _telegram_update_stage(update)
+        incoming_job_number = None
+        if message is not None and stage in {"Получение видео", "Получение аудио", "Получение ссылки"}:
+            incoming_job_number = str(getattr(message, "message_id", "") or "") or None
+        await _record_error(
+            context,
+            source="telegram_handler",
+            details="".join(traceback.format_exception_only(type(error), error)).strip(),
+            traceback_text=traceback_text,
+            job_number=incoming_job_number,
+            user_id=getattr(user, "id", None),
+            chat_id=getattr(chat, "id", None),
+            stage=stage,
+        )
+
+
+def _telegram_update_stage(update: Any) -> str:
+    if update is None:
+        return "Фоновая обработка Telegram"
+    query = getattr(update, "callback_query", None)
+    if query is not None:
+        data = str(getattr(query, "data", "") or "")
+        return f"Кнопка {data[:80]}" if data else "Нажатие кнопки"
+    message = getattr(update, "effective_message", None)
+    if message is None:
+        return "Обработка обновления Telegram"
+    document = getattr(message, "document", None)
+    document_mime = str(getattr(document, "mime_type", "") or "").lower()
+    if getattr(message, "video", None) is not None or document_mime.startswith("video/"):
+        return "Получение видео"
+    if (
+        getattr(message, "audio", None) is not None
+        or getattr(message, "voice", None) is not None
+        or document_mime.startswith("audio/")
+    ):
+        return "Получение аудио"
+    text = str(getattr(message, "text", "") or "").strip()
+    if text.startswith("/"):
+        return f"Команда {text.split(maxsplit=1)[0][:80]}"
+    if extract_url(text):
+        return "Получение ссылки"
+    return "Обработка сообщения"
+
+
+def _is_stale_callback_error(exc: Exception) -> bool:
+    text = str(exc).casefold()
+    return "query is too old" in text or "query id is invalid" in text
+
+
+async def _answer_callback_safely(query: Any, *args: Any, **kwargs: Any) -> bool:
+    """A stale Telegram spinner must not cancel the button's real action."""
+    try:
+        await query.answer(*args, **kwargs)
+        return True
+    except Exception as exc:
+        if not _is_stale_callback_error(exc):
+            raise
+        print(f"Stale callback answer ignored: {exc}", flush=True)
+        return False
+
+
+async def _record_error(
+    context: Any,
+    *,
+    source: str,
+    details: str,
+    traceback_text: str = "",
+    job: dict[str, Any] | None = None,
+    job_number: str | None = None,
+    user_id: int | None = None,
+    chat_id: int | None = None,
+    stage: str | None = None,
+    user_message: str | None = None,
+) -> None:
+    """Best-effort capture; error reporting must never break the bot itself."""
+    store: ErrorStore | None = context.application.bot_data.get("error_store")
+    if store is None:
+        return
+    if job is not None:
+        job_number = job_number or _job_number(job)
+        user_id = user_id if user_id is not None else _job_user_id(job)
+        chat_id = chat_id if chat_id is not None else _job_chat_id(job)
+    try:
+        await asyncio.to_thread(
+            store.record,
+            source=source,
+            details=details,
+            traceback_text=traceback_text,
+            job_number=job_number,
+            user_id=user_id,
+            chat_id=chat_id,
+            stage=stage,
+            user_message=user_message,
+        )
+    except Exception:
+        print("Error registry write failed:\n" + traceback.format_exc(), flush=True)
+
+
+def _error_group_text(group: ErrorGroup, *, heading: str = "🚨 Новая ошибка") -> str:
+    if group.source == "telegram_handler" and "TimedOut" in group.details:
+        heading = "⚠️ Telegram не ответил вовремя"
+    elif (
+        group.source == "telegram_handler"
+        and group.stage == "Фоновая обработка Telegram"
+        and "NetworkError" in group.details
+    ):
+        heading = "⚠️ Временный сбой связи с Telegram"
+    first_seen = datetime.fromtimestamp(group.first_seen).strftime("%H:%M:%S")
+    last_seen = datetime.fromtimestamp(group.last_seen).strftime("%H:%M:%S")
+    event_time = first_seen if first_seen == last_seen else f"{first_seen}–{last_seen}"
+    lines = [
+        f"{heading} ×{group.count}",
+        f"Время события: {event_time}",
+        f"Источник: {group.source}",
+    ]
+    if group.stage:
+        lines.append(f"Этап: {group.stage}")
+    if group.job_numbers:
+        jobs = ", ".join(group.job_numbers[:20])
+        if len(group.job_numbers) > 20:
+            jobs += f" … ещё {len(group.job_numbers) - 20}"
+        lines.append(f"Работы: {jobs}")
+    if group.user_ids:
+        users = ", ".join(str(value) for value in group.user_ids[:12])
+        if len(group.user_ids) > 12:
+            users += f" … ещё {len(group.user_ids) - 12}"
+        lines.append(f"Пользователи: {users}")
+    details = re.sub(r"\s+", " ", group.details).strip()
+    if len(details) > 1800:
+        details = details[:1799].rstrip() + "…"
+    lines.extend(["", details or "(без текста ошибки)"])
+    return "\n".join(lines)
+
+
+async def _error_notification_loop(application: Any) -> None:
+    settings: BotSettings = application.bot_data["settings"]
+    store: ErrorStore = application.bot_data["error_store"]
+    while True:
+        await asyncio.sleep(15.0)
+        try:
+            groups = await asyncio.to_thread(store.pending_groups)
+            for group in groups:
+                if (
+                    group.source == "telegram_handler"
+                    and group.stage == "Фоновая обработка Telegram"
+                    and "NetworkError" in group.details
+                    and group.count < 3
+                ):
+                    # Long polling reconnects by itself. Keep isolated drops in
+                    # /errors for diagnostics, but only wake an admin for a
+                    # burst. If the burst never comes, archive the lone event.
+                    if time.time() - group.last_seen >= 60.0:
+                        await asyncio.to_thread(store.mark_notified, group.fingerprint)
+                    continue
+                delivered = False
+                text = _error_group_text(group)
+                for admin_id in sorted(settings.admin_users):
+                    try:
+                        await application.bot.send_message(chat_id=admin_id, text=text)
+                        delivered = True
+                    except Exception as exc:
+                        print(f"Error alert delivery failed admin={admin_id}: {type(exc).__name__}: {exc}", flush=True)
+                if delivered:
+                    await asyncio.to_thread(store.mark_notified, group.fingerprint)
+        except Exception:
+            print("Error notification loop failed:\n" + traceback.format_exc(), flush=True)
+
+
+async def errors_command(update: Any, context: Any) -> None:
+    settings: BotSettings = context.application.bot_data["settings"]
+    user = update.effective_user
+    if user is None or not settings.is_admin(user.id):
+        await update.effective_message.reply_text("Нет доступа.")
+        return
+    store: ErrorStore = context.application.bot_data["error_store"]
+    groups = await asyncio.to_thread(store.recent_groups, since=time.time() - 24 * 60 * 60, limit=10)
+    if not groups:
+        await update.effective_message.reply_text("За последние 24 часа ошибок не записано.")
+        return
+    lines = ["Ошибки за последние 24 часа:"]
+    for group in groups:
+        jobs = ", ".join(group.job_numbers[:5]) or "—"
+        details = re.sub(r"\s+", " ", group.details).strip()
+        if len(details) > 180:
+            details = details[:179].rstrip() + "…"
+        lines.append(f"\n×{group.count} · {group.source} · работы {jobs}\n{details}")
+    await update.effective_message.reply_text("\n".join(lines)[:4000])
 
 
 def _break_flag_path(settings: BotSettings) -> Path:
@@ -565,6 +790,7 @@ async def _setup_bot_commands(application: Any) -> None:
         ("maintenance", "Режим обслуживания"),
         ("censored", "Статистика цензуры"),
         ("reviews", "Отчёт по проверке текста"),
+        ("errors", "Последние ошибки пользователей"),
         ("starbalance", "Баланс Stars"),
         ("prem_owners", "Кто с премиумом"),
         ("grant_premium", "Выдать премиум"),
@@ -593,6 +819,7 @@ async def _setup_bot_commands(application: Any) -> None:
     asyncio.create_task(_worker_presence_loop(application))
     asyncio.create_task(_maintenance_watch_loop(application))
     asyncio.create_task(_daily_quota_reminder_loop(application))
+    asyncio.create_task(_error_notification_loop(application))
     asyncio.create_task(application.bot_data["job_scheduler"].watch_remote_leases(_ApplicationContext(application)))
     if settings.proposal_enabled:
         asyncio.create_task(_proposal_outbox_loop(application))
@@ -674,6 +901,15 @@ async def _proposal_outbox_loop(application: Any) -> None:
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
                     print(f"Proposal author message failed: {error}", flush=True)
+                    await _record_error(
+                        _ApplicationContext(application),
+                        source="proposal_author_message",
+                        details=error,
+                        traceback_text=traceback.format_exc(),
+                        job_number=str(item.get("job_number") or "") or None,
+                        user_id=_coerce_int(item.get("user_id")),
+                        chat_id=_coerce_int(item.get("user_id")),
+                    )
                 await asyncio.to_thread(store.finish_author_message, int(item["id"]), error=error)
         except Exception:
             print("Proposal outbox loop failed:\n" + traceback.format_exc(), flush=True)
@@ -1768,22 +2004,22 @@ async def proposal_callback(update: Any, context: Any) -> None:
     settings: BotSettings = context.application.bot_data["settings"]
     user = update.effective_user
     if user is None:
-        await query.answer("Не удалось определить пользователя.", show_alert=True)
+        await _answer_callback_safely(query, "Не удалось определить пользователя.", show_alert=True)
         return
     if not settings.proposal_enabled or "proposal_store" not in context.application.bot_data:
-        await query.answer("Предложка сейчас отключена.", show_alert=True)
+        await _answer_callback_safely(query, "Предложка сейчас отключена.", show_alert=True)
         return
 
     parts = str(query.data or "").split(":")
     if len(parts) != 3:
-        await query.answer("Некорректная кнопка.", show_alert=True)
+        await _answer_callback_safely(query, "Некорректная кнопка.", show_alert=True)
         return
     action, value = parts[1], parts[2]
     if action == "submitted":
-        await query.answer("Видео уже отправлено в предложку.")
+        await _answer_callback_safely(query, "Видео уже отправлено в предложку.")
         return
     if action not in {"submit", "comment"} or not value.isdigit():
-        await query.answer("Некорректная кнопка.", show_alert=True)
+        await _answer_callback_safely(query, "Некорректная кнопка.", show_alert=True)
         return
 
     job_dir = settings.workdir / str(user.id) / value
@@ -1791,13 +2027,13 @@ async def proposal_callback(update: Any, context: Any) -> None:
     try:
         job = json.loads(snapshot_path.read_text(encoding="utf-8"))
     except Exception:
-        await query.answer("Данные этой работы уже не найдены.", show_alert=True)
+        await _answer_callback_safely(query, "Данные этой работы уже не найдены.", show_alert=True)
         return
     if not isinstance(job, dict) or _coerce_int(job.get("user_id")) != user.id:
-        await query.answer("Эта работа принадлежит другому пользователю.", show_alert=True)
+        await _answer_callback_safely(query, "Эта работа принадлежит другому пользователю.", show_alert=True)
         return
     if str(job.get("status") or "") not in {"ready", "done"}:
-        await query.answer("Работа ещё не завершена.", show_alert=True)
+        await _answer_callback_safely(query, "Работа ещё не завершена.", show_alert=True)
         return
 
     if action == "comment":
@@ -1808,7 +2044,7 @@ async def proposal_callback(update: Any, context: Any) -> None:
             "chat_id": int(query.message.chat_id),
             "message_id": int(query.message.message_id),
         }
-        await query.answer()
+        await _answer_callback_safely(query)
         await query.message.reply_text(
             f"Напиши комментарий к работе №{value}. Он появится над строкой «Прислал …» при публикации.",
             reply_markup=ForceReply(selective=True),
@@ -1817,7 +2053,7 @@ async def proposal_callback(update: Any, context: Any) -> None:
 
     video_path = _find_proposal_video_path(job_dir, job)
     if video_path is None:
-        await query.answer("Итоговый видеофайл уже не найден.", show_alert=True)
+        await _answer_callback_safely(query, "Итоговый видеофайл уже не найден.", show_alert=True)
         return
     try:
         submission, created = await _create_proposal_submission(
@@ -1830,12 +2066,16 @@ async def proposal_callback(update: Any, context: Any) -> None:
         )
     except Exception as exc:
         print("Proposal submission failed:\n" + traceback.format_exc(), flush=True)
-        await query.answer(f"Не удалось отправить: {type(exc).__name__}", show_alert=True)
+        await _answer_callback_safely(
+            query, f"Не удалось отправить: {type(exc).__name__}", show_alert=True
+        )
         return
 
     with contextlib.suppress(Exception):
         await query.edit_message_reply_markup(reply_markup=_proposal_submitted_keyboard(submission.id))
-    await query.answer("Отправлено в предложку." if created else "Видео уже находится в предложке.")
+    await _answer_callback_safely(
+        query, "Отправлено в предложку." if created else "Видео уже находится в предложке."
+    )
 
 
 PROPOSAL_COMMENT_MAX_CHARS = 800
@@ -1986,6 +2226,16 @@ async def receive_video(update: Any, context: Any) -> None:
             print(traceback_text, flush=True)
             (job_dir / "error.log").write_text(traceback_text, encoding="utf-8")
             details = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+            await _record_error(
+                context,
+                source="telegram_video_download",
+                details=details,
+                traceback_text=traceback_text,
+                job_number=job_dir.name,
+                user_id=user_id,
+                chat_id=getattr(message.chat, "id", None),
+                user_message=f"Не смог скачать видео из Telegram:\n{details}",
+            )
             await status.edit_text(f"Не смог скачать видео из Telegram:\n{details}")
         return
 
@@ -2030,6 +2280,16 @@ async def receive_audio(update: Any, context: Any) -> None:
         print(traceback_text, flush=True)
         (job_dir / "error.log").write_text(traceback_text, encoding="utf-8")
         details = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+        await _record_error(
+            context,
+            source="telegram_audio_download",
+            details=details,
+            traceback_text=traceback_text,
+            job_number=job_dir.name,
+            user_id=user_id,
+            chat_id=getattr(message.chat, "id", None),
+            user_message=f"Не смог скачать аудио:\n{details}",
+        )
         await status.edit_text(f"Не смог скачать аудио:\n{details}")
         return
 
@@ -2043,6 +2303,10 @@ async def receive_link(update: Any, context: Any) -> None:
     settings: BotSettings = context.application.bot_data["settings"]
     text = message.text or ""
     if await _receive_proposal_comment(update, context, text):
+        return
+    local_source = _local_file_path_from_text(text)
+    if local_source is not None:
+        await _receive_local_file(update, context, local_source)
         return
     url = extract_url(text)
     if not url:
@@ -2069,6 +2333,16 @@ async def receive_link(update: Any, context: Any) -> None:
         print(traceback_text, flush=True)
         (job_dir / "error.log").write_text(traceback_text, encoding="utf-8")
         details = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+        await _record_error(
+            context,
+            source="url_download",
+            details=details,
+            traceback_text=traceback_text,
+            job_number=job_dir.name,
+            user_id=user_id,
+            chat_id=getattr(message.chat, "id", None),
+            user_message=f"Не смог скачать видео по ссылке:\n{details}",
+        )
         await status.edit_text(f"Не смог скачать видео по ссылке:\n{details}")
         return
 
@@ -2086,6 +2360,84 @@ async def receive_link(update: Any, context: Any) -> None:
         update=update,
         user_id=user_id,
         source_url=url,
+    )
+
+
+_LOCAL_VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts", ".mpeg", ".mpg"}
+_LOCAL_AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".wma"}
+
+
+def _local_file_path_from_text(text: str) -> Path | None:
+    value = str(text or "").strip().strip('"')
+    if value.lower().startswith("file:///"):
+        value = unquote(value[8:])
+    elif not (re.match(r"^[A-Za-z]:[\\/]", value) or value.startswith("\\\\")):
+        return None
+    return Path(value)
+
+
+def _local_file_access_allowed(user_id: int | None) -> bool:
+    configured = os.environ.get("LALADUB_LOCAL_FILE_USERS", "")
+    allowed = {
+        int(value)
+        for value in re.split(r"[\s,;]+", configured.strip())
+        if value.isdigit()
+    }
+    return user_id is not None and int(user_id) in allowed
+
+
+def _stage_local_file(source: Path, destination: Path) -> None:
+    source = source.resolve(strict=True)
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.unlink(missing_ok=True)
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+
+
+async def _receive_local_file(update: Any, context: Any, source: Path) -> None:
+    message = update.effective_message
+    settings: BotSettings = context.application.bot_data["settings"]
+    user_id = getattr(update.effective_user, "id", None)
+    if not _local_file_access_allowed(user_id):
+        await message.reply_text("Локальные пути доступны только владельцу этого компьютера.")
+        return
+
+    suffix = source.suffix.lower()
+    is_audio = suffix in _LOCAL_AUDIO_SUFFIXES
+    if suffix not in _LOCAL_VIDEO_SUFFIXES and not is_audio:
+        await message.reply_text(
+            "Не узнаю формат локального файла. Пришли путь к видео или аудио с обычным расширением."
+        )
+        return
+
+    await _clear_reply_keyboard(message)
+    job_dir = settings.workdir / str(user_id) / str(message.message_id)
+    input_path = job_dir / (f"input_audio{suffix}" if is_audio else f"input{suffix}")
+    status = await message.reply_text("Подхватываю локальный файл с компьютера...")
+    try:
+        await asyncio.to_thread(_stage_local_file, source, input_path)
+    except Exception as exc:
+        await status.edit_text(f"Не смог открыть локальный файл:\n{type(exc).__name__}: {exc}")
+        return
+
+    if not is_audio:
+        input_path = await _prepare_input_video_duration(status, settings, int(user_id), input_path)
+        if input_path is None:
+            return
+
+    await _remember_job_and_ask_source(
+        context,
+        status,
+        job_dir,
+        input_path,
+        source.stem,
+        input_source="telegram_audio" if is_audio else "local_file",
+        update=update,
+        user_id=int(user_id),
     )
 
 
@@ -2364,12 +2716,20 @@ async def _show_target_screen(target: Any, job: dict[str, Any]) -> None:
     )
 
 
-async def _show_tts_screen(target: Any, job: dict[str, Any]) -> None:
+def _tts_choices_for_update(update: Any, context: Any) -> list[tuple[str, str]]:
+    settings = getattr(getattr(context, "application", None), "bot_data", {}).get("settings")
+    user_id = getattr(getattr(update, "effective_user", None), "id", None)
+    if settings is not None and settings.is_admin(user_id):
+        return ADMIN_TTS_METHOD_CHOICES
+    return TTS_METHOD_CHOICES
+
+
+async def _show_tts_screen(target: Any, job: dict[str, Any], choices: list[tuple[str, str]]) -> None:
     _save_job_snapshot(Path(job["job_dir"]), job, status="select_tts")
     await _show_selection_screen(
         target,
         "Выбери движок озвучки.",
-        _language_keyboard("tts", TTS_METHOD_CHOICES, columns=1, back_callback="back:target"),
+        _language_keyboard("tts", choices, columns=1, back_callback="back:target"),
     )
 
 
@@ -2436,15 +2796,16 @@ async def _advance_selection(update: Any, context: Any, job: dict[str, Any], tar
         # engine, so it's picked without an extra user-facing screen.
         job["tts_provider"] = "f5"
     elif "tts_provider" not in job:
+        tts_choices = _tts_choices_for_update(update, context)
         choice = _preset_choice(job, "tts_provider")
-        if choice and choice in {code for code, _label in TTS_METHOD_CHOICES}:
+        if choice and choice in {code for code, _label in tts_choices}:
             job["tts_provider"] = choice
-        elif len(TTS_METHOD_CHOICES) == 1:
+        elif len(tts_choices) == 1:
             # A screen offering a single button is just an extra tap. It comes
             # back on its own the moment a second engine is offered again.
-            job["tts_provider"] = TTS_METHOD_CHOICES[0][0]
+            job["tts_provider"] = tts_choices[0][0]
         else:
-            await _show_tts_screen(target, job)
+            await _show_tts_screen(target, job, tts_choices)
             return
 
     if "review_mode" not in job:
@@ -2629,7 +2990,8 @@ async def select_tts_method(update: Any, context: Any) -> None:
         return
 
     tts_provider = _tts_provider_value(query.data.split(":", 1)[1])
-    if tts_provider is None or tts_provider not in {code for code, _label in TTS_METHOD_CHOICES}:
+    allowed_choices = _tts_choices_for_update(update, context)
+    if tts_provider is None or tts_provider not in {code for code, _label in allowed_choices}:
         await query.edit_message_text("Неизвестный метод озвучки. Пришли видео ещё раз.")
         return
 
@@ -2883,6 +3245,15 @@ async def _reserve_daily_allowance(
         duration_ms = max(0, round(await asyncio.to_thread(probe_duration, input_path) * 1000))
     except Exception as exc:
         print(f"Daily quota duration failed: {type(exc).__name__}: {exc}", flush=True)
+        await _record_error(
+            context,
+            source="daily_limit_probe",
+            details=f"{type(exc).__name__}: {exc}",
+            traceback_text=traceback.format_exc(),
+            job=job,
+            user_id=user_id,
+            user_message="Не смог определить длительность видео для суточного лимита.",
+        )
         await _safe_edit_status(status_message, "Не смог определить длительность видео для суточного лимита.")
         return False
     karma_milli = await asyncio.to_thread(store.karma_total, user_id)
@@ -2919,6 +3290,15 @@ async def _reserve_daily_allowance(
         except Exception as exc:
             print(f"Daily quota trim failed: {type(exc).__name__}: {exc}", flush=True)
             trimmed_path.unlink(missing_ok=True)
+            await _record_error(
+                context,
+                source="daily_limit_trim",
+                details=f"{type(exc).__name__}: {exc}",
+                traceback_text=traceback.format_exc(),
+                job=job,
+                user_id=user_id,
+                user_message="Не смог обрезать видео до оставшегося суточного лимита.",
+            )
             await _safe_edit_status(
                 status_message,
                 "Не смог обрезать видео до оставшегося суточного лимита.\n"
@@ -3069,7 +3449,11 @@ def _find_recoverable_jobs(settings: BotSettings) -> list[dict[str, Any]]:
     candidates: list[tuple[float, dict[str, Any]]] = []
     if not settings.workdir.exists():
         return []
-    for path in settings.workdir.rglob("job.json"):
+    # Every release job snapshot lives exactly at
+    # <workdir>/<user_id>/<job_id>/job.json.  A recursive walk also descends
+    # into each job's often huge work directory and can leave startup recovery
+    # scanning media artifacts for minutes while both executors sit idle.
+    for path in settings.workdir.glob("*/*/job.json"):
         job_dir = path.parent
         job = _load_job_snapshot(job_dir)
         if not job:
@@ -3534,23 +3918,32 @@ class _JobScheduler:
             # bookkeeping went stale while the machine kept talking to us.
             worker_quiet = now - self.remote_traffic_at > WORKER_SILENCE_SECONDS
             async with self._lock:
-                stale = [
-                    item
-                    for item in self._leased.values()
-                    if item.execution_kind == "remote_preprocess"
-                    and now - float(item.remote_last_seen_at or 0.0) > LEASE_SILENCE_SECONDS
-                    and (worker_quiet or self._worker_moved_on_locked(item))
-                ]
+                stale = self._stale_remote_leases_locked(now, worker_quiet=worker_quiet)
                 await self._dispatch_locked(context)
             for item in stale:
                 silence = now - float(item.remote_last_seen_at or 0.0)
                 print(
-                    f"Remote preprocessing lease reclaimed job={item.job_id} "
+                    f"Remote lease reclaimed job={item.job_id} kind={item.execution_kind} "
                     f"worker={item.worker_id} silence={silence:.0f}s "
                     f"reason={'worker silent' if worker_quiet else 'worker moved on'}",
                     flush=True,
                 )
-                await self._fallback_remote_preprocess(context, item, "worker heartbeat timed out")
+                await self._fallback_remote_item(context, item, "worker abandoned lease")
+
+    def _stale_remote_leases_locked(self, now: float, *, worker_quiet: bool) -> list[_QueuedJob]:
+        """Leases whose worker is gone or has explicitly asked for other work.
+
+        Full remote jobs used to be omitted here.  The laptop receives those
+        while the main PC is resting; if such a run crashed and the worker went
+        back to polling, its lease occupied a global slot forever.
+        """
+        return [
+            item
+            for item in self._leased.values()
+            if item.execution_kind in {"remote_preprocess", "remote"}
+            and now - float(item.remote_last_seen_at or 0.0) > LEASE_SILENCE_SECONDS
+            and (worker_quiet or self._worker_moved_on_locked(item))
+        ]
 
     async def lease_remote(
         self, context: Any, worker_id: str, engines: frozenset[str] | None = None
@@ -3720,6 +4113,11 @@ class _JobScheduler:
                 context.application.create_task(
                     self._fallback_remote_preprocess(context, item, f"worker error: {details}")
                 )
+            elif _is_remote_capacity_error(payload):
+                details = str(payload.get("error") or "Remote worker storage is full")
+                context.application.create_task(
+                    self._fallback_remote_item(context, item, f"worker capacity error: {details}")
+                )
             else:
                 context.application.create_task(self._fail_remote_item(context, item, payload))
 
@@ -3757,6 +4155,14 @@ class _JobScheduler:
 
     async def _fallback_remote_preprocess(self, context: Any, item: _QueuedJob, reason: str) -> None:
         item.job["remote_preprocess_fallback"] = reason
+        item.job["force_local"] = True
+        await self._requeue_after_remote_preprocess(context, item, fallback=True)
+
+    async def _fallback_remote_item(self, context: Any, item: _QueuedJob, reason: str) -> None:
+        if item.execution_kind == "remote_preprocess":
+            item.job["remote_preprocess_fallback"] = reason
+        else:
+            item.job["remote_worker_fallback"] = reason
         item.job["force_local"] = True
         await self._requeue_after_remote_preprocess(context, item, fallback=True)
 
@@ -3816,8 +4222,19 @@ class _JobScheduler:
             details = str(payload.get("error") or "Remote worker failed")
             traceback_text = str(payload.get("traceback") or details)
             job_dir = Path(str(item.job["job_dir"]))
+            stage = item.progress.describe().get("stage") if item.progress is not None else None
             (job_dir / "error.log").write_text(traceback_text, encoding="utf-8")
             _save_job_snapshot(job_dir, item.job, status="failed", error=details)
+            await _record_error(
+                context,
+                source="remote_worker",
+                details=details,
+                traceback_text=traceback_text,
+                job=item.job,
+                chat_id=item.chat_id,
+                stage=str(stage) if stage else None,
+                user_message=f"Задача упала:\n{details}",
+            )
             await _finish_progress(item.progress, item.progress_task, item.status_message, "Error", failed=True, detail=details)
             await context.bot.send_message(
                 chat_id=item.chat_id,
@@ -5384,10 +5801,21 @@ async def _process_job(
         traceback_text = traceback.format_exc()
         print(traceback_text, flush=True)
         details = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+        stage = progress.describe().get("stage") if progress is not None else None
         error_log = job_dir / "error.log"
         error_log.write_text(traceback_text, encoding="utf-8")
         _capture_progress_metrics(job, progress)
         _save_job_snapshot(job_dir, job, status="failed", error=details)
+        await _record_error(
+            context,
+            source="local_pipeline",
+            details=details,
+            traceback_text=traceback_text,
+            job=job,
+            chat_id=chat_id,
+            stage=str(stage) if stage else None,
+            user_message=f"Задача упала:\n{details}",
+        )
         await _finish_progress(progress, progress_task, status_message, "Ошибка", failed=True, detail=details)
         await context.bot.send_message(
             chat_id=chat_id,
@@ -5541,9 +5969,20 @@ async def _send_remote_worker_result(context: Any, item: _QueuedJob, manifest: d
         traceback_text = traceback.format_exc()
         print(traceback_text, flush=True)
         details = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+        stage = progress.describe().get("stage") if progress is not None else None
         (job_dir / "error.log").write_text(traceback_text, encoding="utf-8")
         _capture_progress_metrics(job, progress)
         _save_job_snapshot(job_dir, job, status="failed", error=details)
+        await _record_error(
+            context,
+            source="remote_result_delivery",
+            details=details,
+            traceback_text=traceback_text,
+            job=job,
+            chat_id=item.chat_id,
+            stage=str(stage) if stage else None,
+            user_message=f"Задача упала:\n{details}",
+        )
         await _finish_progress(progress, progress_task, status_message, "Error", failed=True, detail=details)
         await context.bot.send_message(
             chat_id=item.chat_id,
@@ -5687,6 +6126,22 @@ def _prepare_job_for_resume(job: dict[str, Any]) -> None:
     job["force_resume_requested_at"] = time.time()
     for key in ("error", "finished_at", "worker_id"):
         job.pop(key, None)
+
+
+def _is_remote_capacity_error(payload: dict[str, Any]) -> bool:
+    text = "\n".join(
+        str(payload.get(key) or "") for key in ("error", "traceback", "detail")
+    ).lower()
+    return any(
+        marker in text
+        for marker in (
+            "no space left on device",
+            "errno 28",
+            "not enough space on the disk",
+            "there is not enough space on the disk",
+            "disk full",
+        )
+    )
 
 
 def _job_number(job: dict[str, Any]) -> str:
