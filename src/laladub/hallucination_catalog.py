@@ -88,7 +88,24 @@ class HallucinationCatalog:
         seed: str = "",
         cross_language_share: float = 0.15,
     ) -> list[str]:
-        """Up to `count` distinct phrases for this language.
+        """Up to `count` distinct phrases for this language, text only."""
+        return [item.phrase for item in self.pick(lang, count, seed=seed, cross_language_share=cross_language_share)]
+
+    def pick(
+        self,
+        lang: str | None,
+        count: int,
+        *,
+        seed: str = "",
+        cross_language_share: float = 0.15,
+    ) -> list[Hallucination]:
+        """Up to `count` distinct phrases for this language, each with the
+        language it is really in.
+
+        The language matters: half the draw comes from other sections of the
+        catalogue, and a Hindi phrase handed to the translator as Vietnamese
+        comes back untouched - which is how Devanagari ended up spoken aloud
+        in Russian dubs.
 
         Seeded, so the same job asked twice gets the same phrases rather than a
         fresh set on every retry.
@@ -112,7 +129,7 @@ class HallucinationCatalog:
                 share = max(share, 1.0 - variety)
 
         rng = random.Random(hashlib.sha256(f"{seed}|{code}".encode("utf-8")).hexdigest())
-        chosen: list[str] = []
+        chosen: list[Hallucination] = []
         chosen_words: list[set[str]] = []
         seen: set[str] = set()
         # Bounded rather than "until we have enough": a language with three
@@ -136,7 +153,7 @@ class HallucinationCatalog:
             if attempt < count * 12 and _too_similar(item.phrase, chosen_words):
                 continue
             seen.add(key)
-            chosen.append(item.phrase)
+            chosen.append(item)
             chosen_words.append(_word_set(item.phrase))
         return chosen
 

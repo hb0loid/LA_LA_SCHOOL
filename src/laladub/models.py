@@ -14,6 +14,10 @@ class Segment:
     speaker_wav: Path | None = None
     speaker_id: str | None = None
     speaker_ref_text: str | None = None
+    # Set when the text is known to be in a different language from the rest
+    # of the job - a catalogue artifact borrowed from another language. Left
+    # None for ordinary lines, whose language is the job's source language.
+    source_lang: str | None = None
 
     @property
     def duration(self) -> float:

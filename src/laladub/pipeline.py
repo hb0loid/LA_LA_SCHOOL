@@ -1385,7 +1385,7 @@ def _catalog_artifact_segments(
     injectable = len(base_segments) * max(0.05, float(config.artifact_ratio or 0.2))
     wanted = int(max(8, min(32, round(injectable * 3))))
     catalog = shared_catalog(getattr(config, "hallucination_catalog_path", None) or None)
-    phrases = catalog.phrases(
+    phrases = catalog.pick(
         artifact_lang,
         wanted,
         seed=str(config.translation_seed or config.workdir),
@@ -1398,10 +1398,15 @@ def _catalog_artifact_segments(
     duration = max(1.0, source_duration)
     step = duration / (len(phrases) + 1)
     segments: list[Segment] = []
-    for index, phrase in enumerate(phrases, start=1):
+    for index, item in enumerate(phrases, start=1):
         start = min(duration - 0.5, max(0.0, step * index))
         segments.append(
-            Segment(start=start, end=min(duration, start + _estimated_chaos_spoken_duration(phrase)), text=phrase)
+            Segment(
+                start=start,
+                end=min(duration, start + _estimated_chaos_spoken_duration(item.phrase)),
+                text=item.phrase,
+                source_lang=item.lang,
+            )
         )
     print(
         f"      Artifact catalogue: {len(segments)} phrase(s) for {artifact_lang}"
@@ -1959,8 +1964,47 @@ def _translate_and_clean_artifacts(
     for artifact in artifacts:
         if artifact.translated_text:
             artifact.translated_text = _rebrand_foreign_channel(artifact.translated_text, artifact_config)
+    untranslated = [
+        artifact
+        for artifact in artifacts
+        if _spoken_in_foreign_script(artifact.spoken_text, artifact_config.target_lang)
+    ]
+    if untranslated:
+        # The translator sometimes hands a phrase back in its original script,
+        # and a voice reading Devanagari letter by letter is not an artifact,
+        # it is noise. Whatever survived translation in the wrong alphabet is
+        # dropped here, whichever route let it through.
+        print(f"      Dropping {len(untranslated)} artifact(s) still in a foreign script")
+        artifacts = [artifact for artifact in artifacts if artifact not in untranslated]
     write_srt(output_path, artifacts, translated=True)
     return artifacts
+
+
+# Target languages written in Latin or Cyrillic letters. For these, any letter
+# from another alphabet in the final text means the translation did not happen.
+_LATIN_CYRILLIC_TARGETS = frozenset(
+    {"ru", "uk", "be", "bg", "sr", "mk", "kk", "en", "de", "fr", "es", "it", "pt", "pl", "cs", "sk", "sl",
+     "hr", "ro", "hu", "nl", "sv", "da", "no", "nb", "fi", "et", "lv", "lt", "tr", "vi", "id", "ms", "tl",
+     "sw", "az", "ca", "gl", "eu", "sq"}
+)
+
+
+def _spoken_in_foreign_script(text: str, target_lang: str | None) -> bool:
+    if (target_lang or "").strip().casefold() not in _LATIN_CYRILLIC_TARGETS:
+        return False
+    for char in text:
+        if not char.isalpha():
+            continue
+        code = ord(char)
+        if not (
+            code <= 0x024F  # Latin, with the accents of Western Europe
+            or 0x0400 <= code <= 0x052F  # Cyrillic
+            or 0x1E00 <= code <= 0x1EFF  # Latin Extended Additional: Vietnamese tone marks
+            or 0x2C60 <= code <= 0x2C7F  # Latin Extended-C
+            or 0xA720 <= code <= 0xA7FF  # Latin Extended-D
+        ):
+            return True
+    return False
 
 
 def _translate_dub_segments(segments: list[Segment], config: DubConfig) -> list[Segment]:
@@ -2163,18 +2207,35 @@ def _translate_artifact_segments(artifacts: list[Segment], artifact_config: DubC
 
     groups: dict[str, list[Segment]] = {}
     for segment in artifacts:
-        source_lang = _artifact_translation_source_lang(segment.text, artifact_config.source_lang)
+        # A catalogue phrase knows its own language; only a hunted one has to
+        # be guessed from its text.
+        source_lang = segment.source_lang or _artifact_translation_source_lang(
+            segment.text, artifact_config.source_lang
+        )
         groups.setdefault(source_lang, []).append(segment)
 
     if len(groups) > 1:
         summary = ", ".join(f"{lang}:{len(items)}" for lang, items in sorted(groups.items()))
         print(f"      Artifact translation language split: {summary}")
 
+    kept: list[Segment] = []
     for source_lang, group in groups.items():
         group_config = copy(artifact_config)
         group_config.source_lang = source_lang
-        translate_segments(group, group_config)
-    return artifacts
+        try:
+            translate_segments(group, group_config)
+        except Exception as exc:
+            # An artifact is decoration. One that cannot be translated is
+            # dropped rather than either failing the job or being read out
+            # in its original script.
+            print(
+                f"      Artifact translation from {source_lang} failed; dropping {len(group)} phrase(s): "
+                f"{type(exc).__name__}: {exc}"
+            )
+            continue
+        kept.extend(group)
+    kept.sort(key=lambda segment: segment.start)
+    return kept
 
 
 def _artifact_translation_source_lang(text: str, fallback_lang: str | None) -> str:
