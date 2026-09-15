@@ -812,6 +812,23 @@ async def moderation_callback(update: Any, context: Any) -> None:
         await _note(store, int(moderator_id), sent)
         return
 
+    if action == "comment":
+        if submission.status != "pending" or submission.publication_message_id is not None:
+            await query.answer("Пост уже опубликован — комментарий менять поздно.", show_alert=True)
+            return
+        context.user_data["edit_comment_submission_id"] = submission_id
+        await query.answer()
+        from telegram import ForceReply
+
+        current = str(submission.author_comment or "").strip()
+        prompt = f"Пришли новый комментарий для работы №{submission.job_number}."
+        if current:
+            prompt += f"\n\nСейчас:\n{current}"
+        prompt += "\n\nОтправь один дефис (-), чтобы удалить комментарий."
+        sent = await query.message.reply_text(prompt, reply_markup=ForceReply(selective=True))
+        await _note(store, int(moderator_id), sent)
+        return
+
     decisions = {
         "main": ("main", settings.main_channel),
         "shame": ("shame", settings.shame_channel),
@@ -1116,8 +1133,8 @@ async def _refresh_moderator_messages(
                 caption=caption,
                 parse_mode="HTML",
                 reply_markup=(
-                    _moderation_keyboard(submission.id)
-                    if submission.status == "pending" and scheduled_for is None
+                    _moderation_keyboard(submission.id, decisions=scheduled_for is None)
+                    if submission.status == "pending"
                     else None
                 ),
             )
@@ -1128,6 +1145,38 @@ async def relay_message(update: Any, context: Any) -> None:
     store: ProposalStore = context.application.bot_data["store"]
     moderator_id = getattr(update.effective_user, "id", None)
     if not _is_moderator(settings, moderator_id):
+        return
+    edit_comment_submission_id = context.user_data.pop("edit_comment_submission_id", None)
+    if edit_comment_submission_id is not None:
+        text = str(update.effective_message.text or "").strip()
+        comment = None if text == "-" else text
+        if comment is not None and len(comment) > 600:
+            context.user_data["edit_comment_submission_id"] = edit_comment_submission_id
+            sent = await update.effective_message.reply_text(
+                f"Комментарий слишком длинный: {len(comment)} символов. Максимум — 600."
+            )
+            await _note(store, int(moderator_id), sent)
+            return
+        try:
+            updated = await asyncio.to_thread(
+                store.update_author_comment, int(edit_comment_submission_id), comment
+            )
+        except Exception as exc:
+            sent = await update.effective_message.reply_text(f"Не удалось изменить комментарий: {exc}")
+            await _note(store, int(moderator_id), sent)
+            return
+        scheduled = await asyncio.to_thread(store.pending_schedule_for_submission, updated.id)
+        await _refresh_moderator_messages(
+            context.bot,
+            store,
+            updated,
+            scheduled_for=scheduled.scheduled_for if scheduled is not None else None,
+        )
+        result = "удалён" if comment is None else "обновлён"
+        sent = await update.effective_message.reply_text(
+            f"Комментарий к работе №{updated.job_number} {result}."
+        )
+        await _note(store, int(moderator_id), sent)
         return
     submission_id = context.user_data.pop("relay_submission_id", None)
     if submission_id is None:
@@ -1149,18 +1198,21 @@ async def relay_message(update: Any, context: Any) -> None:
     await _note(store, int(moderator_id), sent)
 
 
-def _moderation_keyboard(submission_id: int) -> Any:
+def _moderation_keyboard(submission_id: int, *, decisions: bool = True) -> Any:
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-    return InlineKeyboardMarkup(
-        [
+    rows = []
+    if decisions:
+        rows.append(
             [
                 InlineKeyboardButton("В La La School", callback_data=f"mod:main:{submission_id}"),
                 InlineKeyboardButton("В Ghien Mi Go", callback_data=f"mod:shame:{submission_id}"),
-            ],
-            [InlineKeyboardButton("Передать сообщение", callback_data=f"mod:message:{submission_id}")],
-        ]
-    )
+            ]
+        )
+    rows.append([InlineKeyboardButton("✏️ Изменить комментарий", callback_data=f"mod:comment:{submission_id}")])
+    if decisions:
+        rows.append([InlineKeyboardButton("Передать сообщение", callback_data=f"mod:message:{submission_id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 _MODERATION_CAPTION_LIMIT = 1024
@@ -1191,7 +1243,7 @@ def _moderation_caption(submission: Submission, *, transcript: str | None = None
         comment = submission.author_comment.strip()
         if len(comment) > 600:
             comment = comment[:599].rstrip() + "…"
-        lines.insert(3, f"Комментарий: {html.escape(comment)}")
+        lines.insert(2, f"💬 <b>Комментарий автора:</b>\n<blockquote>{html.escape(comment)}</blockquote>")
     if submission.destination:
         lines.append(f"Решение: {destination_labels.get(submission.destination, html.escape(submission.destination))}")
         lines.append(f"Карма за работу: {format_karma_milli(submission.karma_milli, signed=True)}")
@@ -1231,10 +1283,24 @@ def _publication_caption(submission: Submission) -> str:
     return f"{html.escape(comment)}\n\n{author}"
 
 
+def _submission_job_dir(submission: Submission) -> Path:
+    """Return the job root for both local and remotely produced videos."""
+    video_dir = Path(submission.video_path).parent
+    for candidate in (video_dir, *video_dir.parents):
+        if (candidate / "job.json").is_file():
+            return candidate
+    return video_dir
+
+
 def _find_submission_subtitles(submission: Submission) -> Path | None:
-    job_dir = Path(submission.video_path).parent
+    job_dir = _submission_job_dir(submission)
     candidates = [
         *sorted(job_dir.glob("*_transcript_lalaschool.txt")),
+        *sorted(job_dir.glob("*_lalaschool_transcript.txt")),
+        job_dir / "transcript_lalaschool.txt",
+        *sorted((job_dir / "remote_result" / "transcript").glob("*_transcript_lalaschool.txt")),
+        *sorted((job_dir / "remote_result" / "transcript").glob("*_lalaschool_transcript.txt")),
+        job_dir / "remote_result" / "transcript" / "transcript_lalaschool.txt",
         job_dir / "work" / "translated.srt",
     ]
     work_dir = job_dir / "work"
@@ -1266,7 +1332,7 @@ def _transcript_text_for_submission(submission: Submission) -> str | None:
 
 def _find_submission_original_video(submission: Submission) -> Path | None:
     """The source video the dub was made from, as downloaded into the job folder."""
-    job_dir = Path(submission.video_path).parent
+    job_dir = _submission_job_dir(submission)
     for candidate in sorted(job_dir.glob("input.*")):
         if (
             candidate.suffix.lower() in {".mp4", ".mkv", ".mov", ".webm"}
@@ -1278,14 +1344,16 @@ def _find_submission_original_video(submission: Submission) -> Path | None:
 
 
 async def _send_respecting_flood_limit(send: Any, *, attempts: int = 4) -> None:
-    """Run a send, waiting out Telegram's rate limit instead of losing the message.
+    """Run a send, retrying Telegram's temporary transport failures.
 
     A restart replays whatever forwards piled up, so several posts can want a
     comment at once and trip flood control. That is a "wait and retry" answer,
     not a failure - treating it as one silently dropped the comment for the post
-    that happened to be behind the backlog.
+    that happened to be behind the backlog. Timeouts and brief network failures
+    caused the same permanent subtitle loss, so they use a short bounded retry
+    here as well.
     """
-    from telegram.error import RetryAfter
+    from telegram.error import NetworkError, RetryAfter, TimedOut
 
     for attempt in range(attempts):
         try:
@@ -1296,6 +1364,16 @@ async def _send_respecting_flood_limit(send: Any, *, attempts: int = 4) -> None:
                 raise
             delay = float(getattr(exc, "retry_after", 5) or 5) + 1.0
             print(f"Comment send rate-limited, waiting {delay:.0f}s", flush=True)
+            await asyncio.sleep(delay)
+        except (TimedOut, NetworkError) as exc:
+            if attempt == attempts - 1:
+                raise
+            delay = min(12.0, 2.0 * (2**attempt))
+            print(
+                f"Comment send temporarily failed ({type(exc).__name__}), "
+                f"retrying in {delay:.0f}s",
+                flush=True,
+            )
             await asyncio.sleep(delay)
 
 

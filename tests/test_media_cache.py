@@ -8,9 +8,11 @@ from pathlib import Path
 
 from laladub.pipeline import (
     _covers_source_duration,
+    _seed_media_cache_from_legacy_jobs,
     _store_cached_file,
     _store_legacy_media_cache,
 )
+from laladub.ffmpeg import prepare_voice_reference, probe_duration
 
 FFMPEG = shutil.which("ffmpeg")
 
@@ -139,6 +141,49 @@ class StoreCachedFileOverwriteTests(unittest.TestCase):
         fresh = self._write(self.dir / "fresh.wav", b"new" * 1024)
         _store_cached_file(self.cache_entry, fresh, "source_16k.wav", overwrite=True)
         self.assertEqual((self.cache_entry / "source_16k.wav").read_bytes(), b"new" * 1024)
+
+
+class LegacyMediaCacheCleanupRaceTests(unittest.TestCase):
+    def test_disappearing_legacy_job_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            workdir = root / "runs" / "bot-release" / "current" / "work"
+            workdir.mkdir(parents=True)
+            legacy_job = root / "runs" / "bot-release" / "old" / "job.json"
+            legacy_job.parent.mkdir(parents=True)
+            legacy_job.write_text("{}", encoding="utf-8")
+            cache_entry = root / "cache" / ("a" * 64)
+            cache_entry.mkdir(parents=True)
+
+            from laladub.models import DubConfig
+            from unittest.mock import patch
+
+            config = DubConfig(output=root / "out.mp4", workdir=workdir)
+            original_stat = Path.stat
+
+            def disappearing_stat(path: Path, *args, **kwargs):
+                if path == legacy_job:
+                    raise FileNotFoundError(path)
+                return original_stat(path, *args, **kwargs)
+
+            with patch.object(Path, "stat", disappearing_stat):
+                self.assertFalse(
+                    _seed_media_cache_from_legacy_jobs(root / "input.mp4", cache_entry, config)
+                )
+
+
+@unittest.skipIf(FFMPEG is None, "ffmpeg is required to build the sample media")
+class VoiceReferenceDurationTests(unittest.TestCase):
+    def test_reference_is_kept_below_cosyvoice_thirty_second_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source = root / "long.wav"
+            reference = root / "reference.wav"
+            _make_wav(source, 31.0)
+
+            prepare_voice_reference(source, reference)
+
+            self.assertLessEqual(probe_duration(reference), 29.1)
 
 
 if __name__ == "__main__":

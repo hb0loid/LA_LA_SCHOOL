@@ -12,7 +12,12 @@ authors = [{ name = "HBoloid" }]
 dependencies = []
 
 [project.optional-dependencies]
-asr = ["faster-whisper>=1.0.0"]
+asr = [
+    "faster-whisper>=1.0.0",
+    "openai-whisper>=20250625",
+    # Numba 0.61 rejects NumPy 2.3+, while current audio/OpenCV packages need 2.x.
+    "numpy>=2.0,<2.3",
+]
 translate = ["argostranslate>=1.9.6"]
 bot = ["python-telegram-bot>=21.0", "yt-dlp>=2025.1.0"]
 clone = ["TTS>=0.22.0", "transformers==4.49.0"]

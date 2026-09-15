@@ -63,10 +63,14 @@ def _transcribe_faster_whisper(audio_path: Path, config: DubConfig) -> list[Segm
 def _transcribe_openai_whisper(audio_path: Path, config: DubConfig) -> list[Segment]:
     try:
         import whisper
-    except ImportError as exc:
+    except ModuleNotFoundError as exc:
+        if exc.name != "whisper":
+            raise RuntimeError(f"openai-whisper dependency failed to import: {exc}") from exc
         raise RuntimeError(
             "openai-whisper is not installed. Run: python -m pip install openai-whisper"
         ) from exc
+    except ImportError as exc:
+        raise RuntimeError(f"openai-whisper dependency failed to import: {exc}") from exc
 
     glitchy = config.glitch_profile in {"faithful", "ghost"}
     device = None if config.whisper_device == "auto" else config.whisper_device

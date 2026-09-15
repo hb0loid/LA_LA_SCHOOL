@@ -686,7 +686,12 @@ def normalize_wav(input_path: Path, output_path: Path, sample_rate: int = 44100)
     )
 
 
-def prepare_voice_reference(input_path: Path, output_path: Path, sample_rate: int = 24000) -> None:
+def prepare_voice_reference(
+    input_path: Path,
+    output_path: Path,
+    sample_rate: int = 24000,
+    max_seconds: float = 28.0,
+) -> None:
     ffmpeg = require_tool("ffmpeg")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     run(
@@ -705,6 +710,8 @@ def prepare_voice_reference(input_path: Path, output_path: Path, sample_rate: in
             "1",
             "-ar",
             str(sample_rate),
+            "-t",
+            f"{max(1.0, min(float(max_seconds), 29.0)):.3f}",
             "-c:a",
             "pcm_s16le",
             str(output_path),

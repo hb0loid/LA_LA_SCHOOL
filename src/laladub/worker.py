@@ -61,6 +61,12 @@ def main(argv: list[str] | None = None) -> None:
         save_config=not args.no_save_config,
     )
     workdir.mkdir(parents=True, exist_ok=True)
+    deleted_jobs, freed_bytes = _cleanup_worker_jobs(workdir)
+    if deleted_jobs:
+        print(
+            f"Worker cleanup: deleted={deleted_jobs}, freed={freed_bytes / (1024 ** 3):.2f} GB",
+            flush=True,
+        )
     client.contact_path = _start_stall_heartbeat(workdir)
     _ensure_windows_autostart()
     engines = ",".join(installed_engines(load_bot_settings(require_token=False)))
@@ -399,6 +405,7 @@ def _run_lease(client: CoordinatorClient, lease: dict[str, Any], workdir: Path) 
     )
     heartbeat_thread.start()
     heartbeat_process = _start_external_lease_heartbeat(client, job_id)
+    terminal_reported = False
 
     try:
         client.download_input(job_id, input_path)
@@ -415,17 +422,76 @@ def _run_lease(client: CoordinatorClient, lease: dict[str, Any], workdir: Path) 
         manifest = result_manifest(result)
         _upload_result_files(client, job_id, result)
         client.complete(job_id, manifest)
-        save_job_snapshot(job_dir, job, status="done")
+        terminal_reported = True
+        with contextlib.suppress(OSError):
+            save_job_snapshot(job_dir, job, status="done")
         print(f"Completed job {job_id}", flush=True)
     except Exception as exc:
         traceback_text = traceback.format_exc()
         print(traceback_text, flush=True)
-        save_job_snapshot(job_dir, remote_job, status="failed", error=str(exc))
+        # Reporting the failure is more important than saving another local
+        # file precisely when the failure is an out-of-disk condition.
+        with contextlib.suppress(OSError):
+            save_job_snapshot(job_dir, remote_job, status="failed", error=str(exc))
         client.fail(job_id, "".join(traceback.format_exception_only(type(exc), exc)).strip(), traceback_text)
+        terminal_reported = True
     finally:
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=2.0)
         _stop_external_lease_heartbeat(heartbeat_process)
+        if terminal_reported:
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def _cleanup_worker_jobs(workdir: Path, *, orphan_age_seconds: float = 6 * 60 * 60) -> tuple[int, int]:
+    """Remove disposable worker copies left behind after reported jobs.
+
+    The coordinator owns the original input and final result.  A worker's
+    ``runs/worker/jobs`` tree is only a processing cache, but older builds kept
+    every completed and failed copy forever until the laptop disk filled up.
+    """
+    jobs_dir = workdir / "jobs"
+    if not jobs_dir.is_dir():
+        return 0, 0
+    deleted = 0
+    freed = 0
+    now = time.time()
+    for job_dir in jobs_dir.iterdir():
+        if not job_dir.is_dir():
+            continue
+        snapshot = job_dir / "job.json"
+        status = ""
+        if snapshot.is_file():
+            try:
+                status = str(json.loads(snapshot.read_text(encoding="utf-8")).get("status") or "")
+            except Exception:
+                status = ""
+        try:
+            stale_orphan = not snapshot.is_file() and now - job_dir.stat().st_mtime >= orphan_age_seconds
+        except OSError:
+            stale_orphan = False
+        if status not in {"done", "failed", "rejected"} and not stale_orphan:
+            continue
+        size = _directory_size(job_dir)
+        try:
+            shutil.rmtree(job_dir)
+        except OSError as exc:
+            print(f"Worker cleanup skipped {job_dir}: {type(exc).__name__}: {exc}", flush=True)
+            continue
+        deleted += 1
+        freed += size
+    return deleted, freed
+
+
+def _directory_size(path: Path) -> int:
+    total = 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:
+            continue
+    return total
 
 
 def _settings_for_worker_job(settings: BotSettings, job: dict[str, Any]) -> BotSettings:

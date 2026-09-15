@@ -151,6 +151,7 @@ Set-LaLaDubModelCaches
 $env:LALADUB_BOT_TOKEN = $ReleaseBotToken
 $env:LALADUB_PAID_USERS_FILE = (Join-Path $Root "paid_users.txt")
 $env:LALADUB_ADMIN_USERS_FILE = (Join-Path $Root "admins.txt")
+$env:LALADUB_LOCAL_FILE_USERS = "631551040"
 $env:LALADUB_BOT_WORKDIR = $WorkDir
 $env:LALADUB_PROPOSAL_ENABLED = "1"
 $env:LALADUB_PROPOSAL_DB = (Join-Path $Root "runs\proposal\proposals.sqlite3")
@@ -304,12 +305,16 @@ $env:LALADUB_ARTIFACT_RATIO = "0.30"
 # median job has only 8 lines. At 3 that falls to 17%.
 $env:LALADUB_ARTIFACT_MIN_SOURCE_SEGMENTS = "3"
 $env:LALADUB_ARTIFACT_MIN_GAP_SECONDS = "0.5"
-$env:LALADUB_DISTORT_TRANSLATION = "1"
+# Test profile: keep the ordinary source->Russian translation and genuine
+# Whisper/catalog artifacts, but temporarily disable the repeated multilingual
+# telephone chains. This is deliberately one switch for an easy A/B rollback.
+$env:LALADUB_DISTORT_TRANSLATION = "0"
+$env:LALADUB_TRANSLATION_WORKERS = "3"
 $env:LALADUB_TRANSLATION_PIVOTS = "input,en|input,ja,en|input,tr,de,en|en,de|en,fr|en,es|en,ja,ko|en,tr,ar|input,en,de|input,ja,ko,en|input,tr,ar,en|en,th,he,en|en,ms,he,en"
 # Each hop is one call to a free translation API; longer chains are what got the
 # bot rate-limited. Chains above this length are trimmed, not dropped.
 $env:LALADUB_MAX_TRANSLATION_HOPS = "3"
-$env:LALADUB_TRANSLATION_SECOND_PASS_RATIO = "0.45"
+$env:LALADUB_TRANSLATION_SECOND_PASS_RATIO = "0"
 $env:LALADUB_ASR_BACKEND = "faster-whisper"
 $env:LALADUB_DEFAULT_ASR_METHOD = "ow-large-v3-chaos-backbone"
 $env:LALADUB_WHISPER_DEVICE = "cuda"

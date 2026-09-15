@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -24,12 +25,14 @@ from laladub.proposal_bot import (
     _moderation_caption,
     _moderation_keyboard,
     _process_scheduled_post,
+    _publication_caption,
     _transcript_text_for_submission,
     _split_telegram_text,
     clean_command,
     comment_on_channel_forward,
     moderation_callback,
     post_command,
+    relay_message,
     scheduled_command,
     send_due_scheduled_posts,
     timer_command,
@@ -45,6 +48,22 @@ class ProposalStoreTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
+
+    def test_comment_can_be_edited_before_publication(self) -> None:
+        submission, _created = self.store.create_submission(
+            job_number="comment-1",
+            user_id=123,
+            chat_id=123,
+            author_name="Тест",
+            author_username=None,
+            video_path=Path(self.tempdir.name) / "video.mp4",
+            output_filename="video.mp4",
+            author_comment="старый текст",
+        )
+        updated = self.store.update_author_comment(submission.id, "новый текст")
+        self.assertEqual(updated.author_comment, "новый текст")
+        cleared = self.store.update_author_comment(submission.id, None)
+        self.assertIsNone(cleared.author_comment)
 
     def test_submission_is_idempotent_and_karma_is_adjusted(self) -> None:
         submission, created = self.store.create_submission(
@@ -287,9 +306,21 @@ class ProposalUiTests(unittest.TestCase):
             labels,
             [
                 ["В La La School", "В Ghien Mi Go"],
+                ["✏️ Изменить комментарий"],
                 ["Передать сообщение"],
             ],
         )
+
+    def test_scheduled_keyboard_keeps_only_comment_editor(self) -> None:
+        keyboard = _moderation_keyboard(7, decisions=False).inline_keyboard
+        self.assertEqual([[button.text for button in row] for row in keyboard], [["✏️ Изменить комментарий"]])
+
+    def test_comment_is_separated_only_in_moderation(self) -> None:
+        submission = replace(self._minimal_submission(), author_comment="Не печатать без проверки")
+        moderation = _moderation_caption(submission)
+        self.assertIn("💬 <b>Комментарий автора:</b>\n<blockquote>Не печатать без проверки</blockquote>", moderation)
+        publication = _publication_caption(submission)
+        self.assertEqual(publication, "Не печатать без проверки\n\n👤 <b><a href=\"tg://user?id=123\">Тест</a></b>")
 
     def _make_submission_for_subtitles(self, job_dir: Path) -> Submission:
         return Submission(
@@ -334,6 +365,41 @@ class ProposalUiTests(unittest.TestCase):
             translated.write_text("1\n00:00:00,000 --> 00:00:01,000\nТест\n", encoding="utf-8")
             submission = self._make_submission_for_subtitles(job_dir)
             self.assertEqual(_find_submission_subtitles(submission), translated)
+
+    def test_subtitles_are_found_for_remote_worker_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            job_dir = Path(tempdir)
+            (job_dir / "job.json").write_text("{}", encoding="utf-8")
+            video_dir = job_dir / "remote_result" / "video"
+            transcript_dir = job_dir / "remote_result" / "transcript"
+            video_dir.mkdir(parents=True)
+            transcript_dir.mkdir(parents=True)
+            transcript = transcript_dir / "video_transcript_lalaschool.txt"
+            transcript.write_text("Тест с ноутбука\n", encoding="utf-8")
+            submission = self._make_submission_for_subtitles(video_dir)
+            self.assertEqual(_find_submission_subtitles(submission), transcript)
+
+    def test_subtitles_are_found_for_fixed_remote_result_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            job_dir = Path(tempdir)
+            (job_dir / "job.json").write_text("{}", encoding="utf-8")
+            video_dir = job_dir / "remote_result" / "video"
+            transcript_dir = job_dir / "remote_result" / "transcript"
+            video_dir.mkdir(parents=True)
+            transcript_dir.mkdir(parents=True)
+            transcript = transcript_dir / "transcript_lalaschool.txt"
+            transcript.write_text("ТЕКСТ С НОУТБУКА\n", encoding="utf-8")
+            submission = self._make_submission_for_subtitles(video_dir)
+            self.assertEqual(_find_submission_subtitles(submission), transcript)
+            self.assertEqual(_transcript_text_for_submission(submission), "ТЕКСТ С НОУТБУКА")
+
+    def test_subtitles_are_found_with_legacy_reversed_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            job_dir = Path(tempdir)
+            transcript = job_dir / "video_lalaschool_transcript.txt"
+            transcript.write_text("СТАРЫЙ ТЕКСТ\n", encoding="utf-8")
+            submission = self._make_submission_for_subtitles(job_dir)
+            self.assertEqual(_find_submission_subtitles(submission), transcript)
 
     def test_published_caption_is_marked_with_check(self) -> None:
         submission = Submission(
@@ -674,6 +740,20 @@ class _AlwaysFloodSpy:
         raise RetryAfter(0)
 
 
+class _TimeoutThenSucceedSpy:
+    def __init__(self) -> None:
+        self.attempts = 0
+        self.calls: list[dict] = []
+
+    async def __call__(self, **kwargs) -> None:
+        self.attempts += 1
+        if self.attempts == 1:
+            from telegram.error import TimedOut
+
+            raise TimedOut("temporary timeout")
+        self.calls.append(kwargs)
+
+
 class CommentFloodControlTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self._tempdir = tempfile.TemporaryDirectory()
@@ -716,6 +796,16 @@ class CommentFloodControlTests(unittest.IsolatedAsyncioTestCase):
         spy = _FloodThenSucceedSpy(failures=1)
         await comment_on_channel_forward(self._update(), self._context(spy))
         # It went out on the retry rather than being lost to the backlog.
+        self.assertEqual(len(spy.calls), 1)
+        self.assertEqual(spy.calls[0]["text"], "Привет мир")
+        self.assertFalse(self.store.mark_comment_posted(submission.id))
+
+    async def test_retries_after_a_timeout_instead_of_dropping_the_comment(self) -> None:
+        submission = self._publish()
+        spy = _TimeoutThenSucceedSpy()
+        with patch("laladub.proposal_bot.asyncio.sleep", new=AsyncMock()):
+            await comment_on_channel_forward(self._update(), self._context(spy))
+        self.assertEqual(spy.attempts, 2)
         self.assertEqual(len(spy.calls), 1)
         self.assertEqual(spy.calls[0]["text"], "Привет мир")
         self.assertFalse(self.store.mark_comment_posted(submission.id))
@@ -983,6 +1073,7 @@ class ModerationCallbackDelayedPostingTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(
             application=SimpleNamespace(bot_data={"settings": self.settings, "store": self.store}),
             bot=SimpleNamespace(edit_message_caption=AsyncMock()),
+            user_data={},
         )
 
     def _click(self, destination_action: str, submission: Submission) -> tuple[SimpleNamespace, SimpleNamespace]:
@@ -1006,7 +1097,15 @@ class ModerationCallbackDelayedPostingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pending[0].destination, "main")
         query.message.reply_text.assert_awaited_once()
 
-    async def test_scheduling_hides_the_decision_buttons_on_the_moderator_message(self) -> None:
+    async def test_edit_comment_button_waits_for_moderator_text(self) -> None:
+        submission = self._submission("1")
+        update, query = self._click("comment", submission)
+        context = self._context()
+        await moderation_callback(update, context)
+        self.assertEqual(context.user_data["edit_comment_submission_id"], submission.id)
+        query.message.reply_text.assert_awaited_once()
+
+    async def test_scheduling_keeps_only_comment_editor_on_the_moderator_message(self) -> None:
         submission = self._submission("1")
         self.store.record_moderator_message(submission.id, 631551040, -100, 55)
         update, _query = self._click("main", submission)
@@ -1015,7 +1114,8 @@ class ModerationCallbackDelayedPostingTests(unittest.IsolatedAsyncioTestCase):
             await moderation_callback(update, context)
         context.bot.edit_message_caption.assert_awaited_once()
         kwargs = context.bot.edit_message_caption.call_args.kwargs
-        self.assertIsNone(kwargs["reply_markup"])
+        labels = [[button.text for button in row] for row in kwargs["reply_markup"].inline_keyboard]
+        self.assertEqual(labels, [["✏️ Изменить комментарий"]])
         self.assertIn("Запланировано", kwargs["caption"])
 
     async def test_second_click_on_the_same_submission_is_rejected_not_double_scheduled(self) -> None:
@@ -1502,6 +1602,16 @@ class FindOriginalVideoTests(unittest.TestCase):
             original = job_dir / "input.mp4"
             original.write_bytes(b"x" * 4096)
             self.assertEqual(_find_submission_original_video(self._submission(job_dir)), original)
+
+    def test_finds_source_when_dub_is_in_remote_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            job_dir = Path(tempdir)
+            (job_dir / "job.json").write_text("{}", encoding="utf-8")
+            original = job_dir / "input.mp4"
+            original.write_bytes(b"x" * 4096)
+            video_dir = job_dir / "remote_result" / "video"
+            video_dir.mkdir(parents=True)
+            self.assertEqual(_find_submission_original_video(self._submission(video_dir)), original)
 
     def test_ignores_the_trimmed_and_audio_variants(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

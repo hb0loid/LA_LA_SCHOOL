@@ -620,13 +620,55 @@ def _lalaschool_filename(source_title: str, suffix: str) -> str:
 def _read_transcript_text(srt_path: Path) -> str:
     if not srt_path.exists():
         return ""
+    # Keep the transcript produced on a remote worker visually identical to
+    # one produced by the main bot: injected artifacts are upper-cased, as are
+    # censor substitutions.  Previously the worker exported the raw SRT and
+    # silently lost those marks before uploading the TXT result.
+    artifacts = _artifact_texts(srt_path.parent.parent)
+    censor_pattern = _censor_replacement_pattern()
     lines: list[str] = []
     for line in srt_path.read_text(encoding="utf-8", errors="replace").splitlines():
         stripped = line.strip()
         if not stripped or stripped.isdigit() or "-->" in stripped:
             continue
+        if _transcript_key(stripped) in artifacts:
+            stripped = stripped.upper()
+        elif censor_pattern is not None:
+            stripped = censor_pattern.sub(lambda match: match.group(0).upper(), stripped)
         lines.append(stripped)
     return re.sub(r"\s+", " ", " ".join(lines)).strip()
+
+
+def _transcript_key(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+def _artifact_texts(job_dir: Path) -> set[str]:
+    path = job_dir / "work" / "debug" / "artifact_injected.srt"
+    if not path.is_file():
+        return set()
+    texts: set[str] = set()
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.isdigit() or "-->" in stripped:
+            continue
+        texts.add(_transcript_key(stripped))
+    return texts
+
+
+def _censor_replacement_pattern() -> "re.Pattern[str] | None":
+    try:
+        from .censor import _ACTIVE_REPLACEMENTS
+    except Exception:
+        return None
+    phrases = sorted(
+        {phrase.strip() for phrase in _ACTIVE_REPLACEMENTS if phrase and phrase.strip()},
+        key=len,
+        reverse=True,
+    )
+    if not phrases:
+        return None
+    return re.compile("|".join(re.escape(phrase) for phrase in phrases), re.IGNORECASE)
 
 
 def _write_transcript_text(job_dir: Path, source_title: str, transcript_text: str) -> Path:

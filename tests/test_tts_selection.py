@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from laladub.bot import TTS_METHOD_CHOICES, select_target_lang, select_tts_method
+from laladub.bot import ADMIN_TTS_METHOD_CHOICES, TTS_METHOD_CHOICES, select_target_lang, select_tts_method
 
 
 class _Query:
@@ -21,6 +21,14 @@ def _context(job: dict) -> SimpleNamespace:
     return SimpleNamespace(
         user_data={"job": job},
         application=SimpleNamespace(bot_data={}),
+    )
+
+
+def _admin_context(job: dict) -> SimpleNamespace:
+    settings = SimpleNamespace(is_admin=lambda user_id: user_id == 42)
+    return SimpleNamespace(
+        user_data={"job": job},
+        application=SimpleNamespace(bot_data={"settings": settings}),
     )
 
 
@@ -87,6 +95,15 @@ class SelectTargetLangTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tts_provider", self.job)
         self.assertIn("Выбери движок озвучки", query.message.edit_text.call_args.args[0])
 
+    async def test_admin_gets_engine_screen(self) -> None:
+        query = _Query("tgt:ru")
+        context = _admin_context(self.job)
+        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=42))
+        with patch("laladub.bot._enqueue_job", new=AsyncMock()) as enqueue:
+            await select_target_lang(update, context)
+        enqueue.assert_not_called()
+        self.assertIn("Выбери движок озвучки", query.message.edit_text.call_args.args[0])
+
 
 class SelectTtsMethodTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -137,10 +154,25 @@ class SelectTtsMethodTests(unittest.IsolatedAsyncioTestCase):
         query.edit_message_text.assert_awaited_once()
         self.assertIn("Неизвестный", query.edit_message_text.call_args.args[0])
 
+    async def test_admin_can_choose_cosyvoice(self) -> None:
+        query = _Query("tts:cosyvoice")
+        context = _admin_context(self.job)
+        update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=42))
+        with patch("laladub.bot._enqueue_job", new=AsyncMock()) as enqueue:
+            await select_tts_method(update, context)
+        enqueue.assert_awaited_once()
+        self.assertEqual(self.job["tts_provider"], "cosyvoice")
+
 
 class TtsMethodChoicesTests(unittest.TestCase):
     def test_only_moss_is_offered(self) -> None:
         self.assertEqual([code for code, _label in TTS_METHOD_CHOICES], ["moss"])
+
+    def test_admins_are_offered_all_installed_engines(self) -> None:
+        self.assertEqual(
+            [code for code, _label in ADMIN_TTS_METHOD_CHOICES],
+            ["moss", "cosyvoice", "qwen3", "f5"],
+        )
 
 
 if __name__ == "__main__":

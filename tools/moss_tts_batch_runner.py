@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 from pathlib import Path
 
@@ -179,6 +180,14 @@ def main() -> None:
             if not output_path.is_file() or output_path.stat().st_size < 1024:
                 raise RuntimeError(f"MOSS produced an empty WAV file: {output_path}")
             print(f"MOSS_PROGRESS\t{index}\t{total}", flush=True)
+            # Long videos may contain more than a thousand utterances. Release
+            # completed generation tensors periodically so native CUDA/decoder
+            # allocations do not accumulate for hours.
+            del audio, messages, outputs, batch, conversation, user_message
+            if index % 25 == 0:
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

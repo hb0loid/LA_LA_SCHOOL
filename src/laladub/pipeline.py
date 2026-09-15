@@ -704,11 +704,19 @@ def _seed_media_cache_from_legacy_jobs(video_path: Path, cache_entry: Path | Non
         return False
 
     current_job_dir = config.workdir.parent.resolve()
-    job_files = sorted(
-        runs_root.glob("*/*/job.json"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
+    # The cleanup task may remove an old run after glob() has yielded its
+    # job.json but before we read its mtime.  Missing legacy jobs are expected
+    # here and must never abort the current dub/resume.
+    dated_job_files: list[tuple[float, Path]] = []
+    for job_file in runs_root.glob("*/*/job.json"):
+        try:
+            dated_job_files.append((job_file.stat().st_mtime, job_file))
+        except OSError:
+            continue
+    job_files = [
+        path
+        for _mtime, path in sorted(dated_job_files, key=lambda item: item[0], reverse=True)
+    ]
     video_suffixes = {".mp4", ".mkv", ".mov", ".webm", ".avi"}
     matched_without_work = False
     for job_file in job_files[:300]:
@@ -1202,11 +1210,19 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         "moss-v1.5",
     }
     batch_items: list[tuple[int, Segment, Path]] = []
+    cosyvoice_fallback_paths: set[Path] = set()
     if batch_provider:
         for index, segment in enumerate(segments, start=1):
             fitted_path = fit_dir / f"{index:05d}.wav"
-            if segment.spoken_text and not (config.resume and _file_ready(fitted_path)):
-                batch_items.append((index, segment, raw_dir / f"{index:05d}.wav"))
+            raw_path = raw_dir / f"{index:05d}.wav"
+            if not segment.spoken_text or (config.resume and _file_ready(fitted_path)):
+                continue
+            # MOSS writes each completed line immediately. Preserve that work
+            # when a later line fails so /resume continues at the first missing
+            # line instead of regenerating the whole video.
+            if config.resume and tts_provider in {"moss", "moss-tts", "mosstts", "moss-v1.5"} and _file_ready(raw_path):
+                continue
+            batch_items.append((index, segment, raw_path))
         if batch_items:
             try:
                 if tts_provider in {"qwen3", "qwen3-tts", "qwen3tts"}:
@@ -1216,14 +1232,46 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
                 elif tts_provider in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
                     synthesize_moss_batch(batch_items, config)
             except Exception as exc:
-                print(f"      {config.tts} batch fallback to F5: {type(exc).__name__}: {exc}")
-                fallback_config = copy(config)
-                fallback_config.tts = "f5"
-                for _index, segment, raw_path in batch_items:
-                    if _file_ready(raw_path):
-                        continue
-                    raw_path.unlink(missing_ok=True)
-                    synthesize_segment(segment, raw_path, fallback_config)
+                if tts_provider in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
+                    missing_items = [item for item in batch_items if not _file_ready(item[2])]
+                    moss_error: Exception | None = exc
+                    if missing_items:
+                        print(
+                            f"      MOSS batch stopped with {len(missing_items)} line(s) left; "
+                            "retrying the missing lines once"
+                        )
+                        try:
+                            synthesize_moss_batch(missing_items, config)
+                        except Exception as retry_exc:
+                            moss_error = retry_exc
+                        missing_items = [item for item in missing_items if not _file_ready(item[2])]
+                    if not missing_items:
+                        print("      MOSS retry completed all missing lines")
+                    else:
+                        print(
+                            f"      MOSS batch fallback to CosyVoice for {len(missing_items)} missing line(s): "
+                            f"{type(moss_error).__name__}: {moss_error}"
+                        )
+                        fallback_config = copy(config)
+                        fallback_config.tts = "cosyvoice"
+                        try:
+                            synthesize_cosyvoice_batch(missing_items, fallback_config)
+                        except Exception as cosy_exc:
+                            raise RuntimeError(
+                                "MOSS stopped before all lines were synthesized and CosyVoice also failed. "
+                                "Completed neural TTS lines were preserved; resume the job to continue. "
+                                "Standard system voice fallback is disabled."
+                            ) from cosy_exc
+                        cosyvoice_fallback_paths.update(item[2] for item in missing_items)
+                else:
+                    print(f"      {config.tts} batch fallback to F5: {type(exc).__name__}: {exc}")
+                    fallback_config = copy(config)
+                    fallback_config.tts = "f5"
+                    for _index, segment, raw_path in batch_items:
+                        if _file_ready(raw_path):
+                            continue
+                        raw_path.unlink(missing_ok=True)
+                        synthesize_segment(segment, raw_path, fallback_config)
 
     fitted_items: list[tuple[Segment, Path]] = []
     for index, segment in enumerate(segments, start=1):
@@ -1236,7 +1284,11 @@ def run_dub(video_path: Path, config: DubConfig) -> Path:
         else:
             if not batch_provider:
                 synthesize_segment(segment, raw_path, config)
-            if tts_provider in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
+            if raw_path in cosyvoice_fallback_paths:
+                # CosyVoice does not use MOSS' natural-duration contract, so
+                # fit only the fallback lines back into their source slots.
+                fit_wav_to_duration(raw_path, fitted_path, max(0.1, segment.duration))
+            elif tts_provider in {"moss", "moss-tts", "mosstts", "moss-v1.5"}:
                 # MOSS controls its own delivery and must be allowed to finish
                 # the phrase instead of being time-stretched or trimmed.
                 normalize_wav(raw_path, fitted_path)

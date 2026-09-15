@@ -8,7 +8,12 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-from laladub.bot import WORKER_SILENCE_SECONDS, _ApplicationContext, _JobScheduler
+from laladub.bot import (
+    WORKER_SILENCE_SECONDS,
+    _ApplicationContext,
+    _JobScheduler,
+    _is_remote_capacity_error,
+)
 from laladub.bot_config import load_bot_settings
 
 
@@ -18,6 +23,19 @@ def _scheduler(root: Path) -> _JobScheduler:
 
 
 class WorkerLivenessTests(unittest.TestCase):
+    def test_worker_disk_full_errors_are_recoverable_capacity_errors(self) -> None:
+        self.assertTrue(
+            _is_remote_capacity_error(
+                {"error": "OSError: [Errno 28] No space left on device"}
+            )
+        )
+        self.assertTrue(
+            _is_remote_capacity_error(
+                {"traceback": "There is not enough space on the disk"}
+            )
+        )
+        self.assertFalse(_is_remote_capacity_error({"error": "Model inference failed"}))
+
     def test_progress_for_a_reclaimed_job_still_counts_the_worker_online(self) -> None:
         """A worker talking to us is alive, whatever job it thinks it is on.
 
@@ -238,6 +256,25 @@ class AbandonedLeaseTests(unittest.TestCase):
                 scheduler = _scheduler(Path(tempdir))
                 item = self._item(scheduler, "job-1", "worker-pc")
                 self.assertFalse(scheduler._worker_moved_on_locked(item))
+
+        asyncio.run(run())
+
+    def test_a_full_remote_job_is_reclaimed_after_worker_moves_on(self) -> None:
+        """Full jobs leased during a main-PC break must not hold a slot forever."""
+
+        async def run() -> None:
+            with tempfile.TemporaryDirectory() as tempdir:
+                scheduler = _scheduler(Path(tempdir))
+                scheduler.note_worker_seen("worker-pc")
+                item = SimpleNamespace(
+                    job_id="job-1",
+                    worker_id="worker-pc",
+                    execution_kind="remote",
+                    remote_last_seen_at=time.time() - WORKER_SILENCE_SECONDS - 1,
+                )
+                scheduler._leased[item.job_id] = item
+                stale = scheduler._stale_remote_leases_locked(time.time(), worker_quiet=False)
+                self.assertEqual(stale, [item])
 
         asyncio.run(run())
 

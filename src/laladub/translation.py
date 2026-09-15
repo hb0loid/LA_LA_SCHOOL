@@ -8,6 +8,7 @@ import sqlite3
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .models import DubConfig, Segment
@@ -177,12 +178,26 @@ def _translate_hybrid(segments: list[Segment], config: DubConfig) -> list[Segmen
     if not config.source_lang:
         raise TranslationError("Hybrid translator needs --source-lang, for example: --source-lang vi")
 
-    for segment in segments:
-        text = segment.text.strip()
-        segment.translated_text = _postprocess_translated_text(
-            _translate_hybrid_text(text, config.source_lang, config.target_lang, config),
+    texts = [segment.text.strip() for segment in segments]
+
+    def translate_one(text: str) -> str:
+        return _postprocess_translated_text(
+            _translate_hybrid_text(text, config.source_lang or "auto", config.target_lang, config),
             config.target_lang,
         )
+
+    # Subtitle lines are independent, while the free web translator spends
+    # most of its time waiting on the network. A small pool removes that idle
+    # wait without firing enough simultaneous requests to invite throttling.
+    workers = max(1, min(6, int(os.environ.get("LALADUB_TRANSLATION_WORKERS", "3"))))
+    if workers == 1 or len(texts) <= 1:
+        translated = [translate_one(text) for text in texts]
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(texts)), thread_name_prefix="laladub-translate") as pool:
+            translated = list(pool.map(translate_one, texts))
+
+    for segment, text in zip(segments, translated):
+        segment.translated_text = text
     return segments
 
 

@@ -148,7 +148,20 @@ def synthesize_segment(segment: Segment, output_path: Path, config: DubConfig) -
         try:
             synthesize_moss_batch([(1, segment, output_path)], config)
         except Exception as exc:
-            _fallback_segment_to_f5(segment, text, output_path, config, "MOSS", exc)
+            if _tts_output_ready(output_path):
+                print(f"      MOSS segment failed after WAV was created; keeping output: {type(exc).__name__}: {exc}")
+                return
+            print(f"      MOSS segment fallback to CosyVoice: {type(exc).__name__}: {exc}")
+            output_path.unlink(missing_ok=True)
+            fallback_config = copy(config)
+            fallback_config.tts = "cosyvoice"
+            try:
+                synthesize_cosyvoice_batch([(1, segment, output_path)], fallback_config)
+            except Exception as cosy_exc:
+                output_path.unlink(missing_ok=True)
+                raise TTSError(
+                    "MOSS and CosyVoice both failed; standard system voice fallback is disabled."
+                ) from cosy_exc
         return
 
     raise TTSError(f"Unknown TTS provider: {config.tts}")
@@ -435,6 +448,13 @@ def synthesize_cosyvoice_batch(
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     command = [str(python_path), str(runner_path), "--manifest", str(manifest_path.resolve())]
+    # CosyVoice is normally a fallback for a few lines, but a long MOSS job can
+    # leave hundreds. Scale the whole-batch deadline while retaining the
+    # per-segment watchdog in _run_progress_tts_batch.
+    batch_timeout_seconds = max(
+        int(config.cosyvoice_timeout_seconds),
+        600 + len(manifest_items) * 15,
+    )
     _run_progress_tts_batch(
         command,
         items,
@@ -442,7 +462,7 @@ def synthesize_cosyvoice_batch(
         label="CosyVoice",
         start_prefix="COSYVOICE_START",
         progress_prefix="COSYVOICE_PROGRESS",
-        timeout_seconds=config.cosyvoice_timeout_seconds,
+        timeout_seconds=batch_timeout_seconds,
     )
 
     missing = [str(path) for _index, _segment, path in items if not path.is_file() or path.stat().st_size < 1024]
@@ -506,6 +526,15 @@ def synthesize_moss_batch(
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     command = [str(python_path), str(runner_path), "--manifest", str(manifest_path.resolve())]
+    # A fixed 30-minute deadline is enough for short clips, but it used to
+    # terminate perfectly healthy long MOSS jobs halfway through.  The caller
+    # then synthesized every remaining line with the emergency TTS chain.
+    # Keep the configured floor for short jobs and scale the batch deadline;
+    # the per-segment watchdog below still catches a genuinely stuck model.
+    batch_timeout_seconds = max(
+        int(config.moss_timeout_seconds),
+        600 + len(manifest_items) * 12,
+    )
     _run_progress_tts_batch(
         command,
         items,
@@ -513,7 +542,7 @@ def synthesize_moss_batch(
         label="MOSS",
         start_prefix="MOSS_START",
         progress_prefix="MOSS_PROGRESS",
-        timeout_seconds=config.moss_timeout_seconds,
+        timeout_seconds=batch_timeout_seconds,
         extra_env={"HF_HUB_DISABLE_XET": "1"},
     )
 

@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from laladub.bot import _mark_transcript_line, _read_transcript_text
+from laladub.job_runner import _read_transcript_text as _read_worker_transcript_text
 
 
 class MarkTranscriptLineTests(unittest.TestCase):
@@ -48,6 +49,13 @@ class ReadTranscriptTests(unittest.TestCase):
         srt = self._write("translated.srt", ["Живая реплика", "Спасибо за просмотр"], self.job / "work")
         self._write("artifact_injected.srt", ["Спасибо за просмотр"], self.job / "work" / "debug")
         text = _read_transcript_text(srt)
+        self.assertIn("СПАСИБО ЗА ПРОСМОТР", text)
+        self.assertIn("Живая реплика", text)
+
+    def test_remote_worker_marks_injected_artifacts_too(self) -> None:
+        srt = self._write("translated.srt", ["Живая реплика", "Спасибо за просмотр"], self.job / "work")
+        self._write("artifact_injected.srt", ["Спасибо за просмотр"], self.job / "work" / "debug")
+        text = _read_worker_transcript_text(srt)
         self.assertIn("СПАСИБО ЗА ПРОСМОТР", text)
         self.assertIn("Живая реплика", text)
 

@@ -334,6 +334,25 @@ class ProposalStore:
             row = connection.execute("SELECT * FROM submissions WHERE id = ?", (submission_id,)).fetchone()
         return _submission_from_row(row) if row is not None else None
 
+    def update_author_comment(self, submission_id: int, comment: str | None) -> Submission:
+        """Replace the public comment while a submission is still unpublished."""
+        normalized = str(comment or "").strip() or None
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE submissions
+                SET author_comment = ?, updated_at = ?
+                WHERE id = ? AND status = 'pending' AND publication_message_id IS NULL
+                """,
+                (normalized, time.time(), int(submission_id)),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Comment can only be edited before publication")
+            row = connection.execute("SELECT * FROM submissions WHERE id = ?", (submission_id,)).fetchone()
+        if row is None:
+            raise KeyError(submission_id)
+        return _submission_from_row(row)
+
     def pending_for_moderator(self, moderator_id: int, *, limit: int = 20) -> list[Submission]:
         """Submissions that still need their first moderation-video delivery.
         Excludes anything with an active schedule even if it has no tracked
